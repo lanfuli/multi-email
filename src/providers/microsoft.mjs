@@ -1,12 +1,17 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { PublicClientApplication } from "@azure/msal-node";
 import { MultiEmailError } from "../errors.mjs";
 import { credentialAccountKey, legacyCredentialAccountKey } from "../keychain.mjs";
+import { buildRawMessage } from "../mime.mjs";
 
 const GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0/";
 const DELEGATED_SCOPES = Object.freeze(["User.Read", "Mail.ReadWrite", "Mail.Send"]);
 const BODY_LIMIT = 80_000;
 const PAGE_TOKEN_LIMIT = 12_000;
+const RAW_DRAFT_LIMIT = 2 * 1024 * 1024;
+const MIME_HEADER_LIMIT = 128 * 1024;
+const GRAPH_ERROR_BODY_LIMIT = 64 * 1024;
 
 function credentialKey(config, account) {
   return credentialAccountKey(config, account, ":msal-cache");
@@ -84,6 +89,301 @@ function bareAddresses(values) {
   return (Array.isArray(values) ? values : [])
     .map((value) => String(value?.emailAddress?.address || "").trim().toLowerCase())
     .filter(Boolean);
+}
+
+function draftNotReviewable(message, details = undefined) {
+  return new MultiEmailError(message, "DRAFT_NOT_REVIEWABLE", details);
+}
+
+function draftIdentity(account, value, field, { allowDefault = false } = {}) {
+  const expected = account.email.toLowerCase();
+  if (value === undefined || value === null) {
+    if (allowDefault) return expected;
+    throw draftNotReviewable(
+      `The Microsoft draft has no explicit ${field} identity, so it cannot be safely reviewed.`,
+    );
+  }
+
+  const actual = String(value?.emailAddress?.address || "").trim().toLowerCase();
+  if (!actual || actual !== expected) {
+    throw draftNotReviewable(
+      `The Microsoft draft ${field} identity does not match the configured mailbox.`,
+    );
+  }
+  return actual;
+}
+
+function draftRecipients(values, field) {
+  if (!Array.isArray(values)) {
+    throw draftNotReviewable(
+      `Microsoft returned an invalid ${field} recipient list for this draft.`,
+    );
+  }
+
+  return values.map((value) => {
+    const address = String(value?.emailAddress?.address || "").trim().toLowerCase();
+    if (!address) {
+      throw draftNotReviewable(
+        `Microsoft returned an incomplete ${field} recipient for this draft.`,
+      );
+    }
+    return address;
+  });
+}
+
+function draftReplyTo(value) {
+  if (!Array.isArray(value) || value.length !== 0) {
+    throw draftNotReviewable(
+      "Microsoft drafts with a Reply-To override cannot be safely reviewed.",
+    );
+  }
+  return [];
+}
+
+function draftRevisionValue(value) {
+  return typeof value === "string" && value.length ? value : null;
+}
+
+function microsoftRevision(message, rawPayloadSha256 = null) {
+  return {
+    messageId: message?.id ?? null,
+    threadId: message?.conversationId ?? null,
+    rawPayloadSha256,
+    changeKey: draftRevisionValue(message?.changeKey),
+    lastModifiedDateTime: draftRevisionValue(message?.lastModifiedDateTime),
+  };
+}
+
+function sameMicrosoftRevision(first, second) {
+  return (
+    first.messageId === second.messageId &&
+    first.threadId === second.threadId &&
+    first.changeKey === second.changeKey &&
+    first.lastModifiedDateTime === second.lastModifiedDateTime
+  );
+}
+
+function hasCompleteEmptyAttachmentSnapshot(snapshot) {
+  return (
+    Array.isArray(snapshot?.value) &&
+    snapshot.value.length === 0 &&
+    snapshot?.["@odata.nextLink"] === undefined
+  );
+}
+
+function draftChanged() {
+  return new MultiEmailError(
+    "The Microsoft draft revision changed after review. Prepare and approve it again.",
+    "DRAFT_CHANGED",
+  );
+}
+
+function rawDraftBytes(value) {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
+    throw draftNotReviewable("Microsoft returned an invalid raw MIME draft.");
+  }
+  const raw = Buffer.from(value);
+  if (raw.length > RAW_DRAFT_LIMIT) {
+    throw new MultiEmailError(
+      "The Microsoft raw MIME draft exceeds the 2 MB review limit.",
+      "DRAFT_TOO_LARGE",
+    );
+  }
+  return raw;
+}
+
+function mimeHeaders(raw) {
+  const crlfBoundary = raw.indexOf("\r\n\r\n");
+  const lfBoundary = raw.indexOf("\n\n");
+  const headerEnd =
+    crlfBoundary === -1
+      ? lfBoundary
+      : lfBoundary === -1
+        ? crlfBoundary
+        : Math.min(crlfBoundary, lfBoundary);
+  if (headerEnd < 0 || headerEnd > MIME_HEADER_LIMIT) {
+    throw draftNotReviewable("The Microsoft raw MIME draft has invalid or oversized headers.");
+  }
+
+  const headerText = raw.subarray(0, headerEnd).toString("latin1").replaceAll("\r\n", "\n");
+  if (headerText.includes("\r") || headerText.includes("\0")) {
+    throw draftNotReviewable("The Microsoft raw MIME draft has malformed headers.");
+  }
+
+  const unfolded = [];
+  for (const line of headerText.split("\n")) {
+    if (/^[ \t]/u.test(line)) {
+      if (!unfolded.length) {
+        throw draftNotReviewable("The Microsoft raw MIME draft has malformed header folding.");
+      }
+      unfolded[unfolded.length - 1] += ` ${line.trim()}`;
+    } else {
+      unfolded.push(line);
+    }
+  }
+
+  const headers = new Map();
+  for (const line of unfolded) {
+    const separator = line.indexOf(":");
+    const name = separator > 0 ? line.slice(0, separator) : "";
+    if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u.test(name)) {
+      throw draftNotReviewable("The Microsoft raw MIME draft has a malformed header name.");
+    }
+    const key = name.toLowerCase();
+    const values = headers.get(key) || [];
+    values.push(line.slice(separator + 1).trim());
+    headers.set(key, values);
+  }
+  return headers;
+}
+
+function assertReviewableMime(raw) {
+  const headers = mimeHeaders(raw);
+  const mimeVersions = headers.get("mime-version") || [];
+  if (mimeVersions.length !== 1 || mimeVersions[0].trim() !== "1.0") {
+    throw draftNotReviewable(
+      "The Microsoft raw MIME draft must have one MIME-Version: 1.0 header.",
+    );
+  }
+  const contentTypes = headers.get("content-type") || [];
+  if (contentTypes.length !== 1) {
+    throw draftNotReviewable(
+      "The Microsoft raw MIME draft must have one explicit Content-Type header.",
+    );
+  }
+
+  const contentType = contentTypes[0].trim();
+  if (!/^text\/plain\s*;\s*charset\s*=\s*(?:"(?:utf-8|us-ascii)"|(?:utf-8|us-ascii))\s*$/iu.test(contentType)) {
+    throw draftNotReviewable(
+      "Only a single UTF-8 or US-ASCII text/plain Microsoft MIME draft can be safely reviewed.",
+    );
+  }
+  if (
+    headers.has("content-disposition") ||
+    headers.has("content-id") ||
+    headers.has("content-location")
+  ) {
+    throw draftNotReviewable(
+      "The Microsoft raw MIME draft contains attachment or inline-content headers.",
+    );
+  }
+
+  const transferEncodings = headers.get("content-transfer-encoding") || [];
+  if (transferEncodings.length !== 1) {
+    throw draftNotReviewable(
+      "The Microsoft raw MIME draft must have one explicit transfer encoding.",
+    );
+  }
+  const transferEncoding = transferEncodings[0].trim().toLowerCase();
+  if (!["7bit", "8bit", "base64", "quoted-printable"].includes(transferEncoding)) {
+    throw draftNotReviewable(
+      "The Microsoft raw MIME draft uses an unsupported transfer encoding.",
+    );
+  }
+  return headers;
+}
+
+function optionalMimeHeader(headers, name) {
+  const values = headers.get(name.toLowerCase()) || [];
+  if (values.length > 1) {
+    throw draftNotReviewable(`The Microsoft raw MIME draft has duplicate ${name} headers.`);
+  }
+  const value = values[0]?.trim() || "";
+  if (/[\r\n\0]/u.test(value) || value.length > 4096) {
+    throw draftNotReviewable(`The Microsoft raw MIME draft has an invalid ${name} header.`);
+  }
+  return value;
+}
+
+function frozenManifest(account, draftId, value) {
+  const revision = value?.providerRevision;
+  const body = value?.body;
+  const bodySha256 = typeof body === "string"
+    ? createHash("sha256").update(body, "utf8").digest("hex")
+    : null;
+  const valid =
+    value &&
+    typeof value === "object" &&
+    value.manifestVersion === 1 &&
+    value.policyVersion === 2 &&
+    value.account === account.alias &&
+    value.provider === "microsoft" &&
+    value.authenticatedPrincipal === account.email &&
+    value.mailboxResource === account.email &&
+    value.draftId === draftId &&
+    value.from === account.email &&
+    value.sender === account.email &&
+    Array.isArray(value.replyTo) &&
+    value.replyTo.length === 0 &&
+    Array.isArray(value.to) &&
+    Array.isArray(value.cc) &&
+    Array.isArray(value.bcc) &&
+    value.to.length + value.cc.length + value.bcc.length > 0 &&
+    typeof value.subject === "string" &&
+    typeof value.inReplyTo === "string" &&
+    typeof value.references === "string" &&
+    typeof body === "string" &&
+    value.bodySha256 === bodySha256 &&
+    value.bodyFormat === "text" &&
+    Array.isArray(value.attachments) &&
+    value.attachments.length === 0 &&
+    value.completeness === "complete" &&
+    revision &&
+    typeof revision === "object" &&
+    revision.messageId === value.messageId &&
+    revision.threadId === value.threadId &&
+    typeof revision.rawPayloadSha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(revision.rawPayloadSha256) &&
+    typeof revision.changeKey === "string" &&
+    revision.changeKey.length > 0 &&
+    typeof revision.lastModifiedDateTime === "string" &&
+    revision.lastModifiedDateTime.length > 0;
+  if (!valid) throw draftChanged();
+  return { manifest: value, revision };
+}
+
+async function readBoundedResponse(
+  response,
+  limit,
+  {
+    message = "The Microsoft Graph response exceeds its safety limit.",
+    code = "INVALID_PROVIDER_RESPONSE",
+  } = {},
+) {
+  const contentLength = response.headers?.get?.("content-length");
+  if (/^\d+$/u.test(String(contentLength || "")) && Number(contentLength) > limit) {
+    throw new MultiEmailError(message, code);
+  }
+
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const value = Buffer.from(await response.arrayBuffer());
+    if (value.length > limit) throw new MultiEmailError(message, code);
+    return value;
+  }
+
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > limit) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The response is already being abandoned because it exceeded the cap.
+        }
+        throw new MultiEmailError(message, code);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  return Buffer.concat(chunks, total);
 }
 
 function profileEmails(profile) {
@@ -555,7 +855,18 @@ export class MicrosoftProvider {
     };
   }
 
-  async graphRequestWithToken(accessToken, pathOrUrl, { method = "GET", headers = {}, body } = {}) {
+  async graphRequestWithToken(
+    accessToken,
+    pathOrUrl,
+    {
+      method = "GET",
+      headers = {},
+      body,
+      rawBody = false,
+      responseType = "json",
+      maxResponseBytes = undefined,
+    } = {},
+  ) {
     const url = graphUrl(pathOrUrl);
     const requestHeaders = {
       accept: "application/json",
@@ -563,20 +874,52 @@ export class MicrosoftProvider {
       prefer: 'IdType="ImmutableId"',
       ...headers,
     };
-    if (body !== undefined) requestHeaders["content-type"] = "application/json";
+    if (body !== undefined && !rawBody) requestHeaders["content-type"] = "application/json";
 
     let response;
     try {
       response = await this.fetchImpl(url, {
         method,
         headers: requestHeaders,
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: body === undefined ? undefined : rawBody ? body : JSON.stringify(body),
       });
     } catch {
       throw new MultiEmailError(
         "The Microsoft Graph request did not return a response.",
         "MICROSOFT_NETWORK_ERROR",
       );
+    }
+
+    if (responseType === "buffer") {
+      if (!response.ok) {
+        const errorBytes = await readBoundedResponse(response, GRAPH_ERROR_BODY_LIMIT);
+        let errorPayload = null;
+        try {
+          errorPayload = JSON.parse(errorBytes.toString("utf8"));
+        } catch {
+          // Preserve the status even when Graph did not return its normal JSON error shape.
+        }
+        const code =
+          response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
+        throw new MultiEmailError(
+          `Microsoft Graph rejected the request (${response.status}).`,
+          code,
+          graphErrorDetails(response, errorPayload),
+        );
+      }
+      if (!Number.isInteger(maxResponseBytes) || maxResponseBytes <= 0) {
+        throw new MultiEmailError(
+          "A positive response limit is required for binary Graph requests.",
+          "INVALID_INPUT",
+        );
+      }
+      return readBoundedResponse(response, maxResponseBytes, {
+        message: "The Microsoft raw MIME draft exceeds the 2 MB review limit.",
+        code: "DRAFT_TOO_LARGE",
+      });
+    }
+    if (responseType !== "json") {
+      throw new MultiEmailError("Unsupported Microsoft Graph response type.", "INVALID_INPUT");
     }
 
     const text = await response.text();
@@ -775,48 +1118,229 @@ export class MicrosoftProvider {
     return { account: account.alias, draftId, status: "draft_updated" };
   }
 
+  async rawDraftMime(account, encodedDraftId) {
+    const value = await this.graphRequest(
+      account,
+      `me/messages/${encodedDraftId}/$value`,
+      {
+        headers: { accept: "message/rfc822" },
+        responseType: "buffer",
+        maxResponseBytes: RAW_DRAFT_LIMIT,
+      },
+    );
+    return rawDraftBytes(value);
+  }
+
+  async draftRevisionSnapshot(account, encodedDraftId) {
+    return this.graphRequest(
+      account,
+      `me/messages/${encodedDraftId}?$select=id,conversationId,isDraft,changeKey,lastModifiedDateTime`,
+    );
+  }
+
+  async draftAttachmentSnapshot(account, encodedDraftId) {
+    return this.graphRequest(
+      account,
+      `me/messages/${encodedDraftId}/attachments?$top=1&$select=id,name,contentType,size,isInline`,
+    );
+  }
+
   async reviewDraft(account, draftId) {
+    const id = encodeURIComponent(draftId);
     const draft = await this.graphRequest(
       account,
-      `me/messages/${encodeURIComponent(draftId)}?$select=id,conversationId,isDraft,toRecipients,ccRecipients,bccRecipients,subject,body,lastModifiedDateTime`,
+      `me/messages/${id}?$select=id,conversationId,isDraft,from,sender,replyTo,toRecipients,ccRecipients,bccRecipients,subject,body,hasAttachments,importance,isReadReceiptRequested,isDeliveryReceiptRequested,changeKey,lastModifiedDateTime`,
       { headers: { prefer: 'IdType="ImmutableId", outlook.body-content-type="text"' } },
     );
     if (!draft.isDraft) {
       throw new MultiEmailError("The selected Microsoft message is no longer a draft.", "NOT_A_DRAFT");
     }
-    const body = String(draft.body?.content || "");
+    if (draft.id !== draftId) {
+      throw draftNotReviewable(
+        "Microsoft returned an unexpected message identity for this draft.",
+      );
+    }
+    if (typeof draft.conversationId !== "string" || !draft.conversationId) {
+      throw draftNotReviewable(
+        "Microsoft returned no complete conversation identity for this draft.",
+      );
+    }
+    if (
+      draft.importance !== "normal" ||
+      draft.isReadReceiptRequested !== false ||
+      draft.isDeliveryReceiptRequested !== false
+    ) {
+      throw draftNotReviewable(
+        "Microsoft drafts with priority or receipt-request semantics cannot be safely reviewed.",
+      );
+    }
+    const initialRevision = microsoftRevision(draft);
+    if (!initialRevision.changeKey || !initialRevision.lastModifiedDateTime) {
+      throw draftNotReviewable(
+        "Microsoft returned no complete revision marker for this draft.",
+      );
+    }
+
+    const raw = await this.rawDraftMime(account, id);
+
+    // hasAttachments does not include inline attachments, so enumerate the
+    // collection unconditionally and reject both content and pagination.
+    const attachments = await this.draftAttachmentSnapshot(account, id);
+    const finalDraft = await this.draftRevisionSnapshot(account, id);
+    const finalRevision = microsoftRevision(finalDraft);
+    if (
+      finalDraft?.isDraft !== true ||
+      !finalRevision.changeKey ||
+      !finalRevision.lastModifiedDateTime ||
+      !sameMicrosoftRevision(initialRevision, finalRevision)
+    ) {
+      throw draftChanged();
+    }
+    if (!hasCompleteEmptyAttachmentSnapshot(attachments)) {
+      throw draftNotReviewable(
+        "Microsoft drafts with attachments or incomplete attachment enumeration cannot be safely reviewed.",
+      );
+    }
+
+    const rawHeaders = assertReviewableMime(raw);
+    const projectedBodyFormat = String(draft.body?.contentType || "").trim().toLowerCase();
+    if (projectedBodyFormat !== "text") {
+      throw draftNotReviewable(
+        "Microsoft did not return the requested plain-text draft projection.",
+      );
+    }
+    if (
+      !draft.body ||
+      typeof draft.body !== "object" ||
+      Array.isArray(draft.body) ||
+      typeof draft.body.content !== "string"
+    ) {
+      throw draftNotReviewable("Microsoft returned an invalid draft body.");
+    }
+    if (typeof draft.subject !== "string") {
+      throw draftNotReviewable("Microsoft returned an invalid draft subject.");
+    }
+    const body = draft.body.content;
     if (Buffer.byteLength(body, "utf8") > 1024 * 1024) {
       throw new MultiEmailError(
         "The Microsoft draft body exceeds the 1 MB review limit.",
         "DRAFT_TOO_LARGE",
       );
     }
+
+    const from = draftIdentity(account, draft.from, "From");
+    const sender = draftIdentity(account, draft.sender, "Sender", { allowDefault: true });
+    const replyTo = draftReplyTo(draft.replyTo);
+    const rawPayloadSha256 = createHash("sha256").update(raw).digest("hex");
+
     return {
       account: account.alias,
       draftId: draft.id,
       messageId: draft.id,
       threadId: draft.conversationId || null,
-      to: bareAddresses(draft.toRecipients),
-      cc: bareAddresses(draft.ccRecipients),
-      bcc: bareAddresses(draft.bccRecipients),
-      subject: draft.subject || "",
+      from,
+      sender,
+      replyTo,
+      to: draftRecipients(draft.toRecipients, "To"),
+      cc: draftRecipients(draft.ccRecipients, "Cc"),
+      bcc: draftRecipients(draft.bccRecipients, "Bcc"),
+      subject: draft.subject,
+      inReplyTo: optionalMimeHeader(rawHeaders, "In-Reply-To"),
+      references: optionalMimeHeader(rawHeaders, "References"),
       body,
-      bodyFormat: String(draft.body?.contentType || "text").toLowerCase(),
+      bodyFormat: "text",
+      attachments: [],
+      completeness: "complete",
       truncated: false,
-      lastModifiedDateTime: draft.lastModifiedDateTime || null,
+      rawPayloadSha256,
+      changeKey: initialRevision.changeKey,
+      lastModifiedDateTime: initialRevision.lastModifiedDateTime,
     };
   }
 
-  async sendDraft(account, draftId) {
-    // A timed-out send can have succeeded server-side, so this method deliberately performs one request only.
-    await this.graphRequest(account, `me/messages/${encodeURIComponent(draftId)}/send`, {
+  async sendDraft(account, draftId, expectedManifest) {
+    const id = encodeURIComponent(draftId);
+    const { manifest, revision: expectedRevision } = frozenManifest(
+      account,
+      draftId,
+      expectedManifest,
+    );
+    let mimeBase64;
+    try {
+      const frozenRaw = buildRawMessage({
+        from: manifest.from,
+        to: manifest.to,
+        cc: manifest.cc,
+        bcc: manifest.bcc,
+        subject: manifest.subject,
+        body: manifest.body,
+        inReplyTo: manifest.inReplyTo || undefined,
+        references: manifest.references || undefined,
+      });
+      mimeBase64 = Buffer.from(frozenRaw, "base64url").toString("base64");
+    } catch {
+      throw draftChanged();
+    }
+    try {
+      const before = await this.draftRevisionSnapshot(account, id);
+      const beforeRevision = microsoftRevision(before);
+      let raw;
+      try {
+        raw = await this.rawDraftMime(account, id);
+        assertReviewableMime(raw);
+      } catch (error) {
+        if (error?.code === "DRAFT_NOT_REVIEWABLE" || error?.code === "DRAFT_TOO_LARGE") {
+          throw draftChanged();
+        }
+        throw error;
+      }
+      const attachments = await this.draftAttachmentSnapshot(account, id);
+      const after = await this.draftRevisionSnapshot(account, id);
+      const current = microsoftRevision(
+        after,
+        createHash("sha256").update(raw).digest("hex"),
+      );
+      const changed =
+        before?.isDraft !== true ||
+        after?.isDraft !== true ||
+        !beforeRevision.changeKey ||
+        !beforeRevision.lastModifiedDateTime ||
+        !current.changeKey ||
+        !current.lastModifiedDateTime ||
+        !hasCompleteEmptyAttachmentSnapshot(attachments) ||
+        !sameMicrosoftRevision(beforeRevision, current) ||
+        current.messageId !== (expectedRevision.messageId ?? null) ||
+        current.threadId !== (expectedRevision.threadId ?? null) ||
+        current.rawPayloadSha256 !== (expectedRevision.rawPayloadSha256 ?? null) ||
+        current.changeKey !== (expectedRevision.changeKey ?? null) ||
+        current.lastModifiedDateTime !== (expectedRevision.lastModifiedDateTime ?? null);
+      if (changed) {
+        throw draftChanged();
+      }
+    } catch (error) {
+      if (error?.code === "DRAFT_CHANGED") throw error;
+      throw new MultiEmailError(
+        "The Microsoft draft could not be verified before sending. Prepare and approve it again.",
+        "SEND_VERIFICATION_FAILED",
+        { causeCode: error?.code || null },
+      );
+    }
+
+    // Freeze the approved allowlisted fields into the one send request. Graph's
+    // existing-draft send action has no conditional revision header, so it
+    // cannot prevent another client changing the draft between a GET and POST.
+    await this.graphRequest(account, "me/sendMail", {
       method: "POST",
+      headers: { accept: "application/json", "content-type": "text/plain" },
+      body: mimeBase64,
+      rawBody: true,
     });
     return {
       account: account.alias,
       provider: "microsoft",
       draftId,
-      sentMessageId: draftId,
+      sentMessageId: null,
+      sourceDraftRetained: true,
       status: "send_accepted",
     };
   }

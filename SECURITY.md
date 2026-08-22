@@ -14,7 +14,7 @@ Verify the GitHub owner, signed or annotated release tag, and release notes befo
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting for `lanfuli/multi-email` after the repository enables it. Include the affected version or commit, platform and architecture, impact, minimal reproduction, and any proposed mitigation.
+Use GitHub's enabled private vulnerability reporting for `lanfuli/multi-email`. Include the affected version or commit, platform and architecture, impact, minimal reproduction, and any proposed mitigation.
 
 Do not place mailbox content, real addresses, OAuth URLs or codes, tokens, cookies, nonces, fingerprints, client secrets, tenant data, or Keychain exports in a public issue. If private reporting is unavailable, open a public issue containing only a request for a private security contact channel.
 
@@ -32,8 +32,11 @@ The plugin enforces several boundaries:
 - provider URLs and pagination targets are constrained by provider adapters;
 - permanent deletion and arbitrary provider API calls are not exposed;
 - message content is treated as untrusted data;
-- sending requires approval in a server-owned `127.0.0.1` review window that shows the complete escaped message;
-- the approval request is short-lived, one-use, and bound to the exact reviewed draft;
+- sending requires approval in a server-owned `127.0.0.1` review window that shows every field of the supported plain-text effective-send manifest;
+- the approval request is short-lived, one-use, and bound to the authenticated principal, mailbox, sender identity, recipients, subject, body, threading identity, provider revision, and verified absence of attachments;
+- HTML, multipart or unknown MIME, inline content, attachments, unsupported sender identities, incomplete enumeration, and missing provider revisions fail closed before approval;
+- the provider send request is reconstructed from the approved allowlisted manifest, so unreviewed display names, custom headers, raw MIME fields, and last-moment provider-draft mutations are not copied into the outgoing payload;
+- configurable safety values may tighten but cannot expand the domain-level hard limits;
 - no MCP tool can approve a send request, and a provider send is never automatically retried after an ambiguous result.
 
 These controls do not make write-capable OAuth scopes harmless. Any process allowed to act as the same macOS user may be able to request Keychain access, and a compromised Codex host, Node runtime, dependency, browser session, or provider account can cross boundaries this plugin cannot defend.
@@ -47,7 +50,7 @@ Depending on the requested operation, Multi Email can handle:
 - configured aliases, primary mailbox addresses, provider type, OAuth application IDs/settings, and tenant selection;
 - OAuth access/refresh tokens or serialized MSAL cache entries;
 - message metadata, sender and recipient addresses, subjects, snippets, bodies, labels/categories, thread IDs, message IDs, and draft IDs;
-- attachment names, but not attachment contents in version `0.1.0`;
+- attachment names on ordinary message reads; Gmail `format=full` can also place small inline MIME-part bytes in the local provider response, although the plugin neither requests them through the attachment-content endpoint nor returns them through MCP;
 - local send-review state, including a short-lived request ID and an in-memory content fingerprint.
 
 ### Where data goes
@@ -56,7 +59,7 @@ Depending on the requested operation, Multi Email can handle:
 2. It calls Google Gmail API or Microsoft Graph over HTTPS.
 3. Selected provider responses are returned through MCP to the Codex host.
 4. Those tool results become part of the Codex task context and may be processed or retained by OpenAI/Codex according to the user's product, organization, account, and data-control settings.
-5. For sending, a complete HTML-escaped review is served only on a random `127.0.0.1` port. The server records the decision in memory; no MCP approval tool is exposed.
+5. For sending, a complete HTML-escaped review of a fully inspectable plain-text manifest is served only on a random `127.0.0.1` port. The server records the decision in memory; no MCP approval tool is exposed.
 
 The project does not operate a separate maintainer-controlled backend or intentionally send product analytics. That does not eliminate processing or logging by Codex/OpenAI, Google, Microsoft, npm, GitHub, the operating system, network infrastructure, or dependencies. Do not describe the complete workflow as local-only.
 
@@ -66,6 +69,10 @@ The project does not operate a separate maintainer-controlled backend or intenti
 - Google token JSON and Microsoft MSAL cache data are stored in Keychain service `io.github.lanfuli.multi-email` under provider/alias-specific account keys. Verified historical credentials may be migrated from legacy service `com.openai.codex.multi-email`; read-only diagnosis never migrates them.
 - Send approval requests live in process memory and disappear when the MCP server exits.
 - This project does not define or control Codex, Google, or Microsoft retention.
+
+### Frozen-send and provider revision boundary
+
+The server rebuilds the effective-send manifest after approval, spends the one-use request before any provider call, and rechecks the bound raw hash or revision. It then reconstructs a minimal UTF-8 plain-text MIME message from the exact reviewed From, recipients, subject, threading headers, and body. Gmail includes this frozen raw message in the draft-send request. Microsoft sends the frozen MIME in one `sendMail` request and retains the original source draft rather than invoking Graph's unconditional existing-draft send action. Provider-side processing can still reject, transform, route, or delay a message after acceptance, and ambiguous send outcomes are never retried automatically.
 
 ### Deletion
 
@@ -93,6 +100,7 @@ Email is attacker-controlled input. Instructions in a message, quoted thread, si
 - `npm run build` bundles the MCP server and setup CLI as CommonJS with `@vercel/ncc`; this preserves the native loader's `__filename`/`createRequire` requirements.
 - The release bundle includes native binaries fetched from the exact published `@napi-rs/keyring` architecture packages for macOS arm64 and x64.
 - `npm run pack:check` tests the tarball both without installed dependencies and after a cold npm install.
-- CI runs tests, syntax checks, release validation, a bounded secret scan, a production dependency audit, and the cold-install check.
+- The build manifest binds the runtime version, a deterministic digest of all bundle inputs, and hashes of every committed artifact.
+- CI checks the committed bundle before rebuilding, verifies that a clean rebuild produces no `dist/` diff, then runs tests, syntax checks, a bounded secret scan, a production dependency audit, and the cold-install check.
 
 The repository secret scan is defense in depth, not proof that history is clean. Before publishing, review the full Git history and enable GitHub secret scanning and private vulnerability reporting.

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { emptyConfig, validateConfig } from "../src/config.mjs";
 import { credentialAccountKey, MemoryCredentialStore } from "../src/keychain.mjs";
@@ -29,6 +30,164 @@ function provider(options = {}) {
     },
     ...options,
   });
+}
+
+const REVIEW_SELECT =
+  "id,conversationId,isDraft,from,sender,replyTo,toRecipients,ccRecipients,bccRecipients,subject,body,hasAttachments,importance,isReadReceiptRequested,isDeliveryReceiptRequested,changeKey,lastModifiedDateTime";
+
+function reviewPath(draftId) {
+  return `me/messages/${encodeURIComponent(draftId)}?$select=${REVIEW_SELECT}`;
+}
+
+function attachmentPath(draftId) {
+  return `me/messages/${encodeURIComponent(draftId)}/attachments?$top=1&$select=id,name,contentType,size,isInline`;
+}
+
+function rawPath(draftId) {
+  return `me/messages/${encodeURIComponent(draftId)}/$value`;
+}
+
+function revisionPath(draftId) {
+  return `me/messages/${encodeURIComponent(draftId)}?$select=id,conversationId,isDraft,changeKey,lastModifiedDateTime`;
+}
+
+function plainTextMime(body = "Body", extraHeaders = []) {
+  return Buffer.from(
+    [
+      "From: Sales <sales@example.com>",
+      "To: One <one@example.com>",
+      "Subject: Subject",
+      "MIME-Version: 1.0",
+      'Content-Type: text/plain; charset="UTF-8"',
+      "Content-Transfer-Encoding: 8bit",
+      ...extraHeaders,
+      "",
+      body,
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+}
+
+function rawHash(raw) {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function revisionSnapshot(draft = reviewableDraft()) {
+  return {
+    id: draft.id,
+    conversationId: draft.conversationId,
+    isDraft: draft.isDraft,
+    changeKey: draft.changeKey,
+    lastModifiedDateTime: draft.lastModifiedDateTime,
+  };
+}
+
+function reviewableDraft(overrides = {}) {
+  return {
+    id: "draft-2",
+    conversationId: "thread-2",
+    isDraft: true,
+    from: { emailAddress: { name: "Sales", address: "Sales@Example.COM" } },
+    sender: { emailAddress: { name: "Sales", address: "Sales@Example.COM" } },
+    replyTo: [],
+    toRecipients: [{ emailAddress: { name: "One", address: "ONE@Example.COM" } }],
+    ccRecipients: [{ emailAddress: { name: "Two", address: "TWO@Example.COM" } }],
+    bccRecipients: [{ emailAddress: { name: "Three", address: "THREE@Example.COM" } }],
+    subject: "Subject",
+    body: { contentType: "Text", content: "Body" },
+    hasAttachments: false,
+    importance: "normal",
+    isReadReceiptRequested: false,
+    isDeliveryReceiptRequested: false,
+    changeKey: "CQAAABYAA-review-1",
+    lastModifiedDateTime: "2026-08-21T12:00:00Z",
+    ...overrides,
+  };
+}
+
+function fullManifest(review, revision = {}) {
+  return {
+    manifestVersion: 1,
+    policyVersion: 2,
+    account: review.account,
+    provider: "microsoft",
+    authenticatedPrincipal: account.email,
+    mailboxResource: account.email,
+    draftId: review.draftId,
+    messageId: review.messageId,
+    threadId: review.threadId,
+    from: review.from,
+    sender: review.sender,
+    replyTo: [...review.replyTo],
+    to: [...review.to],
+    cc: [...review.cc],
+    bcc: [...review.bcc],
+    subject: review.subject,
+    inReplyTo: review.inReplyTo || "",
+    references: review.references || "",
+    body: review.body,
+    bodyFormat: "text",
+    bodySha256: createHash("sha256").update(review.body, "utf8").digest("hex"),
+    attachments: [],
+    completeness: "complete",
+    providerRevision: {
+      messageId: review.messageId,
+      threadId: review.threadId,
+      rawPayloadSha256: review.rawPayloadSha256,
+      changeKey: review.changeKey,
+      lastModifiedDateTime: review.lastModifiedDateTime,
+      ...revision,
+    },
+  };
+}
+
+function sendReview({
+  draftId = "draft/send",
+  threadId = "thread-send",
+  body = "Send body",
+  raw = plainTextMime(body),
+  changeKey = "CQAAABYAA-send-1",
+  lastModifiedDateTime = "2026-08-21T13:00:00Z",
+  ...overrides
+} = {}) {
+  return {
+    account: account.alias,
+    draftId,
+    messageId: draftId,
+    threadId,
+    from: account.email,
+    sender: account.email,
+    replyTo: [],
+    to: ["one@example.com"],
+    cc: ["two@example.com"],
+    bcc: ["three@example.com"],
+    subject: "Approved subject",
+    inReplyTo: "",
+    references: "",
+    body,
+    bodyFormat: "text",
+    attachments: [],
+    completeness: "complete",
+    truncated: false,
+    rawPayloadSha256: rawHash(raw),
+    changeKey,
+    lastModifiedDateTime,
+    ...overrides,
+  };
+}
+
+function decodeFrozenMime(base64) {
+  const raw = Buffer.from(base64, "base64").toString("utf8");
+  const boundary = raw.indexOf("\r\n\r\n");
+  assert.notEqual(boundary, -1);
+  const headers = raw.slice(0, boundary);
+  const encodedBody = raw.slice(boundary + 4).replaceAll("\r\n", "");
+  return {
+    raw,
+    headers,
+    body: Buffer.from(encodedBody, "base64").toString("utf8"),
+  };
 }
 
 test("profile accepts only an exact configured mail or principal identity", async () => {
@@ -76,6 +235,24 @@ test("Graph requests reject hostname lookalikes before fetch", async () => {
   assert.equal(fetchCalls, 0);
 });
 
+test("raw Graph responses enforce a byte cap before buffering MIME", async () => {
+  const mail = provider({
+    fetchImpl: async () =>
+      new Response("x".repeat(17), {
+        status: 200,
+        headers: { "content-length": "17", "content-type": "message/rfc822" },
+      }),
+  });
+
+  await assert.rejects(
+    mail.graphRequestWithToken("not-a-real-token", "me/messages/draft-1/$value", {
+      responseType: "buffer",
+      maxResponseBytes: 16,
+    }),
+    { code: "DRAFT_TOO_LARGE" },
+  );
+});
+
 test("Microsoft page tokens are confined to the messages collection", async () => {
   const mail = provider();
   let graphCalls = 0;
@@ -116,11 +293,10 @@ test("reply draft uses createReply, patches only the draft, then reviews it", as
       });
       return null;
     }
-    if (path.startsWith("me/messages/draft%2F1?$select=")) {
-      return {
+    if (path === reviewPath("draft/1")) {
+      return reviewableDraft({
         id: "draft/1",
         conversationId: "thread-1",
-        isDraft: true,
         toRecipients: [
           { emailAddress: { name: "Customer", address: "Customer@Example.COM" } },
         ],
@@ -128,7 +304,17 @@ test("reply draft uses createReply, patches only the draft, then reviews it", as
         bccRecipients: [{ emailAddress: { address: "Audit@Example.COM" } }],
         subject: "RE: Question",
         body: { contentType: "text", content: "Reply body" },
-      };
+      });
+    }
+    if (path === rawPath("draft/1")) {
+      assert.equal(options.responseType, "buffer");
+      return plainTextMime("Reply body");
+    }
+    if (path === attachmentPath("draft/1")) {
+      return { value: [] };
+    }
+    if (path === revisionPath("draft/1")) {
+      return revisionSnapshot(reviewableDraft({ id: "draft/1", conversationId: "thread-1" }));
     }
     throw new Error(`Unexpected Graph request: ${path}`);
   };
@@ -150,27 +336,618 @@ test("reply draft uses createReply, patches only the draft, then reviews it", as
     to: ["customer@example.com"],
     status: "draft_created",
   });
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 7);
 });
 
-test("reviewDraft returns lowercased bare addresses, never display-name strings", async () => {
+test("reviewDraft returns a complete manifest bound to stable raw plain-text MIME", async () => {
   const mail = provider();
-  mail.graphRequest = async () => ({
-    id: "draft-2",
-    conversationId: "thread-2",
-    isDraft: true,
-    toRecipients: [{ emailAddress: { name: "One", address: "ONE@Example.COM" } }],
-    ccRecipients: [{ emailAddress: { name: "Two", address: "TWO@Example.COM" } }],
-    bccRecipients: [{ emailAddress: { name: "Three", address: "THREE@Example.COM" } }],
-    subject: "Subject",
-    body: { contentType: "Text", content: "Body" },
-    lastModifiedDateTime: "2026-08-21T12:00:00Z",
-  });
+  const calls = [];
+  const raw = plainTextMime();
+  mail.graphRequest = async (_account, path, options) => {
+    calls.push({ path, options });
+    if (path === reviewPath("draft-2")) return reviewableDraft();
+    if (path === rawPath("draft-2")) return raw;
+    if (path === attachmentPath("draft-2")) return { value: [] };
+    if (path === revisionPath("draft-2")) return revisionSnapshot();
+    throw new Error(`Unexpected Graph request: ${path}`);
+  };
 
   const review = await mail.reviewDraft(account, "draft-2");
-  assert.deepEqual(review.to, ["one@example.com"]);
-  assert.deepEqual(review.cc, ["two@example.com"]);
-  assert.deepEqual(review.bcc, ["three@example.com"]);
+  assert.deepEqual(review, {
+    account: "m365",
+    draftId: "draft-2",
+    messageId: "draft-2",
+    threadId: "thread-2",
+    from: "sales@example.com",
+    sender: "sales@example.com",
+    replyTo: [],
+    to: ["one@example.com"],
+    cc: ["two@example.com"],
+    bcc: ["three@example.com"],
+    subject: "Subject",
+    inReplyTo: "",
+    references: "",
+    body: "Body",
+    bodyFormat: "text",
+    attachments: [],
+    completeness: "complete",
+    truncated: false,
+    rawPayloadSha256: rawHash(raw),
+    changeKey: "CQAAABYAA-review-1",
+    lastModifiedDateTime: "2026-08-21T12:00:00Z",
+  });
+  assert.deepEqual(calls.map(({ path }) => path), [
+    reviewPath("draft-2"),
+    rawPath("draft-2"),
+    attachmentPath("draft-2"),
+    revisionPath("draft-2"),
+  ]);
+  assert.match(calls[0].options.headers.prefer, /outlook\.body-content-type="text"/iu);
+  assert.equal(calls[1].options.responseType, "buffer");
+  assert.equal(calls[1].options.maxResponseBytes, 2 * 1024 * 1024);
+});
+
+test("reviewDraft rejects every missing review-required structured Graph field", async () => {
+  const cases = [
+    "id",
+    "conversationId",
+    "isDraft",
+    "from",
+    "replyTo",
+    "toRecipients",
+    "ccRecipients",
+    "bccRecipients",
+    "subject",
+    "body",
+    "body.contentType",
+    "body.content",
+    "importance",
+    "isReadReceiptRequested",
+    "isDeliveryReceiptRequested",
+    "changeKey",
+    "lastModifiedDateTime",
+  ];
+
+  for (const field of cases) {
+    const mail = provider();
+    const draft = structuredClone(reviewableDraft({ id: "draft-incomplete" }));
+    const path = field.split(".");
+    const owner = path.length === 1 ? draft : draft[path[0]];
+    delete owner[path.at(-1)];
+    mail.graphRequest = async (_account, requestPath) => {
+      if (requestPath === reviewPath("draft-incomplete")) return draft;
+      if (requestPath === rawPath("draft-incomplete")) return plainTextMime();
+      if (requestPath === attachmentPath("draft-incomplete")) return { value: [] };
+      if (requestPath === revisionPath("draft-incomplete")) {
+        return revisionSnapshot(reviewableDraft({ id: "draft-incomplete" }));
+      }
+      throw new Error(`Unexpected Graph request: ${requestPath}`);
+    };
+
+    await assert.rejects(
+      mail.reviewDraft(account, "draft-incomplete"),
+      (error) => ["DRAFT_NOT_REVIEWABLE", "NOT_A_DRAFT"].includes(error.code),
+      field,
+    );
+  }
+});
+
+test("reviewDraft rejects non-normal priority and receipt-request semantics", async () => {
+  const cases = [
+    { name: "high priority", patch: { importance: "high" } },
+    { name: "low priority", patch: { importance: "low" } },
+    { name: "read receipt", patch: { isReadReceiptRequested: true } },
+    { name: "delivery receipt", patch: { isDeliveryReceiptRequested: true } },
+  ];
+
+  for (const scenario of cases) {
+    const mail = provider();
+    mail.graphRequest = async (_account, path) => {
+      if (path === reviewPath("draft-semantics")) {
+        return reviewableDraft({ id: "draft-semantics", ...scenario.patch });
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.reviewDraft(account, "draft-semantics"),
+      (error) => error.code === "DRAFT_NOT_REVIEWABLE",
+      scenario.name,
+    );
+  }
+});
+
+test("reviewDraft rejects HTML MIME even when Graph projects the body as text", async () => {
+  const mail = provider();
+  let attachmentQueries = 0;
+  mail.graphRequest = async (_account, path) => {
+    if (path === reviewPath("draft-html")) {
+      return reviewableDraft({
+        id: "draft-html",
+        body: { contentType: "Text", content: "Body" },
+      });
+    }
+    if (path === rawPath("draft-html")) {
+      return Buffer.from(
+        "MIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n<p>Body</p>\r\n",
+      );
+    }
+    if (path === attachmentPath("draft-html")) {
+      attachmentQueries += 1;
+      return { value: [] };
+    }
+    if (path === revisionPath("draft-html")) {
+      return revisionSnapshot(reviewableDraft({ id: "draft-html" }));
+    }
+    throw new Error(`Unexpected Graph request: ${path}`);
+  };
+
+  await assert.rejects(mail.reviewDraft(account, "draft-html"), {
+    code: "DRAFT_NOT_REVIEWABLE",
+  });
+  assert.equal(attachmentQueries, 1);
+});
+
+test("reviewDraft rejects non-canonical, attachment, inline, and unknown raw MIME forms", async () => {
+  const replaceHeader = (raw, before, after) =>
+    Buffer.from(raw.toString("utf8").replace(before, after), "utf8");
+  const cases = [
+    {
+      name: "multipart",
+      raw: Buffer.from(
+        "MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=parts\r\n\r\n--parts--\r\n",
+      ),
+    },
+    {
+      name: "attachment disposition",
+      raw: plainTextMime("Body", ['Content-Disposition: attachment; filename="body.txt"']),
+    },
+    {
+      name: "inline disposition",
+      raw: plainTextMime("Body", ["Content-Disposition: inline"]),
+    },
+    {
+      name: "unknown transfer encoding",
+      raw: replaceHeader(
+        plainTextMime(),
+        "Content-Transfer-Encoding: 8bit",
+        "Content-Transfer-Encoding: x-custom",
+      ),
+    },
+    {
+      name: "missing MIME version",
+      raw: replaceHeader(plainTextMime(), "MIME-Version: 1.0\r\n", ""),
+    },
+    {
+      name: "duplicate MIME version",
+      raw: replaceHeader(
+        plainTextMime(),
+        "MIME-Version: 1.0",
+        "MIME-Version: 1.0\r\nMIME-Version: 1.0",
+      ),
+    },
+    {
+      name: "missing charset",
+      raw: replaceHeader(
+        plainTextMime(),
+        'Content-Type: text/plain; charset="UTF-8"',
+        "Content-Type: text/plain",
+      ),
+    },
+    {
+      name: "content type name star parameter",
+      raw: replaceHeader(
+        plainTextMime(),
+        'Content-Type: text/plain; charset="UTF-8"',
+        "Content-Type: text/plain; charset=UTF-8; name*=utf-8''body.txt",
+      ),
+    },
+    {
+      name: "extra charset parameter",
+      raw: replaceHeader(
+        plainTextMime(),
+        'Content-Type: text/plain; charset="UTF-8"',
+        "Content-Type: text/plain; charset=UTF-8; charset=us-ascii",
+      ),
+    },
+    {
+      name: "missing transfer encoding",
+      raw: replaceHeader(plainTextMime(), "Content-Transfer-Encoding: 8bit\r\n", ""),
+    },
+    {
+      name: "duplicate transfer encoding",
+      raw: replaceHeader(
+        plainTextMime(),
+        "Content-Transfer-Encoding: 8bit",
+        "Content-Transfer-Encoding: 8bit\r\nContent-Transfer-Encoding: 8bit",
+      ),
+    },
+  ];
+
+  for (const scenario of cases) {
+    const mail = provider();
+    mail.graphRequest = async (_account, path) => {
+      if (path === reviewPath("draft-mime")) {
+        return reviewableDraft({ id: "draft-mime" });
+      }
+      if (path === rawPath("draft-mime")) return scenario.raw;
+      if (path === attachmentPath("draft-mime")) return { value: [] };
+      if (path === revisionPath("draft-mime")) {
+        return revisionSnapshot(reviewableDraft({ id: "draft-mime" }));
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.reviewDraft(account, "draft-mime"),
+      (error) => error.code === "DRAFT_NOT_REVIEWABLE",
+      scenario.name,
+    );
+  }
+});
+
+test("reviewDraft rejects regular, inline, and paginated attachment results", async () => {
+  const cases = [
+    {
+      name: "regular attachment",
+      draft: { hasAttachments: true },
+      attachments: { value: [{ id: "attachment-1", isInline: false }] },
+    },
+    {
+      name: "inline attachment hidden by hasAttachments",
+      draft: { hasAttachments: false },
+      attachments: { value: [{ id: "inline-1", isInline: true }] },
+    },
+    {
+      name: "paginated attachment enumeration",
+      draft: { hasAttachments: false },
+      attachments: {
+        value: [],
+        "@odata.nextLink":
+          "https://graph.microsoft.com/v1.0/me/messages/draft-attachments/attachments?$skip=1",
+      },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const mail = provider();
+    let sendCalls = 0;
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (path === reviewPath("draft-attachments")) {
+        return reviewableDraft({ id: "draft-attachments", ...scenario.draft });
+      }
+      if (path === rawPath("draft-attachments")) return plainTextMime();
+      if (path === attachmentPath("draft-attachments")) return scenario.attachments;
+      if (path === revisionPath("draft-attachments")) {
+        return revisionSnapshot(reviewableDraft({ id: "draft-attachments" }));
+      }
+      if (options.method === "POST") sendCalls += 1;
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.reviewDraft(account, "draft-attachments"),
+      (error) => error.code === "DRAFT_NOT_REVIEWABLE",
+      scenario.name,
+    );
+    assert.equal(sendCalls, 0, scenario.name);
+  }
+});
+
+test("reviewDraft rejects missing or changed From, Sender, and Reply-To identities", async () => {
+  const cases = [
+    { name: "missing From", patch: { from: null } },
+    {
+      name: "changed From",
+      patch: { from: { emailAddress: { address: "delegate@example.com" } } },
+    },
+    {
+      name: "changed Sender",
+      patch: { sender: { emailAddress: { address: "delegate@example.com" } } },
+    },
+    {
+      name: "Reply-To override",
+      patch: { replyTo: [{ emailAddress: { address: "reply@example.com" } }] },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const mail = provider();
+    mail.graphRequest = async (_account, path) => {
+      if (path === reviewPath("draft-identity")) {
+        return reviewableDraft({ id: "draft-identity", ...scenario.patch });
+      }
+      if (path === rawPath("draft-identity")) return plainTextMime();
+      if (path === attachmentPath("draft-identity")) return { value: [] };
+      if (path === revisionPath("draft-identity")) {
+        return revisionSnapshot(reviewableDraft({ id: "draft-identity" }));
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.reviewDraft(account, "draft-identity"),
+      (error) => error.code === "DRAFT_NOT_REVIEWABLE",
+      scenario.name,
+    );
+  }
+});
+
+test("reviewDraft requires complete Microsoft revision markers", async () => {
+  const mail = provider();
+  mail.graphRequest = async (_account, path) => {
+    if (path === reviewPath("draft-no-revision")) {
+      return reviewableDraft({ id: "draft-no-revision", changeKey: null });
+    }
+    if (path === attachmentPath("draft-no-revision")) return { value: [] };
+    throw new Error(`Unexpected Graph request: ${path}`);
+  };
+
+  await assert.rejects(mail.reviewDraft(account, "draft-no-revision"), {
+    code: "DRAFT_NOT_REVIEWABLE",
+  });
+});
+
+test("reviewDraft rejects a revision that changes while MIME and attachments are read", async () => {
+  const mail = provider();
+  mail.graphRequest = async (_account, path) => {
+    if (path === reviewPath("draft-race")) {
+      return reviewableDraft({ id: "draft-race", changeKey: "before" });
+    }
+    if (path === rawPath("draft-race")) return plainTextMime();
+    if (path === attachmentPath("draft-race")) return { value: [] };
+    if (path === revisionPath("draft-race")) {
+      return revisionSnapshot(reviewableDraft({ id: "draft-race", changeKey: "after" }));
+    }
+    throw new Error(`Unexpected Graph request: ${path}`);
+  };
+
+  await assert.rejects(mail.reviewDraft(account, "draft-race"), {
+    code: "DRAFT_CHANGED",
+  });
+});
+
+test("sendDraft rejects every missing policy-v2 manifest field before Graph access", async () => {
+  const approvedManifest = fullManifest(sendReview());
+  const fields = [
+    "manifestVersion",
+    "policyVersion",
+    "account",
+    "provider",
+    "authenticatedPrincipal",
+    "mailboxResource",
+    "draftId",
+    "messageId",
+    "threadId",
+    "from",
+    "sender",
+    "replyTo",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "inReplyTo",
+    "references",
+    "body",
+    "bodyFormat",
+    "bodySha256",
+    "attachments",
+    "completeness",
+    "providerRevision",
+    "providerRevision.messageId",
+    "providerRevision.threadId",
+    "providerRevision.rawPayloadSha256",
+    "providerRevision.changeKey",
+    "providerRevision.lastModifiedDateTime",
+  ];
+
+  for (const field of fields) {
+    const mail = provider();
+    let graphCalls = 0;
+    mail.graphRequest = async () => {
+      graphCalls += 1;
+      throw new Error("Graph must not be reached for an incomplete approved manifest");
+    };
+    const candidate = structuredClone(approvedManifest);
+    const path = field.split(".");
+    const owner = path.length === 1 ? candidate : candidate[path[0]];
+    delete owner[path.at(-1)];
+
+    await assert.rejects(
+      mail.sendDraft(account, "draft/send", candidate),
+      (error) => error.code === "DRAFT_CHANGED",
+      field,
+    );
+    assert.equal(graphCalls, 0, field);
+  }
+});
+
+test("sendDraft rechecks the source then posts one frozen approved MIME message", async () => {
+  const mail = provider();
+  const calls = [];
+  const approvedBody = "Approved body — exact bytes";
+  const approvedRaw = plainTextMime(approvedBody, [
+    "X-Unreviewed-Display: must-not-survive",
+    "Return-Path: <attacker@example.com>",
+    "Disposition-Notification-To: attacker@example.com",
+  ]);
+  const reviewed = sendReview({ raw: approvedRaw, body: approvedBody });
+  const approvedManifest = fullManifest(reviewed);
+  let liveRaw = approvedRaw;
+  let revisionCalls = 0;
+  let postedOptions = null;
+  mail.graphRequest = async (_account, path, options = {}) => {
+    calls.push({ path, options });
+    if (path === revisionPath("draft/send")) {
+      revisionCalls += 1;
+      const snapshot = {
+        id: "draft/send",
+        conversationId: "thread-send",
+        isDraft: true,
+        changeKey: "CQAAABYAA-send-1",
+        lastModifiedDateTime: "2026-08-21T13:00:00Z",
+      };
+      if (revisionCalls === 2) {
+        // Simulate another client mutating the retained source draft after the
+        // last preflight snapshot but before Graph receives the send request.
+        liveRaw = plainTextMime("MUTATED AFTER FINAL CHECK", [
+          "X-Injected-Late: must-not-survive",
+        ]);
+      }
+      return snapshot;
+    }
+    if (path === rawPath("draft/send")) return liveRaw;
+    if (path === attachmentPath("draft/send")) return { value: [] };
+    if (path === "me/sendMail" && options.method === "POST") {
+      postedOptions = options;
+      return null;
+    }
+    throw new Error(`Unexpected Graph request: ${path}`);
+  };
+
+  const result = await mail.sendDraft(account, "draft/send", approvedManifest);
+  assert.deepEqual(result, {
+    account: "m365",
+    provider: "microsoft",
+    draftId: "draft/send",
+    sentMessageId: null,
+    sourceDraftRetained: true,
+    status: "send_accepted",
+  });
+  assert.deepEqual(calls.map(({ path }) => path), [
+    revisionPath("draft/send"),
+    rawPath("draft/send"),
+    attachmentPath("draft/send"),
+    revisionPath("draft/send"),
+    "me/sendMail",
+  ]);
+  assert.equal(calls.filter(({ options }) => options.method === "POST").length, 1);
+  assert.equal(postedOptions.rawBody, true);
+  assert.equal(postedOptions.headers["content-type"], "text/plain");
+
+  const frozen = decodeFrozenMime(postedOptions.body);
+  assert.match(frozen.headers, /^From: sales@example\.com$/mu);
+  assert.match(frozen.headers, /^To: one@example\.com$/mu);
+  assert.match(frozen.headers, /^Cc: two@example\.com$/mu);
+  assert.match(frozen.headers, /^Bcc: three@example\.com$/mu);
+  assert.match(frozen.headers, /^Subject: Approved subject$/mu);
+  assert.equal(frozen.body, approvedBody);
+  assert.doesNotMatch(frozen.raw, /Sales <sales@example\.com>/u);
+  assert.doesNotMatch(frozen.raw, /X-Unreviewed-Display|Return-Path|Disposition-Notification-To/u);
+  assert.doesNotMatch(frozen.raw, /X-Injected-Late|MUTATED AFTER FINAL CHECK/u);
+});
+
+test("sendDraft rejects every Microsoft revision change before POST", async () => {
+  const reviewedRaw = plainTextMime("Reviewed body");
+  const reviewed = sendReview({
+    draftId: "draft-revision",
+    threadId: "thread-revision",
+    body: "Reviewed body",
+    raw: reviewedRaw,
+    changeKey: "CQAAABYAA-before",
+    lastModifiedDateTime: "2026-08-21T14:00:00Z",
+  });
+  const approvedManifest = fullManifest(reviewed);
+  const changes = [
+    { name: "message identity", patch: { id: "different-message" } },
+    { name: "thread identity", patch: { conversationId: "different-thread" } },
+    { name: "change key", patch: { changeKey: "CQAAABYAA-after" } },
+    {
+      name: "last modified time",
+      patch: { lastModifiedDateTime: "2026-08-21T14:00:01Z" },
+    },
+    { name: "raw MIME payload", raw: plainTextMime("Changed body") },
+    { name: "draft state", patch: { isDraft: false } },
+  ];
+
+  for (const scenario of changes) {
+    const mail = provider();
+    let postCalls = 0;
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (options.method === "POST") {
+        postCalls += 1;
+        return null;
+      }
+      if (path === rawPath("draft-revision")) return scenario.raw || reviewedRaw;
+      if (path === attachmentPath("draft-revision")) {
+        return scenario.attachments || { value: [] };
+      }
+      if (path === revisionPath("draft-revision")) {
+        return {
+          id: "draft-revision",
+          conversationId: "thread-revision",
+          isDraft: true,
+          changeKey: "CQAAABYAA-before",
+          lastModifiedDateTime: "2026-08-21T14:00:00Z",
+          ...scenario.patch,
+        };
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.sendDraft(account, "draft-revision", approvedManifest),
+      (error) => error.code === "DRAFT_CHANGED",
+      scenario.name,
+    );
+    assert.equal(postCalls, 0, scenario.name);
+  }
+});
+
+test("sendDraft rejects an attachment added after approval before POST", async () => {
+  const mail = provider();
+  const raw = plainTextMime("Reviewed body");
+  const approvedManifest = fullManifest(sendReview({
+    draftId: "draft-attachment-race",
+    threadId: "thread-attachment-race",
+    body: "Reviewed body",
+    raw,
+    changeKey: "CQAAABYAA-attachment-race",
+    lastModifiedDateTime: "2026-08-21T15:00:00Z",
+  }));
+  let postCalls = 0;
+  mail.graphRequest = async (_account, path, options = {}) => {
+    if (options.method === "POST") {
+      postCalls += 1;
+      return null;
+    }
+    if (path === rawPath("draft-attachment-race")) return raw;
+    if (path === attachmentPath("draft-attachment-race")) {
+      return { value: [{ id: "attachment-added-after-review", isInline: false }] };
+    }
+    if (path === revisionPath("draft-attachment-race")) {
+      return {
+        id: "draft-attachment-race",
+        conversationId: "thread-attachment-race",
+        isDraft: true,
+        changeKey: "CQAAABYAA-attachment-race",
+        lastModifiedDateTime: "2026-08-21T15:00:00Z",
+      };
+    }
+    throw new Error(`Unexpected Graph request: ${path}`);
+  };
+
+  await assert.rejects(
+    mail.sendDraft(account, "draft-attachment-race", approvedManifest),
+    { code: "DRAFT_CHANGED" },
+  );
+  assert.equal(postCalls, 0);
+});
+
+test("sendDraft fails closed when no expected revision is supplied", async () => {
+  const mail = provider();
+  let calls = 0;
+  mail.graphRequest = async (_account, path, options = {}) => {
+    calls += 1;
+    assert.equal(path, "me/messages/draft-legacy/send");
+    assert.equal(options.method, "POST");
+    return null;
+  };
+
+  await assert.rejects(mail.sendDraft(account, "draft-legacy"), {
+    code: "DRAFT_CHANGED",
+  });
+  assert.equal(calls, 0);
 });
 
 test("Microsoft legacy cache migrates only after silent token and profile identity checks", async () => {

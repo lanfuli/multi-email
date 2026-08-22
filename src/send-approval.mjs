@@ -1,31 +1,61 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { HARD_SAFETY_LIMITS } from "./constants.mjs";
 import { MultiEmailError } from "./errors.mjs";
 
-function cloneReview(review) {
+export const EFFECTIVE_SEND_MANIFEST_VERSION = 1;
+export const EFFECTIVE_SEND_POLICY_VERSION = 2;
+
+function cloneProviderRevision(review, messageId, threadId) {
+  const revision = review.providerRevision || {};
   return {
+    messageId: revision.messageId ?? messageId,
+    threadId: revision.threadId ?? threadId,
+    rawPayloadSha256: revision.rawPayloadSha256 ?? null,
+    changeKey: revision.changeKey ?? null,
+    lastModifiedDateTime: revision.lastModifiedDateTime ?? null,
+  };
+}
+
+function cloneReview(review) {
+  const body = typeof review.body === "string" ? review.body : "";
+  const messageId = review.messageId ?? "";
+  const threadId = review.threadId ?? null;
+  return {
+    manifestVersion: review.manifestVersion ?? EFFECTIVE_SEND_MANIFEST_VERSION,
+    policyVersion: review.policyVersion ?? EFFECTIVE_SEND_POLICY_VERSION,
     account: review.account,
+    provider: review.provider ?? "",
+    authenticatedPrincipal: review.authenticatedPrincipal ?? "",
+    mailboxResource: review.mailboxResource ?? "",
     draftId: review.draftId,
-    messageId: review.messageId,
+    messageId,
+    threadId,
+    from: review.from ?? "",
+    sender: review.sender ?? "",
+    replyTo: [...(review.replyTo || [])],
     to: [...(review.to || [])],
     cc: [...(review.cc || [])],
     bcc: [...(review.bcc || [])],
     subject: review.subject || "",
-    body: review.body || "",
+    inReplyTo: review.inReplyTo ?? "",
+    references: review.references ?? "",
+    body,
+    bodyFormat: review.bodyFormat ?? "",
+    bodySha256:
+      review.bodySha256 ?? createHash("sha256").update(body, "utf8").digest("hex"),
+    attachments: structuredClone(review.attachments || []),
+    completeness: review.completeness ?? "",
+    providerRevision: cloneProviderRevision(review, messageId, threadId),
   };
 }
 
 function stableDraftFingerprint(review) {
-  const payload = JSON.stringify({
-    version: 1,
-    account: review.account,
-    draftId: review.draftId,
-    messageId: review.messageId || "",
-    to: [...(review.to || [])].sort(),
-    cc: [...(review.cc || [])].sort(),
-    bcc: [...(review.bcc || [])].sort(),
-    subject: review.subject || "",
-    body: review.body || "",
-  });
+  const manifest = cloneReview(review);
+  manifest.replyTo.sort();
+  manifest.to.sort();
+  manifest.cc.sort();
+  manifest.bcc.sort();
+  const payload = JSON.stringify(manifest);
   return createHash("sha256").update(payload).digest("hex");
 }
 
@@ -37,6 +67,16 @@ function safeEqual(first, second) {
 
 export class SendApprovalStore {
   constructor({ ttlSeconds = 300, clock = () => Date.now() } = {}) {
+    if (
+      !Number.isInteger(ttlSeconds) ||
+      ttlSeconds <= 0 ||
+      ttlSeconds > HARD_SAFETY_LIMITS.sendApprovalTtlSeconds
+    ) {
+      throw new MultiEmailError(
+        `Send approval TTL must be an integer from 1 to ${HARD_SAFETY_LIMITS.sendApprovalTtlSeconds} seconds.`,
+        "INVALID_CONFIG",
+      );
+    }
     this.ttlMs = ttlSeconds * 1000;
     this.clock = clock;
     this.requests = new Map();

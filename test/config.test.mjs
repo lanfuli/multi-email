@@ -95,3 +95,30 @@ test("validateConfig rejects unsupported providers and invalid safety values", (
   ];
   assert.throws(() => validateConfig(htmlBearing), { code: "INVALID_CONFIG" });
 });
+
+test("configured safety values may tighten but never expand hard limits", () => {
+  const tighter = emptyConfig();
+  tighter.safety = {
+    maxSearchResults: 5,
+    maxWriteBatch: 4,
+    maxRecipients: 3,
+    sendApprovalTtlSeconds: 60,
+  };
+  assert.deepEqual(validateConfig(tighter).safety, tighter.safety);
+
+  for (const [key, value] of [
+    ["maxSearchResults", 26],
+    ["maxWriteBatch", 26],
+    ["maxRecipients", 21],
+    ["sendApprovalTtlSeconds", 301],
+  ]) {
+    const expanded = emptyConfig();
+    expanded.safety[key] = value;
+    assert.throws(
+      () => validateConfig(expanded),
+      (error) =>
+        error.code === "INVALID_CONFIG" &&
+        error.message.includes(`safety.${key} cannot exceed the hard safety limit`),
+    );
+  }
+});

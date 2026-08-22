@@ -5,14 +5,35 @@ import { LocalSendApprovalUi } from "../src/send-approval-ui.mjs";
 
 function review(overrides = {}) {
   return {
+    manifestVersion: 1,
+    policyVersion: 2,
     account: "work",
+    provider: "google",
+    authenticatedPrincipal: "owner@example.com",
+    mailboxResource: "owner@example.com",
     draftId: "draft-1",
     messageId: "message-1",
+    threadId: "thread-1",
+    from: "owner@example.com",
+    sender: "",
+    replyTo: [],
     to: ["recipient@example.com"],
     cc: ["copy@example.com"],
     bcc: ["audit@example.com"],
     subject: "Status <review>",
+    inReplyTo: "<original@example.com>",
+    references: "<root@example.com> <original@example.com>",
     body: "Ready to go.",
+    bodyFormat: "text",
+    attachments: [],
+    completeness: "complete",
+    providerRevision: {
+      messageId: "message-1",
+      threadId: "thread-1",
+      rawPayloadSha256: "a".repeat(64),
+      changeKey: null,
+      lastModifiedDateTime: null,
+    },
     ...overrides,
   };
 }
@@ -69,6 +90,18 @@ test("localhost UI renders the full escaped review and approves one exact send",
   assert.match(page.html, /FULL_BODY_END/u);
   assert.match(page.html, /&lt;script&gt;bad\(\)&lt;\/script&gt;/u);
   assert.doesNotMatch(page.html, /<script>bad\(\)<\/script>/u);
+  assert.match(page.html, /Authenticated principal<\/dt><dd>owner@example\.com/u);
+  assert.match(page.html, /Mailbox<\/dt><dd>owner@example\.com/u);
+  assert.match(page.html, /From<\/dt><dd>owner@example\.com/u);
+  assert.match(page.html, /Sender<\/dt><dd>\(none\)/u);
+  assert.match(page.html, /Reply-To<\/dt><dd>\(none\)/u);
+  assert.match(page.html, /In-Reply-To<\/dt><dd>&lt;original@example\.com&gt;/u);
+  assert.match(
+    page.html,
+    /References<\/dt><dd>&lt;root@example\.com&gt; &lt;original@example\.com&gt;/u,
+  );
+  assert.match(page.html, /Format<\/dt><dd>text/u);
+  assert.match(page.html, /Attachments<\/dt><dd>none/u);
 
   const origin = new URL(local.url).origin;
   const decision = await fetch(new URL(page.action, origin), {

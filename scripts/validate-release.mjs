@@ -3,6 +3,12 @@
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  artifactFiles,
+  buildInputFiles,
+  digestFile,
+  digestFiles,
+} from "./release-integrity.mjs";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const readJson = async (relative) =>
@@ -12,6 +18,9 @@ const plugin = await readJson(".codex-plugin/plugin.json");
 const marketplace = await readJson(".agents/plugins/marketplace.json");
 const build = await readJson("dist/build-manifest.json");
 const skill = await readFile(path.join(pluginRoot, "skills/multi-email/SKILL.md"), "utf8");
+const readme = await readFile(path.join(pluginRoot, "README.md"), "utf8");
+const changelog = await readFile(path.join(pluginRoot, "CHANGELOG.md"), "utf8");
+const constants = await readFile(path.join(pluginRoot, "src/constants.mjs"), "utf8");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -35,6 +44,18 @@ assert(plugin.version === packageJson.version, "Plugin and package versions diff
 assert(plugin.author?.name === "Vincent_Lan", "Plugin author is incorrect.");
 assert(plugin.license === "MIT", "Plugin manifest must declare MIT.");
 assert(plugin.mcpServers === "./.mcp.json", "Plugin MCP manifest path is incorrect.");
+assert(
+  constants.includes(`APP_VERSION = "${packageJson.version}"`),
+  "Runtime and package versions differ.",
+);
+assert(
+  readme.includes(`Release status: \`${packageJson.version}\``),
+  "README release status does not match the package version.",
+);
+assert(
+  changelog.includes(`## [${packageJson.version}]`),
+  "CHANGELOG lacks the current package version.",
+);
 
 assert(marketplace.name === "multi-email", "Unexpected marketplace name.");
 assert(marketplace.plugins?.length === 1, "Marketplace must contain exactly one plugin.");
@@ -54,8 +75,32 @@ assert(
 );
 
 assert(build.entry === "server.cjs", "Unexpected bundled entry.");
+assert(build.appVersion === packageJson.version, "Bundled app version is stale.");
 assert(build.ncc === packageJson.devDependencies?.["@vercel/ncc"], "ncc versions differ.");
 assert(build.keyring === packageJson.dependencies?.["@napi-rs/keyring"], "Keyring versions differ.");
+assert(
+  build.sourceSha256 === await digestFiles(pluginRoot, await buildInputFiles(pluginRoot)),
+  "Bundled source digest is stale. Run npm run build and commit dist.",
+);
+const distDirectory = path.join(pluginRoot, "dist");
+const currentArtifacts = await artifactFiles(distDirectory);
+const recordedArtifacts = Object.keys(build.artifacts || {}).sort();
+assert(
+  JSON.stringify(recordedArtifacts) === JSON.stringify(currentArtifacts),
+  "Bundle artifact manifest does not exactly match the dist file set.",
+);
+for (const [file, expected] of Object.entries(build.artifacts || {})) {
+  assert(/^[a-f0-9]{64}$/.test(expected), `Bundled artifact digest is invalid for ${file}.`);
+  assert(
+    expected === await digestFile(path.join(distDirectory, file)),
+    `Bundled artifact digest is stale for ${file}.`,
+  );
+}
+assert(
+  JSON.stringify([...(build.nativeAssets || [])].sort()) ===
+    JSON.stringify(["keyring.darwin-arm64.node", "keyring.darwin-x64.node"]),
+  "Bundle native asset manifest is incomplete.",
+);
 
 for (const relative of [
   "LICENSE",

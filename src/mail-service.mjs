@@ -1,11 +1,30 @@
+import { createHash } from "node:crypto";
 import { GmailProvider } from "./providers/gmail.mjs";
 import { MicrosoftProvider } from "./providers/microsoft.mjs";
 import { findAccount } from "./config.mjs";
+import { HARD_SAFETY_LIMITS } from "./constants.mjs";
 import { MultiEmailError } from "./errors.mjs";
 import { normalizeAddresses } from "./mime.mjs";
-import { SendApprovalStore } from "./send-approval.mjs";
+import {
+  EFFECTIVE_SEND_MANIFEST_VERSION,
+  EFFECTIVE_SEND_POLICY_VERSION,
+  SendApprovalStore,
+} from "./send-approval.mjs";
 
 const MAX_BODY_BYTES = 1024 * 1024;
+
+function boundedSafety(config) {
+  const configured = config.safety || {};
+  const safety = {};
+  for (const [key, hardLimit] of Object.entries(HARD_SAFETY_LIMITS)) {
+    const value = configured[key] ?? hardLimit;
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new MultiEmailError(`safety.${key} must be a positive integer.`, "INVALID_CONFIG");
+    }
+    safety[key] = Math.min(value, hardLimit);
+  }
+  return safety;
+}
 
 function requireString(value, field, { allowEmpty = false, maxLength = 4096 } = {}) {
   if (typeof value !== "string") {
@@ -74,15 +93,147 @@ function validateRecipients(input, maxRecipients, { requireAny = false } = {}) {
   return recipients;
 }
 
+function notReviewable(message) {
+  throw new MultiEmailError(message, "DRAFT_NOT_REVIEWABLE");
+}
+
+function reviewIdentity(value, field, { allowEmpty = false } = {}) {
+  if (allowEmpty && value === "") return "";
+  if (typeof value !== "string" || !value) {
+    notReviewable(`Draft ${field} identity is missing or incomplete.`);
+  }
+  try {
+    return normalizeAddresses([value], field)[0];
+  } catch {
+    return notReviewable(`Draft ${field} identity is invalid.`);
+  }
+}
+
+function reviewString(value, field, { nullable = false } = {}) {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string" || !value) {
+    notReviewable(`Draft ${field} is missing from the provider review.`);
+  }
+  return value;
+}
+
+function reviewThreadHeader(value, field, { multiple = false } = {}) {
+  if (typeof value !== "string") {
+    notReviewable(`Draft ${field} state is missing from the provider review.`);
+  }
+  if (!value) return "";
+  if (value.length > 4096 || /[\r\n]/u.test(value)) {
+    notReviewable(`Draft ${field} header is invalid or too long.`);
+  }
+  const tokens = value.trim().split(/\s+/u).filter(Boolean);
+  if ((!multiple && tokens.length !== 1) || !tokens.length) {
+    notReviewable(`Draft ${field} header is invalid.`);
+  }
+  if (tokens.some((token) => !/^<[^<>\s]{1,900}>$/u.test(token))) {
+    notReviewable(`Draft ${field} header contains an invalid message ID.`);
+  }
+  return tokens.join(" ");
+}
+
+function providerRevision(account, review, messageId, threadId) {
+  const revision = {
+    messageId,
+    threadId,
+    rawPayloadSha256: null,
+    changeKey: null,
+    lastModifiedDateTime: null,
+  };
+  if (
+    typeof review.rawPayloadSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(review.rawPayloadSha256)
+  ) {
+    notReviewable("Provider draft review is missing its complete raw-payload revision hash.");
+  }
+  revision.rawPayloadSha256 = review.rawPayloadSha256;
+  if (account.provider === "google") {
+    return revision;
+  }
+  if (account.provider === "microsoft") {
+    revision.changeKey = reviewString(review.changeKey, "change key");
+    revision.lastModifiedDateTime = reviewString(
+      review.lastModifiedDateTime,
+      "last modified timestamp",
+    );
+    return revision;
+  }
+  return notReviewable(`Provider '${account.provider}' has no complete-draft review policy.`);
+}
+
 function canonicalDraftReview(account, draftId, review, maxRecipients) {
+  if (!review || typeof review !== "object" || Array.isArray(review)) {
+    notReviewable("Provider returned an incomplete draft review.");
+  }
+  if (review.completeness !== "complete") {
+    notReviewable("Draft review is incomplete and cannot be approved for sending.");
+  }
+  if (review.bodyFormat !== "text") {
+    notReviewable("Only complete plain-text drafts can be approved for sending.");
+  }
+  if (!Array.isArray(review.attachments)) {
+    notReviewable("Draft attachment state is missing from the provider review.");
+  }
+  if (review.attachments.length !== 0) {
+    notReviewable("Drafts with attachments cannot be approved for sending.");
+  }
+  if (!Array.isArray(review.replyTo)) {
+    notReviewable("Draft Reply-To state is missing from the provider review.");
+  }
+  if (![review.to, review.cc, review.bcc].every(Array.isArray)) {
+    notReviewable("Draft recipient enumeration is missing from the provider review.");
+  }
+  if (typeof review.subject !== "string") {
+    notReviewable("Draft subject state is missing from the provider review.");
+  }
+
+  const from = reviewIdentity(review.from, "From");
+  const sender = reviewIdentity(review.sender, "Sender", { allowEmpty: true });
+  let replyTo;
+  try {
+    replyTo = normalizeAddresses(review.replyTo, "reply-to");
+  } catch {
+    return notReviewable("Draft Reply-To identity is invalid.");
+  }
+  if (from !== account.email || (sender && sender !== account.email)) {
+    notReviewable("Draft From and Sender must match the configured primary account identity.");
+  }
+  if (replyTo.length !== 0) {
+    notReviewable("Drafts with an additional Reply-To identity cannot be approved for sending.");
+  }
+
   const recipients = validateRecipients(review, maxRecipients, { requireAny: true });
+  const messageId = reviewString(review.messageId, "message ID");
+  const threadId = reviewString(review.threadId, "thread ID", { nullable: true });
+  const body = validateBody(review.body);
+  const inReplyTo = reviewThreadHeader(review.inReplyTo, "In-Reply-To");
+  const references = reviewThreadHeader(review.references, "References", { multiple: true });
   return {
+    manifestVersion: EFFECTIVE_SEND_MANIFEST_VERSION,
+    policyVersion: EFFECTIVE_SEND_POLICY_VERSION,
     account: account.alias,
+    provider: account.provider,
+    authenticatedPrincipal: account.email,
+    mailboxResource: account.email,
     draftId,
-    messageId: review.messageId,
+    messageId,
+    threadId,
+    from,
+    sender,
+    replyTo,
     ...recipients,
-    subject: validateSubject(review.subject || ""),
-    body: validateBody(review.body || ""),
+    subject: validateSubject(review.subject),
+    inReplyTo,
+    references,
+    body,
+    bodyFormat: "text",
+    bodySha256: createHash("sha256").update(body, "utf8").digest("hex"),
+    attachments: [],
+    completeness: "complete",
+    providerRevision: providerRevision(account, review, messageId, threadId),
   };
 }
 
@@ -95,10 +246,11 @@ export class MailService {
   constructor({ config, credentialStore, approvalStore, approvalUi, providers } = {}) {
     if (!config) throw new MultiEmailError("MailService requires config.", "INVALID_CONFIG");
     this.config = config;
+    this.safety = boundedSafety(config);
     this.credentialStore = credentialStore;
     this.approvals =
       approvalStore ||
-      new SendApprovalStore({ ttlSeconds: config.safety.sendApprovalTtlSeconds });
+      new SendApprovalStore({ ttlSeconds: this.safety.sendApprovalTtlSeconds });
     this.approvalUi = approvalUi;
     this.providers =
       providers ||
@@ -168,13 +320,13 @@ export class MailService {
 
   async search(alias, { query, maxResults, pageToken }) {
     const account = this.account(alias);
-    const requested = maxResults ?? Math.min(10, this.config.safety.maxSearchResults);
+    const requested = maxResults ?? Math.min(10, this.safety.maxSearchResults);
     if (!Number.isInteger(requested) || requested < 1) {
       throw new MultiEmailError("max_results must be a positive integer.", "INVALID_INPUT");
     }
-    if (requested > this.config.safety.maxSearchResults) {
+    if (requested > this.safety.maxSearchResults) {
       throw new MultiEmailError(
-        `max_results exceeds the configured limit of ${this.config.safety.maxSearchResults}.`,
+        `max_results exceeds the configured limit of ${this.safety.maxSearchResults}.`,
         "SAFETY_LIMIT",
       );
     }
@@ -195,7 +347,7 @@ export class MailService {
 
   async createDraft(alias, input) {
     const account = this.account(alias);
-    const recipients = validateRecipients(input, this.config.safety.maxRecipients);
+    const recipients = validateRecipients(input, this.safety.maxRecipients);
     return this.provider(account).createDraft(account, {
       ...recipients,
       subject: validateSubject(input.subject || ""),
@@ -205,7 +357,7 @@ export class MailService {
 
   async createReplyDraft(alias, input) {
     const account = this.account(alias);
-    const recipients = validateRecipients(input, this.config.safety.maxRecipients);
+    const recipients = validateRecipients(input, this.safety.maxRecipients);
     return this.provider(account).createReplyDraft(account, {
       messageId: requireString(input.messageId, "message_id", { maxLength: 1024 }),
       body: validateBody(input.body || ""),
@@ -234,7 +386,7 @@ export class MailService {
         cc: patch.cc ?? current.cc,
         bcc: patch.bcc ?? current.bcc,
       },
-      this.config.safety.maxRecipients,
+      this.safety.maxRecipients,
     );
     return provider.updateDraft(account, normalizedDraftId, patch);
   }
@@ -243,7 +395,7 @@ export class MailService {
     const account = this.account(alias);
     return this.provider(account).archive(
       account,
-      requireIds(messageIds, "message_ids", this.config.safety.maxWriteBatch),
+      requireIds(messageIds, "message_ids", this.safety.maxWriteBatch),
     );
   }
 
@@ -254,7 +406,7 @@ export class MailService {
     }
     return this.provider(account).markRead(
       account,
-      requireIds(messageIds, "message_ids", this.config.safety.maxWriteBatch),
+      requireIds(messageIds, "message_ids", this.safety.maxWriteBatch),
       isRead,
     );
   }
@@ -284,17 +436,40 @@ export class MailService {
       if (!Array.isArray(values)) {
         throw new MultiEmailError(`${field} must be an array.`, "INVALID_INPUT");
       }
-      return [...new Set(values.map((value) => requireString(value, field, { maxLength: 256 })))]
-        .filter(Boolean);
+      if (values.length > this.safety.maxLabelChanges) {
+        throw new MultiEmailError(
+          `${field} exceeds the hard label-change limit of ${this.safety.maxLabelChanges}.`,
+          "SAFETY_LIMIT",
+        );
+      }
+      const normalized = values.map((value) =>
+        requireString(value, field, { maxLength: 256 }),
+      );
+      if (new Set(normalized).size !== normalized.length) {
+        throw new MultiEmailError(`${field} contains duplicate label IDs.`, "INVALID_INPUT");
+      }
+      return normalized;
     };
     const add = normalizeLabels(addLabelIds, "add_label_ids");
     const remove = normalizeLabels(removeLabelIds, "remove_label_ids");
+    if (add.length + remove.length > this.safety.maxLabelChanges) {
+      throw new MultiEmailError(
+        `Combined label changes exceed the hard limit of ${this.safety.maxLabelChanges}.`,
+        "SAFETY_LIMIT",
+      );
+    }
     if (!add.length && !remove.length) {
       throw new MultiEmailError("At least one label change is required.", "INVALID_INPUT");
     }
+    if (add.some((labelId) => remove.includes(labelId))) {
+      throw new MultiEmailError(
+        "A label ID cannot be added and removed in the same operation.",
+        "INVALID_INPUT",
+      );
+    }
     return provider.modifyLabels(
       account,
-      requireIds(messageIds, "message_ids", this.config.safety.maxWriteBatch),
+      requireIds(messageIds, "message_ids", this.safety.maxWriteBatch),
       { addLabelIds: add, removeLabelIds: remove },
     );
   }
@@ -310,7 +485,7 @@ export class MailService {
       account,
       normalizedDraftId,
       review,
-      this.config.safety.maxRecipients,
+      this.safety.maxRecipients,
     );
     const approval = this.approvals.prepare(canonical);
     const preview = safePreview(canonical.body);
@@ -350,17 +525,32 @@ export class MailService {
       account: account.alias,
       draftId: normalizedDraftId,
     });
-    const review = await provider.reviewDraft(account, normalizedDraftId);
-    const canonical = canonicalDraftReview(
-      account,
-      normalizedDraftId,
-      review,
-      this.config.safety.maxRecipients,
-    );
+    let canonical;
+    try {
+      const review = await provider.reviewDraft(account, normalizedDraftId);
+      canonical = canonicalDraftReview(
+        account,
+        normalizedDraftId,
+        review,
+        this.safety.maxRecipients,
+      );
+    } catch (error) {
+      // Any attempted use spends the human approval, including a provider review
+      // failure or a draft that is no longer eligible for complete review.
+      try {
+        this.approvals.rejectOutOfBand(requestId);
+      } catch {
+        // Preserve the provider/review failure that caused this approval to be spent.
+      }
+      throw error;
+    }
     this.approvals.consumeApproved(requestId, canonical);
     try {
-      return await provider.sendDraft(account, normalizedDraftId);
+      return await provider.sendDraft(account, normalizedDraftId, canonical);
     } catch (error) {
+      if (error?.code === "DRAFT_CHANGED" || error?.code === "SEND_VERIFICATION_FAILED") {
+        throw error;
+      }
       console.error(
         `[multi-email] send outcome unknown for ${account.alias}/${normalizedDraftId}: ` +
           String(error?.code || error?.name || "provider_error"),

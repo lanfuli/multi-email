@@ -282,7 +282,7 @@ server.registerTool(
   {
     title: "Open the local send-review window",
     description:
-      "Re-read a draft, open a localhost window showing the complete message, and return a short-lived request ID. Sending remains blocked until the user clicks Approve in that local window.",
+      "Build a complete effective-send manifest for a supported plain-text draft, including threading headers, open its localhost review window, and return a short-lived request ID. HTML, attachments, unknown MIME, or unsupported identities fail closed.",
     inputSchema: { account_alias: accountAlias, draft_id: draftId },
     annotations: reversibleWriteAnnotations,
   },
@@ -294,7 +294,7 @@ server.registerTool(
   {
     title: "Send an approved existing draft",
     description:
-      "Send only an unchanged existing draft after its matching, unexpired request was approved in the local human-review window. Never retry automatically after an ambiguous result.",
+      "Freeze and send only an unchanged approved effective-send manifest after its provider revision is rechecked. Microsoft retains the source draft. Never retry automatically after an ambiguous result.",
     inputSchema: {
       account_alias: accountAlias,
       draft_id: draftId,

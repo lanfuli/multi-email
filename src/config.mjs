@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { CONFIG_VERSION, DEFAULT_SAFETY } from "./constants.mjs";
+import { CONFIG_VERSION, DEFAULT_SAFETY, HARD_SAFETY_LIMITS } from "./constants.mjs";
 import { MultiEmailError } from "./errors.mjs";
 
 const ALIAS_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
@@ -56,6 +56,15 @@ function assertPositiveInteger(value, key) {
   }
 }
 
+function assertAtMost(value, key, maximum) {
+  if (value > maximum) {
+    throw new MultiEmailError(
+      `${key} cannot exceed the hard safety limit of ${maximum}.`,
+      "INVALID_CONFIG",
+    );
+  }
+}
+
 export function validateConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new MultiEmailError("Config must be a JSON object.", "INVALID_CONFIG");
@@ -81,6 +90,26 @@ export function validateConfig(input) {
   assertPositiveInteger(safety.maxWriteBatch, "safety.maxWriteBatch");
   assertPositiveInteger(safety.maxRecipients, "safety.maxRecipients");
   assertPositiveInteger(safety.sendApprovalTtlSeconds, "safety.sendApprovalTtlSeconds");
+  assertAtMost(
+    safety.maxSearchResults,
+    "safety.maxSearchResults",
+    HARD_SAFETY_LIMITS.maxSearchResults,
+  );
+  assertAtMost(
+    safety.maxWriteBatch,
+    "safety.maxWriteBatch",
+    HARD_SAFETY_LIMITS.maxWriteBatch,
+  );
+  assertAtMost(
+    safety.maxRecipients,
+    "safety.maxRecipients",
+    HARD_SAFETY_LIMITS.maxRecipients,
+  );
+  assertAtMost(
+    safety.sendApprovalTtlSeconds,
+    "safety.sendApprovalTtlSeconds",
+    HARD_SAFETY_LIMITS.sendApprovalTtlSeconds,
+  );
 
   const providers = {
     google: { ...(input.providers?.google || {}) },

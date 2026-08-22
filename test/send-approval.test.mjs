@@ -1,17 +1,41 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { SendApprovalStore, stableDraftFingerprint } from "../src/send-approval.mjs";
 
 function review(overrides = {}) {
+  const body = overrides.body ?? "Ready to go.";
   return {
+    manifestVersion: 1,
+    policyVersion: 2,
     account: "work",
+    provider: "google",
+    authenticatedPrincipal: "owner@example.com",
+    mailboxResource: "owner@example.com",
     draftId: "draft-1",
     messageId: "message-1",
+    threadId: "thread-1",
+    from: "owner@example.com",
+    sender: "",
+    replyTo: [],
     to: ["person@example.com"],
     cc: [],
     bcc: [],
     subject: "Status",
-    body: "Ready to go.",
+    inReplyTo: "",
+    references: "",
+    body,
+    bodyFormat: "text",
+    bodySha256: createHash("sha256").update(body, "utf8").digest("hex"),
+    attachments: [],
+    completeness: "complete",
+    providerRevision: {
+      messageId: "message-1",
+      threadId: "thread-1",
+      rawPayloadSha256: "a".repeat(64),
+      changeKey: null,
+      lastModifiedDateTime: null,
+    },
     ...overrides,
   };
 }
@@ -32,16 +56,32 @@ test("preparing a review does not authorize sending", () => {
 test("trusted review access contains the complete immutable body", () => {
   const store = new SendApprovalStore();
   const fullBody = `${"A".repeat(5_000)}\nTHE END`;
-  const draft = review({ body: fullBody });
+  const draft = review({
+    body: fullBody,
+    attachments: [{ name: "blocked.txt", metadata: { size: 7 } }],
+  });
   const { requestId } = store.prepare(draft);
   draft.body = "mutated caller object";
+  draft.to.push("mutated@example.com");
+  draft.attachments[0].metadata.size = 999;
+  draft.providerRevision.rawPayloadSha256 = "b".repeat(64);
 
   const pending = store.getPendingReview(requestId);
   assert.equal(pending.review.body, fullBody);
   assert.equal(pending.review.body.endsWith("THE END"), true);
+  assert.deepEqual(pending.review.to, ["person@example.com"]);
+  assert.equal(pending.review.attachments[0].metadata.size, 7);
+  assert.equal(pending.review.providerRevision.rawPayloadSha256, "a".repeat(64));
 
   pending.review.body = "mutated returned object";
+  pending.review.attachments[0].metadata.size = 123;
+  pending.review.providerRevision.rawPayloadSha256 = "c".repeat(64);
   assert.equal(store.getPendingReview(requestId).review.body, fullBody);
+  assert.equal(store.getPendingReview(requestId).review.attachments[0].metadata.size, 7);
+  assert.equal(
+    store.getPendingReview(requestId).review.providerRevision.rawPayloadSha256,
+    "a".repeat(64),
+  );
 });
 
 test("out-of-band approval enables exactly one matching send", () => {
@@ -126,13 +166,65 @@ test("a post-approval draft change spends and invalidates the request", () => {
   );
 });
 
-test("approval is bound to recipients, subject, and the complete body", () => {
+test("approval fingerprint is bound to every effective-send manifest field", () => {
   const changes = [
+    { manifestVersion: 2 },
+    { policyVersion: 3 },
+    { provider: "microsoft" },
+    { authenticatedPrincipal: "other@example.com" },
+    { mailboxResource: "shared@example.com" },
+    { messageId: "message-2" },
+    { threadId: "thread-2" },
+    { from: "other@example.com" },
+    { sender: "owner@example.com" },
+    { replyTo: ["reply@example.com"] },
     { to: ["other@example.com"] },
     { cc: ["copy@example.com"] },
     { bcc: ["audit@example.com"] },
     { subject: "A different subject" },
+    { inReplyTo: "<original@example.com>" },
+    { references: "<root@example.com> <original@example.com>" },
     { body: "A different body" },
+    { bodyFormat: "html" },
+    { bodySha256: "f".repeat(64) },
+    { attachments: [{ name: "file.txt" }] },
+    { completeness: "partial" },
+    {
+      providerRevision: {
+        messageId: "message-2",
+        threadId: "thread-1",
+        rawPayloadSha256: "a".repeat(64),
+        changeKey: null,
+        lastModifiedDateTime: null,
+      },
+    },
+    {
+      providerRevision: {
+        messageId: "message-1",
+        threadId: "thread-2",
+        rawPayloadSha256: "a".repeat(64),
+        changeKey: null,
+        lastModifiedDateTime: null,
+      },
+    },
+    {
+      providerRevision: {
+        messageId: "message-1",
+        threadId: "thread-1",
+        rawPayloadSha256: "b".repeat(64),
+        changeKey: null,
+        lastModifiedDateTime: null,
+      },
+    },
+    {
+      providerRevision: {
+        messageId: "message-1",
+        threadId: "thread-1",
+        rawPayloadSha256: null,
+        changeKey: "change-2",
+        lastModifiedDateTime: "2026-08-22T00:00:00Z",
+      },
+    },
   ];
 
   for (const change of changes) {
@@ -162,4 +254,12 @@ test("recipient ordering does not change the stable fingerprint", () => {
   const first = review({ to: ["b@example.com", "a@example.com"] });
   const second = review({ to: ["a@example.com", "b@example.com"] });
   assert.equal(stableDraftFingerprint(first), stableDraftFingerprint(second));
+});
+
+test("send approval TTL cannot exceed the non-configurable hard limit", () => {
+  assert.throws(
+    () => new SendApprovalStore({ ttlSeconds: 301 }),
+    { code: "INVALID_CONFIG" },
+  );
+  assert.doesNotThrow(() => new SendApprovalStore({ ttlSeconds: 300 }));
 });

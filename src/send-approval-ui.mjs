@@ -325,14 +325,24 @@ export class LocalSendApprovalUi {
 </head>
 <body>
   <h1>Review the complete email</h1>
-  <p class="warning">Click Approve only after checking the account, every recipient, subject, and the complete body below.</p>
+  <p class="warning">Click Approve only after checking the mailbox identity, every recipient, subject, format, attachments, and the complete body below.</p>
   <dl>
     <dt>Account</dt><dd>${escapeHtml(review.account)}</dd>
+    <dt>Provider</dt><dd>${escapeHtml(review.provider)}</dd>
+    <dt>Authenticated principal</dt><dd>${escapeHtml(review.authenticatedPrincipal)}</dd>
+    <dt>Mailbox</dt><dd>${escapeHtml(review.mailboxResource)}</dd>
     <dt>Draft</dt><dd>${escapeHtml(review.draftId)}</dd>
+    <dt>From</dt><dd>${escapeHtml(review.from)}</dd>
+    <dt>Sender</dt><dd>${escapeHtml(review.sender || "(none)")}</dd>
+    <dt>Reply-To</dt><dd>${escapeHtml(review.replyTo.join(", ") || "(none)")}</dd>
     <dt>To</dt><dd>${escapeHtml(review.to.join(", ") || "(none)")}</dd>
     <dt>Cc</dt><dd>${escapeHtml(review.cc.join(", ") || "(none)")}</dd>
     <dt>Bcc</dt><dd>${escapeHtml(review.bcc.join(", ") || "(none)")}</dd>
     <dt>Subject</dt><dd>${escapeHtml(review.subject || "(empty)")}</dd>
+    <dt>In-Reply-To</dt><dd>${escapeHtml(review.inReplyTo || "(none)")}</dd>
+    <dt>References</dt><dd>${escapeHtml(review.references || "(none)")}</dd>
+    <dt>Format</dt><dd>${escapeHtml(review.bodyFormat)}</dd>
+    <dt>Attachments</dt><dd>${review.attachments.length === 0 ? "none" : "present"}</dd>
   </dl>
   <h2>Complete body</h2>
   <pre>${escapeHtml(review.body)}</pre>

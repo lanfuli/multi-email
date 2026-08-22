@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -51,13 +52,21 @@ async function writeEmptyConfig(directory) {
   return configPath;
 }
 
-async function smokePackage(packageRoot, label) {
+async function smokePackage(
+  packageRoot,
+  label,
+  {
+    command = process.execPath,
+    args = [path.join(packageRoot, "scripts", "launch-mcp")],
+  } = {},
+) {
+  const metadata = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
   const configDirectory = await mkdtemp(path.join(temporaryRoot, `${label}-config-`));
   const configPath = await writeEmptyConfig(configDirectory);
-  const client = new Client({ name: `multi-email-${label}`, version: "0.1.0" });
+  const client = new Client({ name: `multi-email-${label}`, version: metadata.version });
   const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(packageRoot, "scripts", "launch-mcp")],
+    command,
+    args,
     cwd: packageRoot,
     env: {
       ...Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined)),
@@ -67,6 +76,13 @@ async function smokePackage(packageRoot, label) {
   });
   try {
     await client.connect(transport);
+    const server = client.getServerVersion();
+    if (server?.name !== "codex-multi-email" || server?.version !== metadata.version) {
+      throw new Error(
+        `${label} package launched ${server?.name || "unknown"}@${server?.version || "unknown"}, ` +
+          `expected codex-multi-email@${metadata.version}.`,
+      );
+    }
     const { tools } = await client.listTools();
     if (
       tools.length !== 14 ||
@@ -81,11 +97,14 @@ async function smokePackage(packageRoot, label) {
 }
 
 try {
+  await smokePackage(pluginRoot, "working-tree");
   const packDirectory = path.join(temporaryRoot, "pack");
   const extractDirectory = path.join(temporaryRoot, "extract");
   await mkdir(packDirectory);
   await mkdir(extractDirectory);
-  run("npm", ["pack", "--pack-destination", packDirectory, "--silent"], { capture: true });
+  run("npm", ["pack", "--ignore-scripts", "--pack-destination", packDirectory, "--silent"], {
+    capture: true,
+  });
   const archiveName = (await readdir(packDirectory)).find((name) => name.endsWith(".tgz"));
   if (!archiveName) throw new Error("npm pack produced no tarball.");
   const archivePath = path.join(packDirectory, archiveName);
@@ -100,7 +119,7 @@ try {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  await smokePackage(extractedPackage, "git-snapshot");
+  await smokePackage(extractedPackage, "packed-tarball");
 
   const consumer = path.join(temporaryRoot, "consumer");
   await mkdir(consumer);
@@ -120,10 +139,18 @@ try {
   if (installedMetadata.name !== "codex-multi-email") {
     throw new Error("Installed package metadata is incorrect.");
   }
-  run(process.execPath, [path.join(installedPackage, "scripts", "multi-email"), "--help"], {
+  const executableDirectory = path.join(consumer, "node_modules", ".bin");
+  const setupExecutable = path.join(executableDirectory, "multi-email");
+  const mcpExecutable = path.join(executableDirectory, "multi-email-mcp");
+  await access(setupExecutable, fsConstants.X_OK);
+  await access(mcpExecutable, fsConstants.X_OK);
+  run(setupExecutable, ["--help"], {
     cwd: consumer,
   });
-  await smokePackage(installedPackage, "npm-install");
+  await smokePackage(installedPackage, "npm-install", {
+    command: mcpExecutable,
+    args: [],
+  });
 
   process.stdout.write(`Cold install passed (${archiveName}).\n`);
 } finally {

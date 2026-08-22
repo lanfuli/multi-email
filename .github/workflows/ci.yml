@@ -23,11 +23,23 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Verify release tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "$expected"
+
       - name: Install exact dependencies
         run: npm ci
 
+      - name: Verify committed bundle matches source
+        run: npm run validate:release
+
       - name: Build and validate
         run: npm run validate
+
+      - name: Verify build is reproducible
+        run: git diff --exit-code -- dist/
 
       - name: Verify cold Git and npm installs
         run: npm run pack:check
@@ -37,3 +49,6 @@ jobs:
 
       - name: Show package contents
         run: npm pack --dry-run --json
+
+      - name: Verify packaging did not mutate the committed bundle
+        run: git diff --exit-code -- dist/

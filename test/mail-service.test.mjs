@@ -5,11 +5,11 @@ import { MemoryCredentialStore } from "../src/keychain.mjs";
 import { MailService } from "../src/mail-service.mjs";
 import { SendApprovalStore } from "../src/send-approval.mjs";
 
-function config() {
+function config(provider = "google") {
   const value = emptyConfig();
   value.safety.maxWriteBatch = 2;
   value.safety.maxRecipients = 2;
-  value.accounts = [{ alias: "work", email: "owner@example.com", provider: "google" }];
+  value.accounts = [{ alias: "work", email: "owner@example.com", provider }];
   return validateConfig(value);
 }
 
@@ -18,16 +18,26 @@ function draft(overrides = {}) {
     account: "work",
     draftId: "draft-1",
     messageId: "message-1",
+    threadId: "thread-1",
+    from: "owner@example.com",
+    sender: "",
+    replyTo: [],
     to: ["recipient@example.com"],
     cc: [],
     bcc: [],
     subject: "Status",
+    inReplyTo: "",
+    references: "",
     body: "Ready to send.",
+    bodyFormat: "text",
+    attachments: [],
+    completeness: "complete",
+    rawPayloadSha256: "a".repeat(64),
     ...overrides,
   };
 }
 
-function harness({ initialDraft = draft(), sendError = null } = {}) {
+function harness({ initialDraft = draft(), providerName = "google", sendError = null } = {}) {
   const calls = {
     archive: 0,
     createDraft: 0,
@@ -35,7 +45,10 @@ function harness({ initialDraft = draft(), sendError = null } = {}) {
     diagnose: 0,
     reviewDraft: 0,
     requestApproval: 0,
+    search: 0,
     sendDraft: 0,
+    modifyLabels: 0,
+    sentManifest: undefined,
   };
   let currentDraft = structuredClone(initialDraft);
   const provider = {
@@ -44,6 +57,10 @@ function harness({ initialDraft = draft(), sendError = null } = {}) {
     },
     async getMessage(_account, id) {
       return { id };
+    },
+    async search(_account, input) {
+      calls.search += 1;
+      return { input };
     },
     async createDraft(_account, input) {
       calls.createDraft += 1;
@@ -69,18 +86,23 @@ function harness({ initialDraft = draft(), sendError = null } = {}) {
       calls.archive += 1;
       return { archived: ids.length };
     },
+    async modifyLabels(_account, ids, changes) {
+      calls.modifyLabels += 1;
+      return { ids, changes };
+    },
     async reviewDraft() {
       calls.reviewDraft += 1;
       return structuredClone(currentDraft);
     },
-    async sendDraft() {
+    async sendDraft(_account, _draftId, expectedManifest) {
       calls.sendDraft += 1;
+      calls.sentManifest = structuredClone(expectedManifest);
       if (sendError) throw sendError;
       return { status: "sent", sentMessageId: "sent-1" };
     },
   };
   const approvalStore = new SendApprovalStore({
-    ttlSeconds: config().safety.sendApprovalTtlSeconds,
+    ttlSeconds: config(providerName).safety.sendApprovalTtlSeconds,
   });
   const approvalUi = {
     async requestApproval(requestId) {
@@ -89,11 +111,11 @@ function harness({ initialDraft = draft(), sendError = null } = {}) {
     },
   };
   const service = new MailService({
-    config: config(),
+    config: config(providerName),
     credentialStore: new MemoryCredentialStore(),
     approvalStore,
     approvalUi,
-    providers: { google: provider },
+    providers: { [providerName]: provider },
   });
   return {
     approvalStore,
@@ -216,11 +238,55 @@ test("prepare opens the full local review without exposing its URL or full body 
   assert.equal(prepared.approvalWindowOpened, true);
   assert.equal(prepared.approvalStatus, "pending_human_approval");
   assert.equal(calls.requestApproval, 1);
-  assert.equal(
-    approvalStore.getPendingReview(prepared.approvalRequestId).review.body,
-    fullBody,
-  );
+  const pending = approvalStore.getPendingReview(prepared.approvalRequestId).review;
+  assert.equal(pending.body, fullBody);
+  assert.equal(pending.manifestVersion, 1);
+  assert.equal(pending.policyVersion, 2);
+  assert.equal(pending.provider, "google");
+  assert.equal(pending.authenticatedPrincipal, "owner@example.com");
+  assert.equal(pending.mailboxResource, "owner@example.com");
+  assert.equal(pending.from, "owner@example.com");
+  assert.equal(pending.sender, "");
+  assert.deepEqual(pending.replyTo, []);
+  assert.equal(pending.threadId, "thread-1");
+  assert.equal(pending.inReplyTo, "");
+  assert.equal(pending.references, "");
+  assert.equal(pending.bodyFormat, "text");
+  assert.match(pending.bodySha256, /^[a-f0-9]{64}$/u);
+  assert.deepEqual(pending.attachments, []);
+  assert.equal(pending.completeness, "complete");
+  assert.deepEqual(pending.providerRevision, {
+    messageId: "message-1",
+    threadId: "thread-1",
+    rawPayloadSha256: "a".repeat(64),
+    changeKey: null,
+    lastModifiedDateTime: null,
+  });
   assert.equal(calls.sendDraft, 0);
+});
+
+test("Microsoft manifests bind MIME hash and Graph revision markers together", async () => {
+  const { approvalStore, approve, calls, service } = harness({
+    providerName: "microsoft",
+    initialDraft: draft({
+      changeKey: "change-1",
+      lastModifiedDateTime: "2026-08-22T12:00:00Z",
+    }),
+  });
+  const prepared = await service.reviewDraft("work", "draft-1");
+  const pending = approvalStore.getPendingReview(prepared.approvalRequestId).review;
+
+  assert.equal(pending.provider, "microsoft");
+  assert.deepEqual(pending.providerRevision, {
+    messageId: "message-1",
+    threadId: "thread-1",
+    rawPayloadSha256: "a".repeat(64),
+    changeKey: "change-1",
+    lastModifiedDateTime: "2026-08-22T12:00:00Z",
+  });
+  approve(prepared);
+  await service.sendDraft("work", "draft-1", prepared.approvalRequestId);
+  assert.deepEqual(calls.sentManifest, pending);
 });
 
 test("send fails before out-of-band approval and succeeds only after it", async () => {
@@ -238,6 +304,14 @@ test("send fails before out-of-band approval and succeeds only after it", async 
   const sent = await service.sendDraft("work", "draft-1", prepared.approvalRequestId);
   assert.equal(sent.status, "sent");
   assert.equal(calls.sendDraft, 1);
+  assert.deepEqual(calls.sentManifest.providerRevision, {
+    messageId: "message-1",
+    threadId: "thread-1",
+    rawPayloadSha256: "a".repeat(64),
+    changeKey: null,
+    lastModifiedDateTime: null,
+  });
+  assert.equal(calls.sentManifest.body, "Ready to send.");
 });
 
 test("a draft changed after human approval is rejected before provider send", async () => {
@@ -264,6 +338,61 @@ test("a provider draft message identity change invalidates human approval", asyn
     { code: "DRAFT_CHANGED" },
   );
   assert.equal(calls.sendDraft, 0);
+});
+
+test("identity, HTML, attachment, and revision changes are rejected before send", async () => {
+  const changes = [
+    { sender: "owner@example.com", code: "DRAFT_CHANGED" },
+    { bodyFormat: "html", code: "DRAFT_NOT_REVIEWABLE" },
+    { attachments: [{ name: "invoice.pdf" }], code: "DRAFT_NOT_REVIEWABLE" },
+    { rawPayloadSha256: "b".repeat(64), code: "DRAFT_CHANGED" },
+  ];
+
+  for (const { code, ...change } of changes) {
+    const { approve, calls, changeDraft, service } = harness();
+    const prepared = await service.reviewDraft("work", "draft-1");
+    approve(prepared);
+    changeDraft(change);
+
+    await assert.rejects(
+      service.sendDraft("work", "draft-1", prepared.approvalRequestId),
+      { code },
+    );
+    assert.equal(calls.sendDraft, 0);
+    await assert.rejects(
+      service.sendDraft("work", "draft-1", prepared.approvalRequestId),
+      { code: "SEND_APPROVAL_REQUIRED" },
+    );
+  }
+});
+
+test("unsafe draft manifests are never offered for approval", async () => {
+  const unsafe = [
+    { completeness: "partial" },
+    { bodyFormat: "html" },
+    { from: "alias@example.com" },
+    { sender: "delegate@example.com" },
+    { replyTo: ["elsewhere@example.com"] },
+    { attachments: [{ name: "invoice.pdf" }] },
+    { rawPayloadSha256: null },
+    { to: undefined },
+    { cc: undefined },
+    { bcc: undefined },
+    { subject: undefined },
+    { inReplyTo: undefined },
+    { references: undefined },
+    { inReplyTo: "<valid@example.com> <second@example.com>" },
+    { references: "not-a-message-id" },
+  ];
+
+  for (const change of unsafe) {
+    const { calls, service } = harness({ initialDraft: draft(change) });
+    await assert.rejects(service.reviewDraft("work", "draft-1"), {
+      code: "DRAFT_NOT_REVIEWABLE",
+    });
+    assert.equal(calls.requestApproval, 0);
+    assert.equal(calls.sendDraft, 0);
+  }
 });
 
 test("a matching approval sends once and its request cannot be reused", async () => {
@@ -302,4 +431,102 @@ test("provider send failure becomes unknown status and is never retried", async 
     { code: "SEND_APPROVAL_REQUIRED" },
   );
   assert.equal(calls.sendDraft, 1);
+});
+
+test("provider final revision mismatch remains DRAFT_CHANGED", async () => {
+  const sendError = Object.assign(new Error("provider revision mismatch"), {
+    code: "DRAFT_CHANGED",
+  });
+  const { approve, calls, service } = harness({ sendError });
+  const prepared = await service.reviewDraft("work", "draft-1");
+  approve(prepared);
+
+  await assert.rejects(
+    service.sendDraft("work", "draft-1", prepared.approvalRequestId),
+    { code: "DRAFT_CHANGED" },
+  );
+  assert.equal(calls.sendDraft, 1);
+});
+
+test("provider preflight failure remains a definite verification failure", async () => {
+  const sendError = Object.assign(new Error("provider preflight unavailable"), {
+    code: "SEND_VERIFICATION_FAILED",
+  });
+  const { approve, calls, service } = harness({ sendError });
+  const prepared = await service.reviewDraft("work", "draft-1");
+  approve(prepared);
+
+  await assert.rejects(
+    service.sendDraft("work", "draft-1", prepared.approvalRequestId),
+    { code: "SEND_VERIFICATION_FAILED" },
+  );
+  assert.equal(calls.sendDraft, 1);
+  await assert.rejects(
+    service.sendDraft("work", "draft-1", prepared.approvalRequestId),
+    { code: "SEND_APPROVAL_REQUIRED" },
+  );
+});
+
+test("raw config values cannot exceed hard safety limits", async () => {
+  const rawConfig = config();
+  rawConfig.safety = {
+    maxSearchResults: 999,
+    maxWriteBatch: 999,
+    maxRecipients: 999,
+    sendApprovalTtlSeconds: 999,
+  };
+  const calls = { archive: 0, createDraft: 0, modifyLabels: 0, search: 0 };
+  const provider = {
+    async archive() {
+      calls.archive += 1;
+    },
+    async createDraft() {
+      calls.createDraft += 1;
+    },
+    async modifyLabels() {
+      calls.modifyLabels += 1;
+    },
+    async search() {
+      calls.search += 1;
+    },
+  };
+  const service = new MailService({ config: rawConfig, providers: { google: provider } });
+
+  await assert.rejects(
+    service.search("work", { query: "in:inbox", maxResults: 26 }),
+    { code: "SAFETY_LIMIT" },
+  );
+  await assert.rejects(
+    service.archive("work", Array.from({ length: 26 }, (_, index) => `id-${index}`)),
+    { code: "SAFETY_LIMIT" },
+  );
+  await assert.rejects(
+    service.createDraft("work", {
+      to: Array.from({ length: 21 }, (_, index) => `person-${index}@example.com`),
+      body: "Too many recipients",
+    }),
+    { code: "SAFETY_LIMIT" },
+  );
+  await assert.rejects(
+    service.modifyLabels("work", ["message-1"], {
+      addLabelIds: Array.from({ length: 26 }, (_, index) => `label-${index}`),
+    }),
+    { code: "SAFETY_LIMIT" },
+  );
+  await assert.rejects(
+    service.modifyLabels("work", ["message-1"], {
+      addLabelIds: Array.from({ length: 13 }, (_, index) => `add-${index}`),
+      removeLabelIds: Array.from({ length: 13 }, (_, index) => `remove-${index}`),
+    }),
+    { code: "SAFETY_LIMIT" },
+  );
+  await assert.rejects(
+    service.modifyLabels("work", ["message-1"], {
+      addLabelIds: ["same-label"],
+      removeLabelIds: ["same-label"],
+    }),
+    { code: "INVALID_INPUT" },
+  );
+  assert.equal(service.approvals.ttlMs, 300_000);
+  assert.deepEqual(calls, { archive: 0, createDraft: 0, modifyLabels: 0, search: 0 });
 });

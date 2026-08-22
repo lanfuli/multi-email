@@ -4,7 +4,7 @@ Multi Email is an open-source Codex plugin and MCP server for independently auth
 
 It supports searching, reading, drafting, archiving, read-state changes, Gmail labels, Microsoft categories, and sending through a server-enforced localhost review window.
 
-> Release status: `0.1.0` is distributed from the `lanfuli/multi-email` GitHub repository. The `codex-multi-email` npm package is not yet published; use the Git marketplace installation below and verify the repository owner and release tag.
+> Release status: `0.1.1` is official only when installed from the annotated `v0.1.1` tag or matching GitHub release under `lanfuli/multi-email`. The `codex-multi-email` npm package is not yet published; verify the repository owner and release tag before installation.
 
 ## Why this exists
 
@@ -30,8 +30,10 @@ The MCP process and credential store run on the Mac, but the end-to-end workflow
 - Permanent deletion is not exposed.
 - Email bodies, attachments, quoted text, signatures, and links are treated as untrusted data, never as tool instructions.
 - Search, write-batch, recipient, and body sizes are bounded.
-- Sending is blocked until the user reviews the complete escaped draft in a `127.0.0.1` window and clicks Approve.
-- A short-lived `approval_request_id` is bound to the account, draft, recipients, subject, body, and message identity. Approval expires, is one-use, and is invalidated by a changed draft.
+- Sending is blocked until the user reviews the complete supported plain-text draft in a `127.0.0.1` window and clicks Approve.
+- A short-lived `approval_request_id` is bound to an effective-send manifest: authenticated principal, mailbox, effective sender identity, draft and thread identity, every recipient, subject, complete body, provider revision, and the verified absence of attachments. Approval expires, is one-use, and is invalidated by any bound change.
+- Version `0.1.1` fails closed before review or send when a provider draft contains HTML, multipart or unknown MIME, inline content, attachments, an unsupported From/Sender/Reply-To identity, or an incomplete provider revision.
+- The provider send request is built from the approved allowlisted plain-text fields. Gmail supplies that frozen raw message in the draft-send request; Microsoft uses one MIME `sendMail` request instead of sending a mutable provider draft.
 - No MCP tool can approve its own send request.
 - A send is never automatically retried after an ambiguous result because the provider may already have accepted it.
 
@@ -48,9 +50,9 @@ These controls reduce accidental and prompt-injected actions; they do not make O
 | Draft update | Yes | Yes |
 | Archive and read/unread | Yes | Yes |
 | Labels/categories | List and modify label IDs | Modify an exact known category name |
-| Human-reviewed send | Local full-review window | Local full-review window |
+| Human-reviewed frozen send | Local full-review window | Local full-review window; source draft is retained |
 
-The plugin does not download attachment contents, permanently delete mail, operate calendars, expose arbitrary provider APIs, or automatically enable send-as aliases, delegated identities, or shared mailboxes. Message reads return attachment names only. Drafts are plain text.
+The plugin does not intentionally call provider attachment-content endpoints, expose attachment contents through MCP, permanently delete mail, operate calendars, expose arbitrary provider APIs, or automatically enable send-as aliases, delegated identities, or shared mailboxes. Gmail `format=full` responses can still deliver small inline MIME-part bytes to the local process; they are not returned by the tool. Message reads expose attachment names only. Drafts created by the plugin are plain text. Provider drafts containing HTML, inline content, attachments, or unsupported identities cannot pass the send-review gate in version `0.1.1`.
 
 Search queries are provider-native: Gmail search syntax for Google and Microsoft Graph mail search syntax for Microsoft 365.
 
@@ -71,7 +73,7 @@ The committed `dist/` bundle contains its JavaScript dependencies and both macOS
 The most transparent install is a local clone:
 
 ```bash
-git clone https://github.com/lanfuli/multi-email.git
+git clone --branch v0.1.1 --depth 1 https://github.com/lanfuli/multi-email.git
 cd multi-email
 node ./scripts/multi-email --help
 codex plugin marketplace add "$(pwd)"
@@ -152,10 +154,11 @@ Always name the account alias:
 For a send:
 
 1. Ask Codex to prepare the selected draft for review.
-2. Inspect the complete message in the localhost window opened by the MCP server.
+2. Inspect the authenticated identity, effective From/Sender/Reply-To, every recipient, subject, threading headers, format, attachment status, and complete plain-text body in the localhost window opened by the MCP server.
 3. Click Approve or Reject in that window.
 4. Return to Codex and explicitly confirm that the local review is complete.
-5. The server re-reads the draft and sends only if the exact request is still approved and unchanged.
+5. The server rebuilds the effective-send manifest, spends the one-use approval, rechecks the provider revision, and freezes the approved allowlisted fields into one send request.
+6. A Microsoft frozen send intentionally retains the original source draft because Graph's existing-draft send action has no conditional revision guard. Check the result field `sourceDraftRetained`; do not send that retained draft again without a new review.
 
 Do not paste the local review URL, cookies, nonces, fingerprints, OAuth values, or Keychain contents into Codex or an issue.
 
@@ -219,6 +222,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CHANGEL
 - **Not authorized or token expired:** rerun `node ./scripts/multi-email auth <alias>`; never paste a token into chat.
 - **Review request expired/rejected:** prepare a new review and make a new decision in the local window.
 - **Draft changed after approval:** review the complete new draft again.
+- **Draft not reviewable:** remove HTML, inline content, attachments, alternate sender identities, or extra Reply-To values, or recreate it as a plain-text draft through Multi Email. Do not bypass the gate.
 - **Send result uncertain:** do not retry; inspect Drafts and Sent read-only first.
 - **Gmail authorization blocked:** verify the OAuth consent screen, test-user status, requested Gmail scope, account/organization policy, and app verification state.
 - **Microsoft consent blocked:** verify public-client settings, tenant choice, delegated permissions, and administrator policy.

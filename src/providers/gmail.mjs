@@ -1,8 +1,9 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { auth as googleAuth, gmail as createGmailClient } from "@googleapis/gmail";
-import { GOOGLE_SCOPES } from "../constants.mjs";
+import { decodeWords } from "postal-mime";
+import { GOOGLE_SCOPES, HARD_SAFETY_LIMITS } from "../constants.mjs";
 import { MultiEmailError } from "../errors.mjs";
 import { credentialAccountKey, legacyCredentialAccountKey } from "../keychain.mjs";
 import {
@@ -11,9 +12,481 @@ import {
   headersToObject,
   splitAddressHeader,
 } from "../mime.mjs";
+import {
+  EFFECTIVE_SEND_MANIFEST_VERSION,
+  EFFECTIVE_SEND_POLICY_VERSION,
+} from "../send-approval.mjs";
 
-const PROFILE_HEADERS = ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID", "References"];
+const PROFILE_HEADERS = [
+  "From",
+  "To",
+  "Cc",
+  "Bcc",
+  "Subject",
+  "Date",
+  "Message-ID",
+  "In-Reply-To",
+  "References",
+];
 const REQUIRED_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
+const MAX_REVIEW_BODY_BYTES = 1024 * 1024;
+const MAX_REVIEW_RAW_BYTES = 2 * 1024 * 1024;
+const MAX_SUBJECT_BYTES = 998;
+const MAX_IN_REPLY_TO_BYTES = 900;
+const MAX_REFERENCES_BYTES = 8192;
+const UNSUPPORTED_MATERIAL_HEADERS = new Set([
+  "apparently-to",
+  "bounces-to",
+  "disposition-notification-to",
+  "envelope-to",
+  "errors-to",
+  "mail-followup-to",
+  "mail-reply-to",
+  "return-path",
+  "return-receipt-to",
+  "x-confirm-reading-to",
+]);
+
+function draftNotReviewable(message) {
+  return new MultiEmailError(message, "DRAFT_NOT_REVIEWABLE");
+}
+
+function headerValues(headers, name) {
+  if (headers !== undefined && !Array.isArray(headers)) {
+    throw draftNotReviewable("The Gmail draft headers are incomplete or invalid.");
+  }
+  const normalizedName = String(name).toLowerCase();
+  return (headers || [])
+    .filter((header) => String(header?.name || "").toLowerCase() === normalizedName)
+    .map((header) => String(header?.value ?? ""));
+}
+
+function uniqueHeader(headers, name, { required = false } = {}) {
+  const values = headerValues(headers, name);
+  if (values.length > 1 || (required && values.length !== 1)) {
+    throw draftNotReviewable(
+      `The Gmail draft must contain ${required ? "exactly one" : "at most one"} ${name} header.`,
+    );
+  }
+  return values[0];
+}
+
+function assertNoUnsupportedMaterialHeaders(headers) {
+  if (!Array.isArray(headers)) {
+    throw draftNotReviewable("The Gmail draft headers are incomplete or invalid.");
+  }
+  for (const header of headers) {
+    const name = String(header?.name || "").trim().toLowerCase();
+    if (name.startsWith("resent-") || UNSUPPORTED_MATERIAL_HEADERS.has(name)) {
+      throw draftNotReviewable(
+        "The Gmail draft contains an unsupported material sending header.",
+      );
+    }
+  }
+}
+
+function singleBareAddress(value, headerName) {
+  const text = String(value ?? "").trim();
+  if (/\r|\n/u.test(text)) {
+    throw draftNotReviewable(
+      `The Gmail draft ${headerName} header must contain exactly one email address.`,
+    );
+  }
+  const angleAddress = text.match(/^[^<>]*<([^<>]+)>$/u);
+  const candidate = (angleAddress?.[1] || text).trim();
+  const addresses = splitAddressHeader(candidate);
+  if (
+    addresses.length !== 1 ||
+    candidate.toLowerCase() !== addresses[0] ||
+    (!angleAddress && /[<>,;]/u.test(text))
+  ) {
+    throw draftNotReviewable(
+      `The Gmail draft ${headerName} header must contain exactly one email address.`,
+    );
+  }
+  return addresses[0];
+}
+
+function addressHeaderList(value, headerName) {
+  if (value === undefined || value === "") return [];
+  const text = String(value);
+  const entries = [];
+  let entry = "";
+  let inQuotes = false;
+  let escaped = false;
+  let angleDepth = 0;
+
+  for (const character of text) {
+    if (escaped) {
+      entry += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && inQuotes) {
+      entry += character;
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      inQuotes = !inQuotes;
+      entry += character;
+      continue;
+    }
+    if (!inQuotes && character === "<") angleDepth += 1;
+    if (!inQuotes && character === ">") angleDepth -= 1;
+    if (angleDepth < 0 || angleDepth > 1 || /\r|\n/u.test(character)) {
+      throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
+    }
+    if (!inQuotes && angleDepth === 0 && character === ",") {
+      if (!entry.trim()) {
+        throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
+      }
+      entries.push(entry);
+      entry = "";
+      continue;
+    }
+    entry += character;
+  }
+
+  if (inQuotes || escaped || angleDepth !== 0 || !entry.trim()) {
+    throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
+  }
+  entries.push(entry);
+  return entries.map((item) => singleBareAddress(item, headerName));
+}
+
+function singleAddressHeader(value, headerName) {
+  const addresses = addressHeaderList(value, headerName);
+  if (addresses.length !== 1) {
+    throw draftNotReviewable(
+      `The Gmail draft ${headerName} header must contain exactly one email address.`,
+    );
+  }
+  return addresses[0];
+}
+
+function decodeBase64UrlBytes(
+  value,
+  description,
+  { allowEmpty = true, maxBytes = MAX_REVIEW_RAW_BYTES } = {},
+) {
+  if (
+    typeof value !== "string" ||
+    (!allowEmpty && value.length === 0) ||
+    value.length > Math.ceil((maxBytes * 4) / 3) + 4 ||
+    !/^[A-Za-z0-9_-]*={0,2}$/u.test(value) ||
+    value.length % 4 === 1
+  ) {
+    throw draftNotReviewable(`The Gmail draft ${description} is missing or invalid.`);
+  }
+  const bytes = Buffer.from(value, "base64url");
+  if (
+    bytes.length > maxBytes ||
+    bytes.toString("base64url") !== value.replace(/=+$/u, "")
+  ) {
+    throw draftNotReviewable(`The Gmail draft ${description} is not valid base64url data.`);
+  }
+  return bytes;
+}
+
+function reviewPlainTextPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw draftNotReviewable("The Gmail draft has no complete MIME payload.");
+  }
+
+  const parts = payload.parts;
+  if ((parts != null && !Array.isArray(parts)) || (Array.isArray(parts) && parts.length)) {
+    throw draftNotReviewable(
+      "Multipart or nested Gmail drafts cannot be reviewed completely and will not be sent.",
+    );
+  }
+  if (String(payload.mimeType || "").trim().toLowerCase() !== "text/plain") {
+    throw draftNotReviewable(
+      "Only a single complete text/plain Gmail draft can be reviewed and sent.",
+    );
+  }
+  const contentType = uniqueHeader(payload.headers, "Content-Type");
+  if (contentType && contentType.split(";", 1)[0].trim().toLowerCase() !== "text/plain") {
+    throw draftNotReviewable("The Gmail draft has contradictory MIME content metadata.");
+  }
+  if (String(payload.filename || "").trim() || payload.body?.attachmentId) {
+    throw draftNotReviewable("Gmail drafts with attachments cannot be reviewed and sent.");
+  }
+
+  const contentDisposition = headerValues(payload.headers, "Content-Disposition");
+  const contentId = headerValues(payload.headers, "Content-ID");
+  if (contentDisposition.length || contentId.length) {
+    throw draftNotReviewable("Inline or attached Gmail MIME content cannot be reviewed and sent.");
+  }
+
+  const encodedBody = payload.body?.data;
+  const declaredSize = payload.body?.size;
+  if (!Number.isSafeInteger(declaredSize) || declaredSize < 0) {
+    throw draftNotReviewable("The Gmail draft body size is missing or invalid.");
+  }
+  if (encodedBody === undefined && declaredSize !== 0) {
+    throw draftNotReviewable("The Gmail draft body is incomplete and cannot be reviewed.");
+  }
+  const bodyBytes = decodeBase64UrlBytes(encodedBody ?? "", "body", {
+    maxBytes: MAX_REVIEW_BODY_BYTES,
+  });
+  if (bodyBytes.length !== declaredSize) {
+    throw draftNotReviewable("The Gmail draft body is incomplete and cannot be reviewed.");
+  }
+  if (bodyBytes.length > MAX_REVIEW_BODY_BYTES) {
+    throw draftNotReviewable("The Gmail draft body exceeds the 1 MB review limit.");
+  }
+
+  const body = bodyBytes.toString("utf8");
+  if (!Buffer.from(body, "utf8").equals(bodyBytes)) {
+    throw draftNotReviewable("The Gmail draft body is not valid UTF-8 text.");
+  }
+  return body;
+}
+
+function rawDraftRevision(response, draftId) {
+  const draft = response?.data;
+  const message = draft?.message;
+  if (
+    String(draft?.id || "") !== draftId ||
+    !message?.id ||
+    !message?.threadId ||
+    typeof message.raw !== "string"
+  ) {
+    throw draftNotReviewable("The Gmail raw draft identity or payload is incomplete.");
+  }
+  const rawBytes = decodeBase64UrlBytes(message.raw, "raw payload", {
+    allowEmpty: false,
+    maxBytes: MAX_REVIEW_RAW_BYTES,
+  });
+  return {
+    draftId: draft.id,
+    messageId: String(message.id),
+    threadId: String(message.threadId),
+    rawPayloadSha256: createHash("sha256").update(rawBytes).digest("hex"),
+  };
+}
+
+function assertSameDraftSnapshot(fullDraft, rawRevision, requestedDraftId) {
+  const message = fullDraft?.message;
+  if (
+    String(fullDraft?.id || "") !== requestedDraftId ||
+    !message?.id ||
+    !message?.threadId ||
+    String(message.id) !== rawRevision.messageId ||
+    String(message.threadId) !== rawRevision.threadId
+  ) {
+    throw draftNotReviewable(
+      "The Gmail full and raw draft snapshots do not identify the same message and thread.",
+    );
+  }
+  return message;
+}
+
+function assertSameRawRevision(before, after) {
+  if (
+    before.draftId !== after.draftId ||
+    before.messageId !== after.messageId ||
+    before.threadId !== after.threadId ||
+    before.rawPayloadSha256 !== after.rawPayloadSha256
+  ) {
+    throw draftNotReviewable(
+      "The Gmail draft changed while its complete raw revision was being reviewed.",
+    );
+  }
+}
+
+function reviewedSubject(headers) {
+  const encoded = uniqueHeader(headers, "Subject") ?? "";
+  if (/\r|\n/u.test(encoded) || Buffer.byteLength(encoded, "utf8") > MAX_SUBJECT_BYTES) {
+    throw draftNotReviewable("The Gmail draft Subject header is invalid or too long.");
+  }
+  let decoded;
+  try {
+    decoded = decodeWords(encoded);
+  } catch {
+    throw draftNotReviewable("The Gmail draft Subject header could not be decoded safely.");
+  }
+  if (
+    typeof decoded !== "string" ||
+    /\r|\n/u.test(decoded) ||
+    Buffer.byteLength(decoded, "utf8") > MAX_SUBJECT_BYTES
+  ) {
+    throw draftNotReviewable("The decoded Gmail draft Subject is invalid or too long.");
+  }
+  return decoded;
+}
+
+function reviewedThreadHeader(headers, name, maxBytes) {
+  const value = uniqueHeader(headers, name);
+  if (value === undefined) return "";
+  if (/\r|\n/u.test(value)) {
+    throw draftNotReviewable(`The Gmail draft ${name} header contains a line break.`);
+  }
+  const normalized = String(value).trim().replace(/[\t ]+/gu, " ");
+  if (!normalized || Buffer.byteLength(normalized, "utf8") > maxBytes) {
+    throw draftNotReviewable(`The Gmail draft ${name} header is empty or too long.`);
+  }
+  if (
+    name === "References" &&
+    normalized.split(" ").some((token) => Buffer.byteLength(token, "utf8") > 900)
+  ) {
+    throw draftNotReviewable("The Gmail draft References header contains an oversized message ID.");
+  }
+  return normalized;
+}
+
+function draftChanged(
+  message = "The Gmail draft changed after review. Prepare and review it again before sending.",
+) {
+  return new MultiEmailError(message, "DRAFT_CHANGED");
+}
+
+function requireManifestString(
+  manifest,
+  field,
+  { allowEmpty = false, allowLineBreaks = false, maxBytes = 4096 } = {},
+) {
+  const value = manifest?.[field];
+  if (
+    typeof value !== "string" ||
+    (!allowEmpty && value.length === 0) ||
+    (!allowLineBreaks && /\r|\n/u.test(value)) ||
+    Buffer.byteLength(value, "utf8") > maxBytes
+  ) {
+    throw draftChanged("The approved Gmail send manifest is missing or malformed.");
+  }
+  return value;
+}
+
+function requireCanonicalAddresses(manifest, field) {
+  const values = manifest?.[field];
+  if (!Array.isArray(values)) {
+    throw draftChanged("The approved Gmail send manifest is missing or malformed.");
+  }
+  return Array.from({ length: values.length }, (_, index) => {
+    if (!Object.hasOwn(values, index)) {
+      throw draftChanged("The approved Gmail send manifest contains a sparse address list.");
+    }
+    const value = values[index];
+    const address = requireManifestString({ value }, "value", { maxBytes: 320 });
+    let normalized;
+    try {
+      normalized = singleBareAddress(address, field);
+    } catch {
+      throw draftChanged("The approved Gmail send manifest contains an invalid address.");
+    }
+    if (address !== normalized) {
+      throw draftChanged("The approved Gmail send manifest contains a non-canonical address.");
+    }
+    return normalized;
+  });
+}
+
+function validatedApprovedManifest(account, draftId, manifest) {
+  const invalid = () => {
+    throw draftChanged("A complete approved Gmail send manifest is required before sending.");
+  };
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) invalid();
+
+  const expectedEmail = String(account?.email || "").trim().toLowerCase();
+  if (
+    manifest.manifestVersion !== EFFECTIVE_SEND_MANIFEST_VERSION ||
+    manifest.policyVersion !== EFFECTIVE_SEND_POLICY_VERSION ||
+    manifest.account !== account?.alias ||
+    manifest.provider !== "google" ||
+    manifest.authenticatedPrincipal !== expectedEmail ||
+    manifest.mailboxResource !== expectedEmail ||
+    manifest.draftId !== draftId ||
+    manifest.bodyFormat !== "text" ||
+    manifest.completeness !== "complete" ||
+    !Array.isArray(manifest.attachments) ||
+    manifest.attachments.length !== 0 ||
+    !Array.isArray(manifest.replyTo) ||
+    manifest.replyTo.length !== 0
+  ) {
+    invalid();
+  }
+
+  const messageId = requireManifestString(manifest, "messageId", { maxBytes: 1024 });
+  const threadId = requireManifestString(manifest, "threadId", { maxBytes: 1024 });
+  const from = requireManifestString(manifest, "from", { maxBytes: 320 });
+  const sender = requireManifestString(manifest, "sender", { maxBytes: 320 });
+  if (from !== expectedEmail || sender !== expectedEmail) invalid();
+
+  const to = requireCanonicalAddresses(manifest, "to");
+  const cc = requireCanonicalAddresses(manifest, "cc");
+  const bcc = requireCanonicalAddresses(manifest, "bcc");
+  const recipientCount = to.length + cc.length + bcc.length;
+  if (recipientCount === 0 || recipientCount > HARD_SAFETY_LIMITS.maxRecipients) invalid();
+
+  const subject = requireManifestString(manifest, "subject", {
+    allowEmpty: true,
+    maxBytes: MAX_SUBJECT_BYTES,
+  });
+  const body = requireManifestString(manifest, "body", {
+    allowEmpty: true,
+    allowLineBreaks: true,
+    maxBytes: MAX_REVIEW_BODY_BYTES,
+  });
+  const bodySha256 = requireManifestString(manifest, "bodySha256", { maxBytes: 64 });
+  if (
+    !/^[a-f0-9]{64}$/u.test(bodySha256) ||
+    bodySha256 !== createHash("sha256").update(body, "utf8").digest("hex")
+  ) {
+    invalid();
+  }
+
+  const inReplyTo = requireManifestString(manifest, "inReplyTo", {
+    allowEmpty: true,
+    maxBytes: MAX_IN_REPLY_TO_BYTES,
+  });
+  const references = requireManifestString(manifest, "references", {
+    allowEmpty: true,
+    maxBytes: MAX_REFERENCES_BYTES,
+  });
+  const referenceTokens = references ? references.split(/[\t ]+/u) : [];
+  if (
+    inReplyTo !== inReplyTo.trim().replace(/[\t ]+/gu, " ") ||
+    references !== references.trim().replace(/[\t ]+/gu, " ") ||
+    (inReplyTo && !/^<[^<>\s]{1,900}>$/u.test(inReplyTo)) ||
+    referenceTokens.some(
+      (token) =>
+        Buffer.byteLength(token, "utf8") > 900 || !/^<[^<>\s]{1,900}>$/u.test(token),
+    )
+  ) {
+    invalid();
+  }
+
+  const revision = manifest.providerRevision;
+  if (
+    !revision ||
+    typeof revision !== "object" ||
+    Array.isArray(revision) ||
+    revision.messageId !== messageId ||
+    revision.threadId !== threadId ||
+    typeof revision.rawPayloadSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(revision.rawPayloadSha256) ||
+    revision.changeKey !== null ||
+    revision.lastModifiedDateTime !== null
+  ) {
+    invalid();
+  }
+
+  return {
+    messageId,
+    threadId,
+    from,
+    to,
+    cc,
+    bcc,
+    subject,
+    body,
+    inReplyTo,
+    references,
+    providerRevision: revision,
+  };
+}
 
 function credentialKey(config, account) {
   return credentialAccountKey(config, account);
@@ -650,31 +1123,137 @@ export class GmailProvider {
 
   async reviewDraft(account, draftId) {
     const gmail = await this.client(account);
-    const response = await gmail.users.drafts.get({
+    const rawBeforeResponse = await gmail.users.drafts.get({
+      userId: "me",
+      id: draftId,
+      format: "raw",
+    });
+    const fullResponse = await gmail.users.drafts.get({
       userId: "me",
       id: draftId,
       format: "full",
     });
-    const message = response.data.message || {};
-    const headers = headersToObject(message.payload?.headers);
-    const extracted = extractGmailBody(message.payload);
+    const rawAfterResponse = await gmail.users.drafts.get({
+      userId: "me",
+      id: draftId,
+      format: "raw",
+    });
+    const revisionBefore = rawDraftRevision(rawBeforeResponse, draftId);
+    const revisionAfter = rawDraftRevision(rawAfterResponse, draftId);
+    assertSameRawRevision(revisionBefore, revisionAfter);
+    const message = assertSameDraftSnapshot(fullResponse.data, revisionAfter, draftId);
+    const payloadHeaders = message.payload?.headers;
+    assertNoUnsupportedMaterialHeaders(payloadHeaders);
+    const from = singleAddressHeader(
+      uniqueHeader(payloadHeaders, "From", { required: true }),
+      "From",
+    );
+    const expectedFrom = String(account.email || "").trim().toLowerCase();
+    if (from !== expectedFrom) {
+      throw draftNotReviewable(
+        "The Gmail draft From identity does not match the configured primary account.",
+      );
+    }
+
+    const senderHeader = uniqueHeader(payloadHeaders, "Sender");
+    const sender = senderHeader === undefined
+      ? expectedFrom
+      : singleAddressHeader(senderHeader, "Sender");
+    if (sender !== expectedFrom) {
+      throw draftNotReviewable(
+        "The Gmail draft Sender identity does not match the configured primary account.",
+      );
+    }
+    if (headerValues(payloadHeaders, "Reply-To").length) {
+      throw draftNotReviewable(
+        "Gmail drafts with a Reply-To identity cannot be reviewed and sent.",
+      );
+    }
+
+    const to = uniqueHeader(payloadHeaders, "To");
+    const cc = uniqueHeader(payloadHeaders, "Cc");
+    const bcc = uniqueHeader(payloadHeaders, "Bcc");
+    const subject = reviewedSubject(payloadHeaders);
+    const inReplyTo = reviewedThreadHeader(
+      payloadHeaders,
+      "In-Reply-To",
+      MAX_IN_REPLY_TO_BYTES,
+    );
+    const references = reviewedThreadHeader(
+      payloadHeaders,
+      "References",
+      MAX_REFERENCES_BYTES,
+    );
+    const body = reviewPlainTextPayload(message.payload);
     return {
       account: account.alias,
       draftId,
       messageId: message.id,
-      to: splitAddressHeader(headers.to),
-      cc: splitAddressHeader(headers.cc),
-      bcc: splitAddressHeader(headers.bcc),
-      subject: headers.subject || "",
-      body: extracted.body || extracted.htmlBody || "",
+      threadId: message.threadId,
+      from,
+      sender,
+      replyTo: [],
+      to: addressHeaderList(to, "To"),
+      cc: addressHeaderList(cc, "Cc"),
+      bcc: addressHeaderList(bcc, "Bcc"),
+      subject,
+      body,
+      inReplyTo,
+      references,
+      bodyFormat: "text",
+      attachments: [],
+      completeness: "complete",
+      truncated: false,
+      rawPayloadSha256: revisionAfter.rawPayloadSha256,
     };
   }
 
-  async sendDraft(account, draftId) {
+  async sendDraft(account, draftId, approvedManifest) {
+    const approved = validatedApprovedManifest(account, draftId, approvedManifest);
+    let raw;
+    try {
+      raw = buildRawMessage({
+        from: approved.from,
+        to: approved.to,
+        cc: approved.cc,
+        bcc: approved.bcc,
+        subject: approved.subject,
+        body: approved.body,
+        inReplyTo: approved.inReplyTo || undefined,
+        references: approved.references || undefined,
+      });
+    } catch {
+      throw draftChanged("The approved Gmail send manifest could not be reconstructed safely.");
+    }
+
     const gmail = await this.client(account);
+    let currentRevision;
+    try {
+      const rawResponse = await gmail.users.drafts.get({
+        userId: "me",
+        id: draftId,
+        format: "raw",
+      });
+      currentRevision = rawDraftRevision(rawResponse, draftId);
+    } catch {
+      throw draftChanged(
+        "The Gmail draft could not be verified against the reviewed revision. Prepare and review it again before sending.",
+      );
+    }
+    if (
+      currentRevision.messageId !== approved.providerRevision.messageId ||
+      currentRevision.threadId !== approved.providerRevision.threadId ||
+      currentRevision.rawPayloadSha256 !== approved.providerRevision.rawPayloadSha256
+    ) {
+      throw draftChanged(
+        "The Gmail draft changed after review. Prepare and review it again before sending.",
+      );
+    }
+    const message = { raw };
+    if (approved.threadId) message.threadId = approved.threadId;
     const response = await gmail.users.drafts.send({
       userId: "me",
-      requestBody: { id: draftId },
+      requestBody: { id: draftId, message },
     });
     return {
       account: account.alias,

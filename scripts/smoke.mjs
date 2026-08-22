@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,11 +16,14 @@ const serverEntry = existsSync(bundledServer)
   : path.join(pluginRoot, "src", "server.mjs");
 const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "multi-email-smoke-"));
 const configPath = path.join(tempDirectory, "config.json");
+const packageJson = JSON.parse(
+  await readFile(path.join(pluginRoot, "package.json"), "utf8"),
+);
 let client;
 
 try {
   await saveConfig(emptyConfig(), configPath);
-  client = new Client({ name: "multi-email-smoke", version: "0.1.0" });
+  client = new Client({ name: "multi-email-smoke", version: packageJson.version });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverEntry],
@@ -33,6 +36,13 @@ try {
   });
 
   await client.connect(transport);
+  const server = client.getServerVersion();
+  if (server?.name !== "codex-multi-email" || server?.version !== packageJson.version) {
+    throw new Error(
+      `MCP server reported ${server?.name || "unknown"}@${server?.version || "unknown"}; ` +
+        `expected codex-multi-email@${packageJson.version}.`,
+    );
+  }
   const { tools } = await client.listTools();
   if (!Array.isArray(tools) || tools.length === 0) {
     throw new Error("MCP server started but advertised no tools.");
