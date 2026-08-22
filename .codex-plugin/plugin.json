@@ -1,0 +1,38 @@
+{
+  "name": "multi-email",
+  "version": "0.1.0",
+  "description": "Safely manage multiple Gmail and Microsoft 365 mailboxes through one local MCP server.",
+  "author": {
+    "name": "Vincent_Lan",
+    "url": "https://github.com/lanfuli"
+  },
+  "homepage": "https://github.com/lanfuli/multi-email#readme",
+  "repository": "https://github.com/lanfuli/multi-email",
+  "license": "MIT",
+  "keywords": [
+    "email",
+    "gmail",
+    "microsoft-365",
+    "multi-account"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Multi Email",
+    "shortDescription": "Route Gmail and Microsoft 365 by explicit account alias.",
+    "longDescription": "An alias-routed plugin for searching, reading, drafting, and organizing multiple Gmail and Microsoft 365 mailboxes. Sending requires approval in a server-enforced localhost review window.",
+    "developerName": "Vincent_Lan",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/lanfuli/multi-email",
+    "privacyPolicyURL": "https://github.com/lanfuli/multi-email/blob/main/SECURITY.md#privacy-and-data-flow",
+    "defaultPrompt": [
+      "Review unread mail across my connected accounts without making changes.",
+      "Create a draft reply in a specific account for my review.",
+      "Find messages that need my reply across named account aliases."
+    ]
+  }
+}

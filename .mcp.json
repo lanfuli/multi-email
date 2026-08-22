@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "multi-email": {
+      "command": "./scripts/launch-mcp",
+      "args": [],
+      "cwd": ".",
+      "env_vars": [
+        "CODEX_MULTI_EMAIL_CONFIG",
+        "HOME",
+        "PATH",
+        "XDG_CONFIG_HOME"
+      ],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 120
+    }
+  }
+}

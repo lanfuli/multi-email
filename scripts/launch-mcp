@@ -1,0 +1,17 @@
+#!/usr/bin/env node
+
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const bundledEntry = path.join(pluginRoot, "dist", "server.cjs");
+const sourceEntry = path.join(pluginRoot, "src", "server.mjs");
+const entry = existsSync(bundledEntry) ? bundledEntry : sourceEntry;
+const loaded = await import(pathToFileURL(entry).href);
+const startServer = loaded.startServer || loaded.default?.startServer;
+
+startServer().catch(() => {
+  console.error("[multi-email] MCP server failed to start.");
+  process.exitCode = 1;
+});

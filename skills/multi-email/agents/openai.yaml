@@ -1,0 +1,6 @@
+interface:
+  display_name: "Multi Email"
+  short_description: "Route named Gmail and Microsoft 365 mailboxes safely"
+  default_prompt: "Use $multi-email to review unread mail across my connected accounts without making changes."
+policy:
+  allow_implicit_invocation: true
