@@ -39660,7 +39660,7 @@ function findAccount(config, alias) {
 /* harmony export */ });
 /* unused harmony export MICROSOFT_SCOPES */
 const APP_NAME = "codex-multi-email";
-const APP_VERSION = "0.1.3";
+const APP_VERSION = "0.1.4";
 const CONFIG_VERSION = 2;
 const KEYCHAIN_SERVICE = "io.github.lanfuli.multi-email";
 const LEGACY_KEYCHAIN_SERVICE = "com.openai.codex.multi-email";

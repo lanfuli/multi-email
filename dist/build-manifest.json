@@ -1,9 +1,9 @@
 {
   "entry": "server.cjs",
-  "appVersion": "0.1.3",
+  "appVersion": "0.1.4",
   "ncc": "0.45.0",
   "keyring": "1.3.0",
-  "sourceSha256": "3ab2a9b917ab95d3468d3715218be185f81823ed75cd39a11e31238e0ffe4962",
+  "sourceSha256": "653ac4e225d5d8e39eeef1edecf52eeb51e67abf2f766a834889a7be7c262fae",
   "artifacts": {
     "101.index.cjs.js": "481a1757a755e10da403c9a3a70a0c9bed7bdcc9e6459bf239751faadd28b0fb",
     "669.index.cjs.js": "0e135ec0dd95d681f533744ca5212a7ad6036726f5278e126ac848d59bccdedb",
@@ -11,7 +11,7 @@
     "keyring.darwin-arm64.node": "9627560bd2490b8495504df6b48dafe0153883aab09fd8eee976f826c74a6fff",
     "keyring.darwin-x64.node": "3ad3b083cab321be04223e7fa1a22a8258c32c4da0883886683e25dcba9d03cc",
     "licenses.txt": "9a07b03fd24caeed0c08178b5c2e272e380aec2a86e0b9d85644a2312bf61eb7",
-    "server.cjs": "8ec4028bcb829508743438f9d46b35d8ccd7b060352e1aeee626c4c7771dd37c"
+    "server.cjs": "6bd3e3a45134345f6c1fc2a301dcd5ec92aee715a5f652d05790cee1cd623f62"
   },
   "nativeAssets": [
     "keyring.darwin-arm64.node",

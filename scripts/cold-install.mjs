@@ -131,6 +131,7 @@ try {
   await access(path.join(extractedPackage, "dist", `keyring.darwin-${process.arch}.node`));
   await access(path.join(extractedPackage, "CONTRIBUTING.md"));
   await access(path.join(extractedPackage, "CODE_OF_CONDUCT.md"));
+  await access(path.join(extractedPackage, "assets", "plugin-icon.png"));
   await access(path.join(extractedPackage, "docs", "google-oauth.md"));
   await access(path.join(extractedPackage, "docs", "microsoft-entra.md"));
   try {
