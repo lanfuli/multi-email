@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,6 +27,30 @@ test("validateConfig normalizes account identity and supplies safety defaults", 
   assert.equal(result.safety.maxRecipients > 0, true);
   assert.match(result.profileId, /^[a-z0-9-]{8,64}$/);
   assert.equal(findAccount(result, "PRIMARY_GMAIL").email, "owner@example.com");
+});
+
+test("validateConfig canonicalizes Microsoft OAuth configuration", () => {
+  const config = emptyConfig();
+  config.providers.microsoft = {
+    clientId: " ABCDEFAB-1234-5678-90AB-ABCDEFABCDEF ",
+    tenant: " Example.OnMicrosoft.COM ",
+  };
+
+  const result = validateConfig(config);
+
+  assert.deepEqual(result.providers.microsoft, {
+    clientId: "abcdefab-1234-5678-90ab-abcdefabcdef",
+    tenant: "example.onmicrosoft.com",
+  });
+
+  for (const microsoft of [
+    { clientId: "not-a-guid", tenant: "organizations" },
+    { clientId: "abcdefab-1234-5678-90ab-abcdefabcdef", tenant: "../common" },
+  ]) {
+    const invalid = emptyConfig();
+    invalid.providers.microsoft = microsoft;
+    assert.throws(() => validateConfig(invalid), { code: "INVALID_CONFIG" });
+  }
 });
 
 test("legacy version-one config gets a stable path-bound profile without an implicit write", async () => {
@@ -94,6 +128,96 @@ test("validateConfig rejects unsupported providers and invalid safety values", (
     { alias: "mail", email: "<script>@example.com", provider: "google" },
   ];
   assert.throws(() => validateConfig(htmlBearing), { code: "INVALID_CONFIG" });
+
+  const groupSyntax = emptyConfig();
+  groupSyntax.accounts = [
+    { alias: "mail", email: "victim:attacker@example.com", provider: "google" },
+  ];
+  assert.throws(() => validateConfig(groupSyntax), { code: "INVALID_CONFIG" });
+});
+
+test("loadConfig does not disclose its filesystem path for invalid JSON", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-config-json-"));
+  const configPath = path.join(directory, "private-name.json");
+  try {
+    await writeFile(configPath, "{not-json\n");
+    await assert.rejects(
+      loadConfig(configPath),
+      (error) =>
+        error.code === "INVALID_CONFIG" &&
+        !error.message.includes(configPath) &&
+        !error.message.includes("private-name.json"),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("saveConfig preserves existing parent permissions and secures new files", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-config-mode-"));
+  const existingParent = path.join(directory, "shared");
+  const newParent = path.join(directory, "private");
+  try {
+    await mkdir(existingParent, { mode: 0o755 });
+    await chmod(existingParent, 0o755);
+
+    const existingPath = path.join(existingParent, "config.json");
+    const newPath = path.join(newParent, "config.json");
+    await saveConfig(emptyConfig(), existingPath);
+    await saveConfig(emptyConfig(), newPath);
+
+    assert.equal((await lstat(existingParent)).mode & 0o777, 0o755);
+    assert.equal((await lstat(newParent)).mode & 0o777, 0o700);
+    assert.equal((await lstat(existingPath)).mode & 0o777, 0o600);
+    assert.equal((await lstat(newPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("saveConfig rejects symlink and non-regular targets without touching their contents", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-config-link-"));
+  const victimPath = path.join(directory, "victim.txt");
+  const linkedPath = path.join(directory, "config.json");
+  const directoryPath = path.join(directory, "config-directory");
+  try {
+    await writeFile(victimPath, "keep me\n", { mode: 0o644 });
+    await symlink(victimPath, linkedPath);
+    await mkdir(directoryPath);
+
+    await assert.rejects(saveConfig(emptyConfig(), linkedPath), {
+      code: "INVALID_CONFIG_PATH",
+    });
+    await assert.rejects(saveConfig(emptyConfig(), directoryPath), {
+      code: "INVALID_CONFIG_PATH",
+    });
+    assert.equal(await readFile(victimPath, "utf8"), "keep me\n");
+    assert.deepEqual(
+      (await readdir(directory)).filter((name) => name.endsWith(".tmp")),
+      [],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("saveConfig ignores the old predictable temporary path and never follows it", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-config-temp-link-"));
+  const victimPath = path.join(directory, "victim.txt");
+  const configPath = path.join(directory, "config.json");
+  const predictableTempPath = `${configPath}.${process.pid}.tmp`;
+  try {
+    await writeFile(victimPath, "do not overwrite\n", { mode: 0o644 });
+    await symlink(victimPath, predictableTempPath);
+
+    await saveConfig(emptyConfig(), configPath);
+
+    assert.equal(await readFile(victimPath, "utf8"), "do not overwrite\n");
+    assert.equal((await lstat(predictableTempPath)).isSymbolicLink(), true);
+    assert.equal((await lstat(configPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("configured safety values may tighten but never expand hard limits", () => {

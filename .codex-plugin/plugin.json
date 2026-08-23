@@ -1,6 +1,6 @@
 {
   "name": "multi-email",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Safely manage multiple Gmail and Microsoft 365 mailboxes through one local MCP server.",
   "author": {
     "name": "Vincent_Lan",

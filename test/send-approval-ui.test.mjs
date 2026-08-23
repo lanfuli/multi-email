@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SendApprovalStore } from "../src/send-approval.mjs";
-import { LocalSendApprovalUi } from "../src/send-approval-ui.mjs";
+import {
+  defaultBrowserCommand,
+  LocalSendApprovalUi,
+} from "../src/send-approval-ui.mjs";
 
 function review(overrides = {}) {
   return {
@@ -208,4 +211,63 @@ test("localhost UI rejection removes the send request", async (context) => {
     () => store.getPendingReview(prepared.requestId),
     { code: "SEND_APPROVAL_REQUIRED" },
   );
+});
+
+test("macOS approval launch uses the absolute system opener", () => {
+  assert.deepEqual(
+    defaultBrowserCommand("http://127.0.0.1:45678/review/session", "darwin"),
+    {
+      command: "/usr/bin/open",
+      args: ["http://127.0.0.1:45678/review/session"],
+    },
+  );
+  assert.throws(
+    () => defaultBrowserCommand("https://attacker.example/review/session", "darwin"),
+    { code: "INVALID_APPROVAL_URL" },
+  );
+});
+
+test("localhost UI caps active sessions and sweeps expired sessions", async (context) => {
+  let now = Date.parse("2026-08-22T12:00:00Z");
+  const store = new SendApprovalStore({ ttlSeconds: 1, clock: () => now });
+  const ui = new LocalSendApprovalUi({
+    approvalStore: store,
+    browserOpener: async () => {},
+    clock: () => now,
+    maxSessions: 1,
+  });
+  context.after(() => ui.stop());
+
+  const first = store.prepare(review({ draftId: "draft-1" }));
+  await ui.requestApproval(first.requestId);
+  assert.equal(ui.sessionCount(), 1);
+
+  const second = store.prepare(review({ draftId: "draft-2" }));
+  await assert.rejects(ui.requestApproval(second.requestId), {
+    code: "APPROVAL_UI_CAPACITY",
+  });
+  assert.equal(ui.sessionCount(), 1);
+
+  now += 1_001;
+  const third = store.prepare(review({ draftId: "draft-3" }));
+  await assert.doesNotReject(ui.requestApproval(third.requestId));
+  assert.equal(ui.sessionCount(), 1);
+});
+
+test("localhost UI releases a reserved session when browser launch fails", async (context) => {
+  const store = new SendApprovalStore();
+  const prepared = store.prepare(review());
+  const ui = new LocalSendApprovalUi({
+    approvalStore: store,
+    browserOpener: async () => {
+      throw new Error("browser unavailable");
+    },
+    maxSessions: 1,
+  });
+  context.after(() => ui.stop());
+
+  await assert.rejects(ui.requestApproval(prepared.requestId), {
+    code: "APPROVAL_UI_UNAVAILABLE",
+  });
+  assert.equal(ui.sessionCount(), 0);
 });

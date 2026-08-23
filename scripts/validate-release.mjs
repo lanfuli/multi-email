@@ -21,6 +21,19 @@ const skill = await readFile(path.join(pluginRoot, "skills/multi-email/SKILL.md"
 const readme = await readFile(path.join(pluginRoot, "README.md"), "utf8");
 const changelog = await readFile(path.join(pluginRoot, "CHANGELOG.md"), "utf8");
 const constants = await readFile(path.join(pluginRoot, "src/constants.mjs"), "utf8");
+const buildInputs = await buildInputFiles(pluginRoot);
+const instructionFiles = [
+  ...buildInputs.filter((relative) => relative.startsWith("src/")),
+  "scripts/launch-mcp",
+  "scripts/multi-email",
+  "skills/multi-email/SKILL.md",
+  "skills/multi-email/agents/openai.yaml",
+];
+const publishedInstructions = (
+  await Promise.all(
+    instructionFiles.map((relative) => readFile(path.join(pluginRoot, relative), "utf8")),
+  )
+).join("\n");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -38,6 +51,11 @@ assert(packageJson.repository?.url?.includes("lanfuli/multi-email"), "Repository
 assert(packageJson.bin?.["multi-email"], "The setup CLI bin is missing.");
 assert(packageJson.bin?.["multi-email-mcp"], "The MCP bin is missing.");
 assert(packageJson.files?.includes("dist/"), "The package files whitelist omits dist.");
+assert(
+  packageJson.files?.includes("CONTRIBUTING.md") &&
+    packageJson.files?.includes("CODE_OF_CONDUCT.md"),
+  "The package files whitelist leaves README documentation links broken.",
+);
 
 assert(plugin.name === "multi-email", "Unexpected Codex plugin name.");
 assert(plugin.version === packageJson.version, "Plugin and package versions differ.");
@@ -55,6 +73,19 @@ assert(
 assert(
   changelog.includes(`## [${packageJson.version}]`),
   "CHANGELOG lacks the current package version.",
+);
+assert(
+  readme.includes(
+    `codex plugin marketplace add lanfuli/multi-email --ref v${packageJson.version}`,
+  ),
+  "README Git marketplace installation is not pinned to the release tag.",
+);
+assert(
+  !readme.includes("\nnpm run setup") &&
+    !/\bnpm run setup\b|\bsetup (?:add-account|auth|doctor|init|list|logout|revoke|set-microsoft-client)\b/iu.test(
+      publishedInstructions,
+    ),
+  "Consumer-incompatible npm run setup guidance remains.",
 );
 
 assert(marketplace.name === "multi-email", "Unexpected marketplace name.");
@@ -79,7 +110,7 @@ assert(build.appVersion === packageJson.version, "Bundled app version is stale."
 assert(build.ncc === packageJson.devDependencies?.["@vercel/ncc"], "ncc versions differ.");
 assert(build.keyring === packageJson.dependencies?.["@napi-rs/keyring"], "Keyring versions differ.");
 assert(
-  build.sourceSha256 === await digestFiles(pluginRoot, await buildInputFiles(pluginRoot)),
+  build.sourceSha256 === await digestFiles(pluginRoot, buildInputs),
   "Bundled source digest is stale. Run npm run build and commit dist.",
 );
 const distDirectory = path.join(pluginRoot, "dist");

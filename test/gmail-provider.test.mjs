@@ -228,6 +228,33 @@ test("reviewDraft returns a complete identity-bound plain-text manifest", async 
   });
 });
 
+test("reviewDraft accepts display names but rejects non-canonical recipient syntax", async () => {
+  const displayPayload = plainPayload();
+  displayPayload.headers.find((header) => header.name === "To").value =
+    '"Recipient, One" <Recipient@Example.COM>';
+  const { mail: displayMail } = harness({
+    full: fullDraft({ payload: displayPayload }),
+  });
+  assert.deepEqual((await displayMail.reviewDraft(account, "draft-1")).to, [
+    "recipient@example.com",
+  ]);
+
+  for (const value of [
+    "victim:attacker@example.com",
+    "victim:<attacker@example.com>",
+    "good@example.com, malformed",
+    "owner\0@example.com",
+    "Owner\0 <owner@example.com>",
+  ]) {
+    const payload = plainPayload();
+    payload.headers.find((header) => header.name === "To").value = value;
+    const { mail } = harness({ full: fullDraft({ payload }) });
+    await assert.rejects(mail.reviewDraft(account, "draft-1"), {
+      code: "DRAFT_NOT_REVIEWABLE",
+    });
+  }
+});
+
 test("reviewDraft decodes Subject and binds reply-thread headers explicitly", async () => {
   const payload = plainPayload({
     headers: [

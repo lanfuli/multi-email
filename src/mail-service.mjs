@@ -491,7 +491,12 @@ export class MailService {
     const preview = safePreview(canonical.body);
     let approvalWindowOpened = false;
     if (this.approvalUi) {
-      await this.approvalUi.requestApproval(approval.requestId);
+      try {
+        await this.approvalUi.requestApproval(approval.requestId);
+      } catch (error) {
+        this.approvals.discard(approval.requestId);
+        throw error;
+      }
       approvalWindowOpened = true;
     }
     return {

@@ -387,6 +387,61 @@ test("reviewDraft returns a complete manifest bound to stable raw plain-text MIM
   assert.equal(calls[1].options.maxResponseBytes, 2 * 1024 * 1024);
 });
 
+test("Microsoft config and draft review require canonical OAuth and mailbox values", async () => {
+  const invalidConfig = emptyConfig();
+  invalidConfig.providers.microsoft = {
+    clientId: "not-a-guid",
+    tenant: "organizations",
+  };
+  assert.throws(() => validateConfig(invalidConfig), { code: "INVALID_CONFIG" });
+
+  const directProvider = new MicrosoftProvider({
+    config: {
+      providers: {
+        microsoft: {
+          clientId: " ABCDEFAB-1234-5678-90AB-ABCDEFABCDEF ",
+          tenant: " Example.OnMicrosoft.COM ",
+        },
+      },
+    },
+    credentialStore: new MemoryCredentialStore(),
+  });
+  assert.deepEqual(directProvider.providerConfig(), {
+    clientId: "abcdefab-1234-5678-90ab-abcdefabcdef",
+    tenant: "example.onmicrosoft.com",
+    authority: "https://login.microsoftonline.com/example.onmicrosoft.com",
+  });
+
+  directProvider.config.providers.microsoft.clientId = "not-a-guid";
+  assert.throws(() => directProvider.providerConfig(), { code: "INVALID_CONFIG" });
+
+  for (const address of [
+    "victim:attacker@example.com",
+    "one\0@example.com",
+    "malformed",
+  ]) {
+    const mail = provider();
+    mail.graphRequest = async (_account, path) => {
+      if (path === reviewPath("draft-address")) {
+        return reviewableDraft({
+          id: "draft-address",
+          toRecipients: [{ emailAddress: { address } }],
+        });
+      }
+      if (path === rawPath("draft-address")) return plainTextMime();
+      if (path === attachmentPath("draft-address")) return { value: [] };
+      if (path === revisionPath("draft-address")) {
+        return revisionSnapshot(reviewableDraft({ id: "draft-address" }));
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(mail.reviewDraft(account, "draft-address"), {
+      code: "DRAFT_NOT_REVIEWABLE",
+    });
+  }
+});
+
 test("reviewDraft rejects every missing review-required structured Graph field", async () => {
   const cases = [
     "id",

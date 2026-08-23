@@ -1,12 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { constants as FS_CONSTANTS } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { CONFIG_VERSION, DEFAULT_SAFETY, HARD_SAFETY_LIMITS } from "./constants.mjs";
 import { MultiEmailError } from "./errors.mjs";
+import {
+  normalizeMailboxAddress,
+  normalizeMicrosoftClientId,
+  normalizeMicrosoftTenant,
+} from "./validation.mjs";
 
 const ALIAS_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-const EMAIL_PATTERN = /^[^\s@,<>]+@[^\s@,<>]+\.[^\s@,<>]+$/u;
 const PROFILE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const PROVIDERS = new Set(["google", "microsoft"]);
 const LEGACY_CONFIG_VERSION = 1;
@@ -119,8 +124,15 @@ export function validateConfig(input) {
     },
   };
 
-  if (providers.microsoft.tenant && typeof providers.microsoft.tenant !== "string") {
-    throw new MultiEmailError("providers.microsoft.tenant must be a string.", "INVALID_CONFIG");
+  providers.microsoft.tenant = normalizeMicrosoftTenant(
+    providers.microsoft.tenant,
+    { code: "INVALID_CONFIG" },
+  );
+  if (Object.hasOwn(providers.microsoft, "clientId")) {
+    providers.microsoft.clientId = normalizeMicrosoftClientId(
+      providers.microsoft.clientId,
+      { code: "INVALID_CONFIG" },
+    );
   }
 
   if (!Array.isArray(input.accounts)) {
@@ -135,7 +147,10 @@ export function validateConfig(input) {
     }
 
     const alias = String(account.alias || "").toLowerCase();
-    const email = String(account.email || "").trim().toLowerCase();
+    const email = normalizeMailboxAddress(account.email, {
+      field: `accounts[${index}].email`,
+      code: "INVALID_CONFIG",
+    });
     const provider = String(account.provider || "").toLowerCase();
 
     if (!ALIAS_PATTERN.test(alias)) {
@@ -143,9 +158,6 @@ export function validateConfig(input) {
         `Invalid account alias '${alias}'. Use 1-32 lowercase letters, digits, '_' or '-'.`,
         "INVALID_CONFIG",
       );
-    }
-    if (!EMAIL_PATTERN.test(email) || /[\x00-\x1f\x7f]/.test(email)) {
-      throw new MultiEmailError(`Invalid account email '${email}'.`, "INVALID_CONFIG");
     }
     if (!PROVIDERS.has(provider)) {
       throw new MultiEmailError(`Unsupported provider '${provider}'.`, "INVALID_CONFIG");
@@ -167,14 +179,14 @@ export function validateConfig(input) {
   return { version: CONFIG_VERSION, profileId, safety, providers, accounts };
 }
 
-export async function loadConfig(configPath = defaultConfigPath()) {
+async function readConfigDocument(configPath) {
   let raw;
   try {
     raw = await readFile(configPath, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") {
       throw new MultiEmailError(
-        `Multi Email is not configured. Run 'npm run setup -- init' in the plugin folder.`,
+        "Multi Email is not configured. Run 'multi-email init ...' (or 'node ./scripts/multi-email init ...' from a Git clone).",
         "NOT_CONFIGURED",
       );
     }
@@ -182,28 +194,86 @@ export async function loadConfig(configPath = defaultConfigPath()) {
   }
 
   try {
-    return validateConfig(upgradeLegacyConfig(JSON.parse(raw), configPath));
+    return upgradeLegacyConfig(JSON.parse(raw), configPath);
   } catch (error) {
     if (error instanceof SyntaxError) {
-      throw new MultiEmailError(`Invalid JSON in ${configPath}.`, "INVALID_CONFIG");
+      throw new MultiEmailError("The Multi Email config contains invalid JSON.", "INVALID_CONFIG");
     }
     throw error;
   }
 }
 
+export async function loadConfig(configPath = defaultConfigPath()) {
+  return validateConfig(await readConfigDocument(configPath));
+}
+
+// v0.1.1 accepted malformed Microsoft client IDs and tenant values. Setup may
+// use this narrow loader only when it will immediately replace that provider
+// block; every other config field is still validated before anything is saved.
+export async function loadConfigForMicrosoftRepair(configPath = defaultConfigPath()) {
+  const input = await readConfigDocument(configPath);
+  const providerInput =
+    input?.providers && typeof input.providers === "object" && !Array.isArray(input.providers)
+      ? input.providers
+      : {};
+  let tenant = "organizations";
+  try {
+    tenant = normalizeMicrosoftTenant(providerInput.microsoft?.tenant || tenant, {
+      code: "INVALID_CONFIG",
+    });
+  } catch {
+    // The setup command using this loader immediately replaces the Microsoft
+    // block; an invalid legacy tenant safely falls back to organizations.
+  }
+  return validateConfig({
+    ...input,
+    providers: {
+      ...providerInput,
+      microsoft: { tenant },
+    },
+  });
+}
+
 export async function saveConfig(config, configPath = defaultConfigPath()) {
   const validated = validateConfig(config);
   const parent = path.dirname(configPath);
-  const tempPath = `${configPath}.${process.pid}.tmp`;
-  await mkdir(parent, { recursive: true, mode: 0o700 });
-  await chmod(parent, 0o700);
-  await writeFile(tempPath, `${JSON.stringify(validated, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  await chmod(tempPath, 0o600);
-  await rename(tempPath, configPath);
-  await chmod(configPath, 0o600);
-  return validated;
+  const tempPath = `${configPath}.${process.pid}.${randomUUID()}.tmp`;
+  let handle;
+
+  try {
+    const target = await lstat(configPath).catch((error) => {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    });
+    if (target && (!target.isFile() || target.isSymbolicLink())) {
+      throw new MultiEmailError(
+        "The Multi Email config path must be a regular file, not a link or special file.",
+        "INVALID_CONFIG_PATH",
+      );
+    }
+
+    const created = await mkdir(parent, { recursive: true, mode: 0o700 });
+    if (created !== undefined) await chmod(parent, 0o700);
+
+    const flags =
+      FS_CONSTANTS.O_WRONLY |
+      FS_CONSTANTS.O_CREAT |
+      FS_CONSTANTS.O_EXCL |
+      (FS_CONSTANTS.O_NOFOLLOW || 0);
+    handle = await open(tempPath, flags, 0o600);
+    await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
+    await handle.chmod(0o600);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(tempPath, configPath);
+    return validated;
+  } finally {
+    await handle?.close().catch(() => {});
+    await unlink(tempPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
 }
 
 export function findAccount(config, alias) {

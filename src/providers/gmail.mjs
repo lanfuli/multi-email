@@ -94,7 +94,14 @@ function singleBareAddress(value, headerName) {
   }
   const angleAddress = text.match(/^[^<>]*<([^<>]+)>$/u);
   const candidate = (angleAddress?.[1] || text).trim();
-  const addresses = splitAddressHeader(candidate);
+  let addresses;
+  try {
+    addresses = splitAddressHeader(candidate);
+  } catch {
+    throw draftNotReviewable(
+      `The Gmail draft ${headerName} header must contain exactly one email address.`,
+    );
+  }
   if (
     addresses.length !== 1 ||
     candidate.toLowerCase() !== addresses[0] ||
@@ -109,50 +116,11 @@ function singleBareAddress(value, headerName) {
 
 function addressHeaderList(value, headerName) {
   if (value === undefined || value === "") return [];
-  const text = String(value);
-  const entries = [];
-  let entry = "";
-  let inQuotes = false;
-  let escaped = false;
-  let angleDepth = 0;
-
-  for (const character of text) {
-    if (escaped) {
-      entry += character;
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && inQuotes) {
-      entry += character;
-      escaped = true;
-      continue;
-    }
-    if (character === '"') {
-      inQuotes = !inQuotes;
-      entry += character;
-      continue;
-    }
-    if (!inQuotes && character === "<") angleDepth += 1;
-    if (!inQuotes && character === ">") angleDepth -= 1;
-    if (angleDepth < 0 || angleDepth > 1 || /\r|\n/u.test(character)) {
-      throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
-    }
-    if (!inQuotes && angleDepth === 0 && character === ",") {
-      if (!entry.trim()) {
-        throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
-      }
-      entries.push(entry);
-      entry = "";
-      continue;
-    }
-    entry += character;
-  }
-
-  if (inQuotes || escaped || angleDepth !== 0 || !entry.trim()) {
+  try {
+    return splitAddressHeader(value);
+  } catch {
     throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
   }
-  entries.push(entry);
-  return entries.map((item) => singleBareAddress(item, headerName));
 }
 
 function singleAddressHeader(value, headerName) {
@@ -605,7 +573,7 @@ export class GmailProvider {
     const provider = this.config.providers.google || {};
     if (!provider.clientId || !provider.clientSecret) {
       throw new MultiEmailError(
-        "Google OAuth client is not configured. Run setup init with a Desktop OAuth client JSON file.",
+        "Google OAuth client is not configured. Run 'multi-email init --google-client-json <desktop-oauth.json>' (or the same node ./scripts/multi-email command from a Git clone).",
         "GOOGLE_CLIENT_NOT_CONFIGURED",
       );
     }
@@ -737,7 +705,7 @@ export class GmailProvider {
     const record = await this.credentialRecord(account, { allowLegacy });
     if (!record) {
       throw new MultiEmailError(
-        `Account '${account.alias}' is not authorized. Run setup auth ${account.alias}.`,
+        `Account '${account.alias}' is not authorized. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "NOT_AUTHENTICATED",
       );
     }

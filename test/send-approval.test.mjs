@@ -250,6 +250,98 @@ test("out-of-band rejection permanently removes the request", () => {
   );
 });
 
+test("approval capacity is bounded and discard restores count and byte capacity", () => {
+  const store = new SendApprovalStore({ maxPendingRequests: 2 });
+  const first = store.prepare(review({ draftId: "draft-1" }));
+  const second = store.prepare(review({ draftId: "draft-2" }));
+  const full = store.stats();
+
+  assert.equal(full.pendingRequests, 2);
+  assert.ok(full.retainedBytes > 0);
+  assert.throws(
+    () => store.prepare(review({ draftId: "draft-3" })),
+    { code: "SEND_APPROVAL_CAPACITY" },
+  );
+
+  assert.equal(store.discard(first.requestId), true);
+  assert.equal(store.discard(first.requestId), false);
+  assert.equal(store.stats().pendingRequests, 1);
+  assert.ok(store.stats().retainedBytes < full.retainedBytes);
+  assert.doesNotThrow(() => store.prepare(review({ draftId: "draft-3" })));
+  assert.equal(store.stats().pendingRequests, 2);
+
+  store.rejectOutOfBand(second.requestId);
+  assert.equal(store.stats().pendingRequests, 1);
+});
+
+test("retained-byte capacity is enforced before a snapshot is retained", () => {
+  const draft = review();
+  const oneSnapshotBytes = Buffer.byteLength(JSON.stringify(draft), "utf8");
+  const store = new SendApprovalStore({
+    maxPendingRequests: 2,
+    maxRetainedBytes: oneSnapshotBytes,
+  });
+
+  const first = store.prepare(draft);
+  assert.deepEqual(store.stats(), {
+    pendingRequests: 1,
+    retainedBytes: oneSnapshotBytes,
+  });
+  assert.throws(
+    () => store.prepare(draft),
+    { code: "SEND_APPROVAL_CAPACITY" },
+  );
+  assert.deepEqual(store.stats(), {
+    pendingRequests: 1,
+    retainedBytes: oneSnapshotBytes,
+  });
+  assert.equal(store.discard(first.requestId), true);
+  assert.deepEqual(store.stats(), { pendingRequests: 0, retainedBytes: 0 });
+});
+
+test("every terminal and expiry path releases retained approval bytes", () => {
+  let now = 10_000;
+  const store = new SendApprovalStore({ ttlSeconds: 1, clock: () => now });
+
+  const rejected = store.prepare(review({ draftId: "rejected" }));
+  store.rejectOutOfBand(rejected.requestId);
+  assert.deepEqual(store.stats(), { pendingRequests: 0, retainedBytes: 0 });
+
+  const mismatched = store.prepare(review({ draftId: "mismatched" }));
+  const mismatchPending = store.getPendingReview(mismatched.requestId);
+  store.approveOutOfBand(mismatched.requestId, mismatchPending.fingerprint);
+  assert.throws(
+    () => store.requireApproved(mismatched.requestId, { draftId: "different" }),
+    { code: "SEND_APPROVAL_MISMATCH" },
+  );
+  assert.deepEqual(store.stats(), { pendingRequests: 0, retainedBytes: 0 });
+
+  const consumedDraft = review({ draftId: "consumed" });
+  const consumed = store.prepare(consumedDraft);
+  const consumedPending = store.getPendingReview(consumed.requestId);
+  store.approveOutOfBand(consumed.requestId, consumedPending.fingerprint);
+  assert.equal(store.consumeApproved(consumed.requestId, consumedDraft), true);
+  assert.deepEqual(store.stats(), { pendingRequests: 0, retainedBytes: 0 });
+
+  store.prepare(review({ draftId: "expired" }));
+  now += 1_001;
+  assert.deepEqual(store.stats(), { pendingRequests: 0, retainedBytes: 0 });
+});
+
+test("expired requests are swept before admission so capacity recovers", () => {
+  let now = 1_000;
+  const store = new SendApprovalStore({
+    ttlSeconds: 1,
+    clock: () => now,
+    maxPendingRequests: 1,
+  });
+  store.prepare(review({ draftId: "first" }));
+
+  now += 1_001;
+  assert.doesNotThrow(() => store.prepare(review({ draftId: "second" })));
+  assert.equal(store.stats().pendingRequests, 1);
+});
+
 test("recipient ordering does not change the stable fingerprint", () => {
   const first = review({ to: ["b@example.com", "a@example.com"] });
   const second = review({ to: ["a@example.com", "b@example.com"] });

@@ -37,7 +37,12 @@ function draft(overrides = {}) {
   };
 }
 
-function harness({ initialDraft = draft(), providerName = "google", sendError = null } = {}) {
+function harness({
+  initialDraft = draft(),
+  providerName = "google",
+  sendError = null,
+  approvalError = null,
+} = {}) {
   const calls = {
     archive: 0,
     createDraft: 0,
@@ -48,6 +53,7 @@ function harness({ initialDraft = draft(), providerName = "google", sendError = 
     search: 0,
     sendDraft: 0,
     modifyLabels: 0,
+    lastApprovalRequestId: undefined,
     sentManifest: undefined,
   };
   let currentDraft = structuredClone(initialDraft);
@@ -107,6 +113,8 @@ function harness({ initialDraft = draft(), providerName = "google", sendError = 
   const approvalUi = {
     async requestApproval(requestId) {
       calls.requestApproval += 1;
+      calls.lastApprovalRequestId = requestId;
+      if (approvalError) throw approvalError;
       return { url: `http://127.0.0.1:45678/review/${requestId}` };
     },
   };
@@ -262,6 +270,33 @@ test("prepare opens the full local review without exposing its URL or full body 
     changeKey: null,
     lastModifiedDateTime: null,
   });
+  assert.equal(calls.sendDraft, 0);
+});
+
+test("a large review is discarded if the approval UI cannot open", async () => {
+  const approvalError = Object.assign(new Error("simulated browser failure"), {
+    code: "APPROVAL_UI_UNAVAILABLE",
+  });
+  const largeBody = `${"A".repeat(900_000)}\nCOMPLETE ENDING`;
+  const { approvalStore, calls, service } = harness({
+    initialDraft: draft({ body: largeBody }),
+    approvalError,
+  });
+
+  await assert.rejects(
+    service.reviewDraft("work", "draft-1"),
+    (error) => error === approvalError,
+  );
+  assert.equal(calls.requestApproval, 1);
+  assert.match(calls.lastApprovalRequestId, /^sar_/u);
+  assert.deepEqual(approvalStore.stats(), {
+    pendingRequests: 0,
+    retainedBytes: 0,
+  });
+  assert.throws(
+    () => approvalStore.getPendingReview(calls.lastApprovalRequestId),
+    { code: "SEND_APPROVAL_REQUIRED" },
+  );
   assert.equal(calls.sendDraft, 0);
 });
 

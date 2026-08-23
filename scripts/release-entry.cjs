@@ -1,4 +1,4 @@
 const { startServer } = require("../src/server.mjs");
-const { run: runSetup } = require("../src/setup.mjs");
+const { formatSetupError, runSetupCli } = require("../src/setup.mjs");
 
-module.exports = { runSetup, startServer };
+module.exports = { formatSetupError, runSetupCli, startServer };

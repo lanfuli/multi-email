@@ -1,6 +1,5 @@
 import { MultiEmailError } from "./errors.mjs";
-
-const EMAIL_PATTERN = /^[^\s@,<>]+@[^\s@,<>]+\.[^\s@,<>]+$/u;
+import { normalizeMailboxAddress } from "./validation.mjs";
 
 function assertNoHeaderBreak(value, field) {
   if (/[\r\n]/.test(String(value))) {
@@ -12,14 +11,12 @@ export function normalizeAddresses(values = [], field = "recipient") {
   if (!Array.isArray(values)) {
     throw new MultiEmailError(`${field} must be an array.`, "INVALID_MESSAGE");
   }
-  return values.map((value) => {
-    const address = String(value).trim().toLowerCase();
-    assertNoHeaderBreak(address, field);
-    if (!EMAIL_PATTERN.test(address)) {
-      throw new MultiEmailError(`Invalid ${field} address '${address}'.`, "INVALID_MESSAGE");
-    }
-    return address;
-  });
+  return values.map((value) =>
+    normalizeMailboxAddress(value, {
+      field: `${field} address`,
+      code: "INVALID_MESSAGE",
+    }),
+  );
 }
 
 export function encodeHeader(value) {
@@ -154,11 +151,67 @@ export function extractGmailBody(payload) {
 }
 
 export function splitAddressHeader(value = "") {
-  return String(value)
-    .split(",")
-    .map((entry) => {
-      const angle = entry.match(/<([^>]+)>/);
-      return (angle?.[1] || entry).trim().toLowerCase();
-    })
-    .filter((entry) => EMAIL_PATTERN.test(entry));
+  const text = String(value);
+  if (!text.trim()) return [];
+  if (/[\x00-\x1f\x7f]/u.test(text)) {
+    throw new MultiEmailError("Address header contains a control character.", "INVALID_MESSAGE");
+  }
+
+  const entries = [];
+  let entry = "";
+  let inQuotes = false;
+  let escaped = false;
+  let angleDepth = 0;
+
+  for (const character of text) {
+    if (escaped) {
+      entry += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && inQuotes) {
+      entry += character;
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      inQuotes = !inQuotes;
+      entry += character;
+      continue;
+    }
+    if (!inQuotes && character === "<") angleDepth += 1;
+    if (!inQuotes && character === ">") angleDepth -= 1;
+    if (
+      angleDepth < 0 ||
+      angleDepth > 1 ||
+      (!inQuotes && angleDepth === 0 && (character === ":" || character === ";"))
+    ) {
+      throw new MultiEmailError("Address header is malformed.", "INVALID_MESSAGE");
+    }
+    if (!inQuotes && angleDepth === 0 && character === ",") {
+      if (!entry.trim()) {
+        throw new MultiEmailError("Address header is malformed.", "INVALID_MESSAGE");
+      }
+      entries.push(entry.trim());
+      entry = "";
+      continue;
+    }
+    entry += character;
+  }
+
+  if (inQuotes || escaped || angleDepth !== 0 || !entry.trim()) {
+    throw new MultiEmailError("Address header is malformed.", "INVALID_MESSAGE");
+  }
+  entries.push(entry.trim());
+
+  return entries.map((item) => {
+    const angle = item.match(/^[^<>]*<([^<>]+)>$/u);
+    if (!angle && /[<>]/u.test(item)) {
+      throw new MultiEmailError("Address header is malformed.", "INVALID_MESSAGE");
+    }
+    return normalizeMailboxAddress((angle?.[1] || item).trim(), {
+      field: "address header mailbox",
+      code: "INVALID_MESSAGE",
+    });
+  });
 }

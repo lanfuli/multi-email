@@ -32,6 +32,16 @@ test("message fields reject header injection and malformed recipients", () => {
   assert.throws(() => normalizeAddresses(["not-an-address"], "to"), {
     code: "INVALID_MESSAGE",
   });
+  for (const address of [
+    "victim:attacker@example.com",
+    "quoted local@example.com",
+    "owner\0@example.com",
+    '"quoted"@example.com',
+  ]) {
+    assert.throws(() => normalizeAddresses([address], "to"), {
+      code: "INVALID_MESSAGE",
+    });
+  }
 });
 
 test("extractGmailBody walks nested MIME parts", () => {
@@ -62,8 +72,21 @@ test("extractGmailBody walks nested MIME parts", () => {
 });
 
 test("splitAddressHeader extracts bare and display-name addresses", () => {
-  assert.deepEqual(splitAddressHeader("One <ONE@example.com>, two@example.com"), [
-    "one@example.com",
-    "two@example.com",
-  ]);
+  assert.deepEqual(
+    splitAddressHeader('"One, Primary" <ONE@example.com>, two@example.com'),
+    ["one@example.com", "two@example.com"],
+  );
+});
+
+test("splitAddressHeader rejects group syntax, controls, and malformed fragments", () => {
+  for (const value of [
+    "victim:attacker@example.com",
+    "Friends: one@example.com, two@example.com;",
+    "one\0@example.com",
+    "bad, good@example.com",
+    "one@example.com,",
+    "Broken <one@example.com",
+  ]) {
+    assert.throws(() => splitAddressHeader(value), { code: "INVALID_MESSAGE" });
+  }
 });

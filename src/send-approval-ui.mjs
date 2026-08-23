@@ -6,6 +6,7 @@ import { MultiEmailError } from "./errors.mjs";
 const LOOPBACK_HOST = "127.0.0.1";
 const COOKIE_NAME = "multi_email_send_review";
 const MAX_FORM_BYTES = 4_096;
+export const MAX_APPROVAL_UI_SESSIONS = 16;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -76,7 +77,7 @@ function cookieValue(request, name) {
   return undefined;
 }
 
-export function openInDefaultBrowser(url) {
+export function defaultBrowserCommand(url, platform = process.platform) {
   const target = new URL(url);
   if (target.protocol !== "http:" || target.hostname !== LOOPBACK_HOST) {
     throw new MultiEmailError(
@@ -87,10 +88,10 @@ export function openInDefaultBrowser(url) {
 
   let command;
   let args;
-  if (process.platform === "darwin") {
-    command = "open";
+  if (platform === "darwin") {
+    command = "/usr/bin/open";
     args = [target.href];
-  } else if (process.platform === "win32") {
+  } else if (platform === "win32") {
     command = "rundll32.exe";
     args = ["url.dll,FileProtocolHandler", target.href];
   } else {
@@ -98,8 +99,17 @@ export function openInDefaultBrowser(url) {
     args = [target.href];
   }
 
+  return { command, args };
+}
+
+export function openInDefaultBrowser(
+  url,
+  { platform = process.platform, spawnProcess = spawn } = {},
+) {
+  const { command, args } = defaultBrowserCommand(url, platform);
+
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    const child = spawnProcess(command, args, { detached: true, stdio: "ignore" });
     child.once("error", reject);
     child.once("spawn", () => {
       child.unref();
@@ -109,16 +119,34 @@ export function openInDefaultBrowser(url) {
 }
 
 export class LocalSendApprovalUi {
-  constructor({ approvalStore, browserOpener = openInDefaultBrowser, port = 0 } = {}) {
+  constructor({
+    approvalStore,
+    browserOpener = openInDefaultBrowser,
+    port = 0,
+    clock = () => Date.now(),
+    maxSessions = MAX_APPROVAL_UI_SESSIONS,
+  } = {}) {
     if (!approvalStore) {
       throw new MultiEmailError(
         "LocalSendApprovalUi requires an approval store.",
         "INVALID_CONFIG",
       );
     }
+    if (
+      !Number.isInteger(maxSessions) ||
+      maxSessions <= 0 ||
+      maxSessions > MAX_APPROVAL_UI_SESSIONS
+    ) {
+      throw new MultiEmailError(
+        `Local approval session capacity must be an integer from 1 to ${MAX_APPROVAL_UI_SESSIONS}.`,
+        "INVALID_CONFIG",
+      );
+    }
     this.approvalStore = approvalStore;
     this.browserOpener = browserOpener;
     this.port = port;
+    this.clock = clock;
+    this.maxSessions = maxSessions;
     this.sessions = new Map();
     this.server = undefined;
     this.startPromise = undefined;
@@ -185,7 +213,13 @@ export class LocalSendApprovalUi {
         "SEND_APPROVAL_ALREADY_APPROVED",
       );
     }
-    await this.start();
+    this.#sweepExpired();
+    if (this.sessions.size >= this.maxSessions) {
+      throw new MultiEmailError(
+        "Too many local approval windows are awaiting a decision. Finish or close an existing review before opening another.",
+        "APPROVAL_UI_CAPACITY",
+      );
+    }
 
     const sessionId = randomBytes(24).toString("base64url");
     const csrf = randomBytes(24).toString("base64url");
@@ -196,6 +230,13 @@ export class LocalSendApprovalUi {
       cookie,
       expiresAt: Date.parse(pending.expiresAt),
     });
+
+    try {
+      await this.start();
+    } catch (error) {
+      this.sessions.delete(sessionId);
+      throw error;
+    }
     const url = `${this.origin}/review/${sessionId}`;
 
     try {
@@ -209,6 +250,11 @@ export class LocalSendApprovalUi {
     }
 
     return { url, expiresAt: pending.expiresAt };
+  }
+
+  sessionCount() {
+    this.#sweepExpired();
+    return this.sessions.size;
   }
 
   async stop() {
@@ -236,12 +282,15 @@ export class LocalSendApprovalUi {
   }
 
   #session(sessionId) {
+    this.#sweepExpired();
     const session = this.sessions.get(sessionId);
-    if (!session || session.expiresAt <= Date.now()) {
-      this.sessions.delete(sessionId);
-      return undefined;
-    }
     return session;
+  }
+
+  #sweepExpired(now = this.clock()) {
+    for (const [sessionId, session] of this.sessions) {
+      if (session.expiresAt <= now) this.sessions.delete(sessionId);
+    }
   }
 
   async #handle(request, response) {
@@ -304,7 +353,7 @@ export class LocalSendApprovalUi {
     const { review } = pending;
     const styleNonce = randomBytes(18).toString("base64url");
     const action = `/review/${sessionId}/decision`;
-    const maxAge = Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 1000));
+    const maxAge = Math.max(0, Math.ceil((session.expiresAt - this.clock()) / 1000));
     const html = `<!doctype html>
 <html lang="en">
 <head>

@@ -12,10 +12,11 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "multi-email-cold-install-"));
 
-function run(command, args, { capture = false, cwd = pluginRoot } = {}) {
+function run(command, args, { capture = false, cwd = pluginRoot, env = process.env } = {}) {
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf8",
+    env,
     stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
   });
   if (result.error || result.status !== 0) {
@@ -26,6 +27,21 @@ function run(command, args, { capture = false, cwd = pluginRoot } = {}) {
     );
   }
   return result.stdout || "";
+}
+
+function runExpectFailure(command, args, { cwd = pluginRoot, env = process.env } = {}) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.error || result.status === 0) {
+    throw new Error(`Command unexpectedly succeeded: ${command} ${args.join(" ")}`, {
+      cause: result.error,
+    });
+  }
+  return `${result.stderr || ""}${result.stdout || ""}`;
 }
 
 async function writeEmptyConfig(directory) {
@@ -113,6 +129,8 @@ try {
   const extractedPackage = path.join(extractDirectory, "package");
   await access(path.join(extractedPackage, "dist", "server.cjs"));
   await access(path.join(extractedPackage, "dist", `keyring.darwin-${process.arch}.node`));
+  await access(path.join(extractedPackage, "CONTRIBUTING.md"));
+  await access(path.join(extractedPackage, "CODE_OF_CONDUCT.md"));
   try {
     await access(path.join(extractedPackage, "test"));
     throw new Error("Published tarball unexpectedly contains tests.");
@@ -144,9 +162,59 @@ try {
   const mcpExecutable = path.join(executableDirectory, "multi-email-mcp");
   await access(setupExecutable, fsConstants.X_OK);
   await access(mcpExecutable, fsConstants.X_OK);
-  run(setupExecutable, ["--help"], {
+  const help = run(setupExecutable, ["--help"], {
     cwd: consumer,
+    capture: true,
   });
+  if (!help.includes("multi-email init") || help.includes("npm run setup")) {
+    throw new Error("Installed setup help contains unusable consumer commands.");
+  }
+  const version = run(setupExecutable, ["--version"], {
+    cwd: consumer,
+    capture: true,
+  }).trim();
+  if (version !== installedMetadata.version) {
+    throw new Error(
+      `Installed setup CLI reported ${version || "no version"}, expected ${installedMetadata.version}.`,
+    );
+  }
+  const setupConfigDirectory = path.join(temporaryRoot, "consumer-setup-config");
+  await mkdir(setupConfigDirectory);
+  const setupConfigPath = path.join(setupConfigDirectory, "config.json");
+  const setupEnvironment = {
+    ...Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined)),
+    CODEX_MULTI_EMAIL_CONFIG: setupConfigPath,
+  };
+  const initialized = run(
+    setupExecutable,
+    [
+      "init",
+      "--microsoft-client-id",
+      "11111111-2222-3333-4444-555555555555",
+      "--microsoft-tenant",
+      "organizations",
+    ],
+    { cwd: consumer, capture: true, env: setupEnvironment },
+  );
+  if (!initialized.includes("Microsoft OAuth is configured")) {
+    throw new Error("Installed setup CLI did not complete Microsoft-only initialization.");
+  }
+
+  const invalidConfigDirectory = path.join(temporaryRoot, "invalid-config-target");
+  await mkdir(invalidConfigDirectory);
+  const redacted = runExpectFailure(setupExecutable, ["list"], {
+    cwd: consumer,
+    env: {
+      ...setupEnvironment,
+      CODEX_MULTI_EMAIL_CONFIG: invalidConfigDirectory,
+    },
+  });
+  if (
+    redacted !== "Setup failed: an unexpected local or provider error occurred.\n" ||
+    redacted.includes(invalidConfigDirectory)
+  ) {
+    throw new Error("Installed setup CLI exposed an unknown local error.");
+  }
   await smokePackage(installedPackage, "npm-install", {
     command: mcpExecutable,
     args: [],

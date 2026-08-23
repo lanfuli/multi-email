@@ -9,24 +9,36 @@ import {
   emptyConfig,
   findAccount,
   loadConfig,
+  loadConfigForMicrosoftRepair,
   saveConfig,
 } from "./config.mjs";
+import { APP_VERSION } from "./constants.mjs";
 import { MultiEmailError } from "./errors.mjs";
 import { KeychainStore } from "./keychain.mjs";
+import {
+  googleProviderConfigured,
+  microsoftProviderConfigured,
+  normalizeMicrosoftClientId,
+  normalizeMicrosoftTenant,
+} from "./validation.mjs";
 
 const HELP = `Multi Email setup
 
 Usage:
-  npm run setup -- init --google-client-json <desktop-oauth.json> [--microsoft-client-id <id>] [--microsoft-tenant <tenant>]
-  npm run setup -- add-account <alias> <email> <google|microsoft>
-  npm run setup -- set-microsoft-client <client-id> [--microsoft-tenant <tenant>]
-  npm run setup -- auth <alias>
-  npm run setup -- doctor [alias]
-  npm run setup -- logout <alias> --confirm
-  npm run setup -- revoke <alias> --confirm
-  npm run setup -- list
+  multi-email init --google-client-json <desktop-oauth.json> [--microsoft-client-id <guid>] [--microsoft-tenant <tenant>]
+  multi-email init --microsoft-client-id <guid> [--microsoft-tenant <tenant>]
+  multi-email add-account <alias> <email> <google|microsoft>
+  multi-email set-microsoft-client <guid> [--microsoft-tenant <tenant>]
+  multi-email auth <alias>
+  multi-email doctor [alias]
+  multi-email logout <alias> --confirm
+  multi-email revoke <alias> --confirm
+  multi-email list
+  multi-email --version
 
 Notes:
+  - From a Git clone, replace 'multi-email' with 'node ./scripts/multi-email'.
+  - init requires at least one Google or Microsoft OAuth client option.
   - Aliases are lowercase identifiers used by every mail tool.
   - OAuth tokens are stored in macOS Keychain and are never printed.
   - The config path defaults to ~/.config/codex-multi-email/config.json.
@@ -40,13 +52,17 @@ function fail(message, code = "INVALID_ARGUMENT") {
 
 function requireNoExtraPositionals(positionals, expected) {
   if (positionals.length !== expected) {
-    fail("Invalid arguments. Run 'npm run setup -- --help' for usage.");
+    fail(
+      "Invalid arguments. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.",
+    );
   }
 }
 
-async function loadConfigOrEmpty(configPath) {
+async function loadConfigOrEmpty(configPath, { repairMicrosoft = false } = {}) {
   try {
-    return await loadConfig(configPath);
+    return await (repairMicrosoft
+      ? loadConfigForMicrosoftRepair(configPath)
+      : loadConfig(configPath));
   } catch (error) {
     if (error?.code === "NOT_CONFIGURED") return emptyConfig();
     throw error;
@@ -97,60 +113,95 @@ async function instantiateProvider(provider, config, credentialStore) {
   fail(`Unsupported provider '${provider}'.`);
 }
 
-function optionalTenant(value) {
-  const tenant = value ? String(value).trim() : "organizations";
-  if (!tenant || /[\s\r\n/]/.test(tenant)) {
-    fail("Microsoft tenant must be 'organizations', 'common', a tenant ID, or a tenant domain.");
-  }
-  return tenant;
-}
-
 async function initCommand({ values, positionals, configPath, output }) {
   requireNoExtraPositionals(positionals, 0);
-  const google = await readGoogleDesktopClient(values["google-client-json"]);
-  const config = await loadConfigOrEmpty(configPath);
-  config.providers.google = google;
-
-  if (values["microsoft-client-id"]) {
-    config.providers.microsoft = {
-      clientId: String(values["microsoft-client-id"]).trim(),
-      tenant: optionalTenant(values["microsoft-tenant"]),
-    };
-  } else if (values["microsoft-tenant"]) {
+  const googleClientPath = values["google-client-json"];
+  const microsoftClientIdValue = values["microsoft-client-id"];
+  if (!googleClientPath && !microsoftClientIdValue) {
+    fail(
+      "init requires --google-client-json, --microsoft-client-id, or both.",
+    );
+  }
+  if (values["microsoft-tenant"] && !microsoftClientIdValue) {
     fail("--microsoft-tenant requires --microsoft-client-id during init.");
   }
 
-  await saveConfig(config, configPath);
+  const google = googleClientPath
+    ? await readGoogleDesktopClient(googleClientPath)
+    : undefined;
+  const microsoftClientId = microsoftClientIdValue
+    ? normalizeMicrosoftClientId(microsoftClientIdValue)
+    : undefined;
+  const microsoftTenant = microsoftClientId
+    ? normalizeMicrosoftTenant(values["microsoft-tenant"] || "organizations")
+    : undefined;
+  const config = await loadConfigOrEmpty(configPath, {
+    repairMicrosoft: Boolean(microsoftClientId),
+  });
+  if (google) config.providers.google = google;
+
+  if (microsoftClientId) {
+    config.providers.microsoft = {
+      clientId: microsoftClientId,
+      tenant: microsoftTenant,
+    };
+  }
+
+  const saved = await saveConfig(config, configPath);
   output(`Initialized Multi Email configuration at ${configPath}.`);
-  output(
-    values["microsoft-client-id"]
-      ? "Google and Microsoft OAuth clients are configured."
-      : "Google OAuth is configured. Microsoft can be added later with set-microsoft-client.",
-  );
+  const googleConfigured = googleProviderConfigured(saved.providers.google);
+  const microsoftConfigured = microsoftProviderConfigured(saved.providers.microsoft);
+  if (googleConfigured && microsoftConfigured) {
+    output("Google and Microsoft OAuth clients are configured.");
+  } else if (googleConfigured) {
+    output("Google OAuth is configured. Microsoft can be added later with set-microsoft-client.");
+  } else if (microsoftConfigured) {
+    output("Microsoft OAuth is configured. Google can be added later with init --google-client-json.");
+  }
 }
 
 async function addAccountCommand({ positionals, configPath, output }) {
   requireNoExtraPositionals(positionals, 3);
-  const [alias, email, provider] = positionals;
+  const [alias, email, providerValue] = positionals;
+  const provider = String(providerValue || "").toLowerCase();
+  if (provider !== "google" && provider !== "microsoft") {
+    fail("Account provider must be 'google' or 'microsoft'.");
+  }
   const config = await loadConfig(configPath);
+  if (provider === "google" && !googleProviderConfigured(config.providers.google)) {
+    fail(
+      "Google OAuth is not configured. Run 'multi-email init --google-client-json <desktop-oauth.json>' (or use 'node ./scripts/multi-email init ...' from a Git clone) before adding a Google account.",
+      "PROVIDER_NOT_CONFIGURED",
+    );
+  }
+  if (
+    provider === "microsoft" &&
+    !microsoftProviderConfigured(config.providers.microsoft)
+  ) {
+    fail(
+      "Microsoft OAuth is not configured. Run 'multi-email set-microsoft-client <application-guid>' (or use 'node ./scripts/multi-email set-microsoft-client ...' from a Git clone) before adding a Microsoft account.",
+      "PROVIDER_NOT_CONFIGURED",
+    );
+  }
   config.accounts.push({ alias, email, provider });
   const saved = await saveConfig(config, configPath);
   const added = findAccount(saved, alias);
   output(`Added '${added.alias}' (${added.provider}, ${added.email}).`);
-  output(`Next: npm run setup -- auth ${added.alias}`);
+  output(
+    `Next: multi-email auth ${added.alias} (or node ./scripts/multi-email auth ${added.alias} from a Git clone).`,
+  );
 }
 
 async function setMicrosoftClientCommand({ values, positionals, configPath, output }) {
   requireNoExtraPositionals(positionals, 1);
-  const clientId = String(positionals[0] || "").trim();
-  if (!clientId || /[\s\r\n]/.test(clientId)) {
-    fail("set-microsoft-client requires a valid public client application ID.");
-  }
+  const clientId = normalizeMicrosoftClientId(positionals[0]);
 
-  const config = await loadConfig(configPath);
+  const config = await loadConfigForMicrosoftRepair(configPath);
   config.providers.microsoft = {
     clientId,
-    tenant: optionalTenant(values["microsoft-tenant"] || config.providers.microsoft?.tenant),
+    tenant: normalizeMicrosoftTenant(
+      values["microsoft-tenant"] || config.providers.microsoft?.tenant || "organizations",
+    ),
   };
   await saveConfig(config, configPath);
   output("Microsoft OAuth client configuration updated.");
@@ -233,6 +284,7 @@ export function parseCliArgs(args) {
       "microsoft-client-id": { type: "string" },
       "microsoft-tenant": { type: "string" },
       confirm: { type: "boolean" },
+      version: { type: "boolean", short: "V" },
     },
   });
 }
@@ -242,8 +294,23 @@ export async function run(args = process.argv.slice(2), dependencies = {}) {
   const configPath = dependencies.configPath || defaultConfigPath();
   const credentialStore = dependencies.credentialStore || new KeychainStore();
   const providerFactory = dependencies.providerFactory || instantiateProvider;
-  const parsed = parseCliArgs(args);
+  let parsed;
+  try {
+    parsed = parseCliArgs(args);
+  } catch (error) {
+    if (String(error?.code || "").startsWith("ERR_PARSE_ARGS_")) {
+      fail(
+        "Invalid arguments. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.",
+      );
+    }
+    throw error;
+  }
   const [command, ...positionals] = parsed.positionals;
+
+  if (parsed.values.version) {
+    output(APP_VERSION);
+    return;
+  }
 
   if (parsed.values.help || !command) {
     output(HELP.trimEnd());
@@ -276,7 +343,34 @@ export async function run(args = process.argv.slice(2), dependencies = {}) {
     case "list":
       return listCommand(context);
     default:
-      fail(`Unknown command '${command}'. Run 'npm run setup -- --help' for usage.`);
+      fail(
+        `Unknown command '${command}'. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.`,
+      );
+  }
+}
+
+export function formatSetupError(error) {
+  if (error instanceof MultiEmailError) {
+    const code = error.code ? ` [${error.code}]` : "";
+    return `Setup failed${code}: ${error.message}`;
+  }
+  return "Setup failed: an unexpected local or provider error occurred.";
+}
+
+export async function runSetupCli(args = process.argv.slice(2), dependencies = {}) {
+  const errorOutput = dependencies.errorOutput || console.error;
+  const setExitCode =
+    dependencies.setExitCode ||
+    ((code) => {
+      process.exitCode = code;
+    });
+  try {
+    await run(args, dependencies);
+    return true;
+  } catch (error) {
+    errorOutput(formatSetupError(error));
+    setExitCode(1);
+    return false;
   }
 }
 
@@ -284,15 +378,5 @@ const invokedAsScript =
   process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 
 if (invokedAsScript) {
-  run().catch((error) => {
-    if (error instanceof MultiEmailError) {
-      const code = error.code ? ` [${error.code}]` : "";
-      console.error(`Setup failed${code}: ${error.message}`);
-    } else {
-      // Provider and parser errors can carry request context. Do not risk printing
-      // authorization codes, tokens, or client credentials from an unknown error.
-      console.error("Setup failed: an unexpected local or provider error occurred.");
-    }
-    process.exitCode = 1;
-  });
+  void runSetupCli();
 }

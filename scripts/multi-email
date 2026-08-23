@@ -8,16 +8,23 @@ const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".
 const bundledEntry = path.join(pluginRoot, "dist", "server.cjs");
 const sourceEntry = path.join(pluginRoot, "src", "setup.mjs");
 const entry = existsSync(bundledEntry) ? bundledEntry : sourceEntry;
-const module = await import(pathToFileURL(entry).href);
-const runSetup = module.runSetup || module.run;
+let module;
+try {
+  module = await import(pathToFileURL(entry).href);
+} catch {
+  console.error("Multi Email setup could not be loaded. Reinstall or rebuild the package.");
+  process.exitCode = 1;
+}
+const runSetupCli = module?.runSetupCli || module?.default?.runSetupCli;
 
-if (typeof runSetup !== "function") {
+if (module && typeof runSetupCli !== "function") {
   console.error("Multi Email setup entry is unavailable. Reinstall or rebuild the package.");
   process.exitCode = 1;
-} else {
-  runSetup(process.argv.slice(2)).catch((error) => {
-    const code = error?.code ? ` [${error.code}]` : "";
-    console.error(`Setup failed${code}: ${error?.message || "an unexpected error occurred"}`);
+} else if (runSetupCli) {
+  try {
+    await runSetupCli(process.argv.slice(2));
+  } catch {
+    console.error("Setup failed: an unexpected local or provider error occurred.");
     process.exitCode = 1;
-  });
+  }
 }

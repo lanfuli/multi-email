@@ -39314,9 +39314,9 @@ function _requestToken2() {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const { startServer } = __nccwpck_require__(3196);
-const { run: runSetup } = __nccwpck_require__(8902);
+const { formatSetupError, runSetupCli } = __nccwpck_require__(8902);
 
-module.exports = { runSetup, startServer };
+module.exports = { formatSetupError, runSetupCli, startServer };
 
 
 /***/ }),
@@ -39332,6 +39332,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   i4: () => (/* binding */ emptyConfig),
   vF: () => (/* binding */ findAccount),
   Z9: () => (/* binding */ loadConfig),
+  Vp: () => (/* binding */ loadConfigForMicrosoftRepair),
   ql: () => (/* binding */ saveConfig)
 });
 
@@ -39339,6 +39340,8 @@ __nccwpck_require__.d(__webpack_exports__, {
 
 // EXTERNAL MODULE: external "node:crypto"
 var external_node_crypto_ = __nccwpck_require__(7598);
+// EXTERNAL MODULE: external "node:fs"
+var external_node_fs_ = __nccwpck_require__(3024);
 // EXTERNAL MODULE: external "node:fs/promises"
 var promises_ = __nccwpck_require__(1455);
 ;// CONCATENATED MODULE: external "node:os"
@@ -39349,6 +39352,8 @@ var external_node_path_ = __nccwpck_require__(6760);
 var constants = __nccwpck_require__(1102);
 // EXTERNAL MODULE: ./src/errors.mjs
 var errors = __nccwpck_require__(178);
+// EXTERNAL MODULE: ./src/validation.mjs
+var validation = __nccwpck_require__(6918);
 ;// CONCATENATED MODULE: ./src/config.mjs
 
 
@@ -39357,8 +39362,9 @@ var errors = __nccwpck_require__(178);
 
 
 
+
+
 const ALIAS_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-const EMAIL_PATTERN = /^[^\s@,<>]+@[^\s@,<>]+\.[^\s@,<>]+$/u;
 const PROFILE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const PROVIDERS = new Set(["google", "microsoft"]);
 const LEGACY_CONFIG_VERSION = 1;
@@ -39471,8 +39477,15 @@ function validateConfig(input) {
     },
   };
 
-  if (providers.microsoft.tenant && typeof providers.microsoft.tenant !== "string") {
-    throw new errors/* MultiEmailError */.G("providers.microsoft.tenant must be a string.", "INVALID_CONFIG");
+  providers.microsoft.tenant = (0,validation/* normalizeMicrosoftTenant */.Cw)(
+    providers.microsoft.tenant,
+    { code: "INVALID_CONFIG" },
+  );
+  if (Object.hasOwn(providers.microsoft, "clientId")) {
+    providers.microsoft.clientId = (0,validation/* normalizeMicrosoftClientId */.U)(
+      providers.microsoft.clientId,
+      { code: "INVALID_CONFIG" },
+    );
   }
 
   if (!Array.isArray(input.accounts)) {
@@ -39487,7 +39500,10 @@ function validateConfig(input) {
     }
 
     const alias = String(account.alias || "").toLowerCase();
-    const email = String(account.email || "").trim().toLowerCase();
+    const email = (0,validation/* normalizeMailboxAddress */.o9)(account.email, {
+      field: `accounts[${index}].email`,
+      code: "INVALID_CONFIG",
+    });
     const provider = String(account.provider || "").toLowerCase();
 
     if (!ALIAS_PATTERN.test(alias)) {
@@ -39495,9 +39511,6 @@ function validateConfig(input) {
         `Invalid account alias '${alias}'. Use 1-32 lowercase letters, digits, '_' or '-'.`,
         "INVALID_CONFIG",
       );
-    }
-    if (!EMAIL_PATTERN.test(email) || /[\x00-\x1f\x7f]/.test(email)) {
-      throw new errors/* MultiEmailError */.G(`Invalid account email '${email}'.`, "INVALID_CONFIG");
     }
     if (!PROVIDERS.has(provider)) {
       throw new errors/* MultiEmailError */.G(`Unsupported provider '${provider}'.`, "INVALID_CONFIG");
@@ -39519,14 +39532,14 @@ function validateConfig(input) {
   return { version: constants/* CONFIG_VERSION */.e8, profileId, safety, providers, accounts };
 }
 
-async function loadConfig(configPath = defaultConfigPath()) {
+async function readConfigDocument(configPath) {
   let raw;
   try {
     raw = await (0,promises_.readFile)(configPath, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT") {
       throw new errors/* MultiEmailError */.G(
-        `Multi Email is not configured. Run 'npm run setup -- init' in the plugin folder.`,
+        "Multi Email is not configured. Run 'multi-email init ...' (or 'node ./scripts/multi-email init ...' from a Git clone).",
         "NOT_CONFIGURED",
       );
     }
@@ -39534,28 +39547,86 @@ async function loadConfig(configPath = defaultConfigPath()) {
   }
 
   try {
-    return validateConfig(upgradeLegacyConfig(JSON.parse(raw), configPath));
+    return upgradeLegacyConfig(JSON.parse(raw), configPath);
   } catch (error) {
     if (error instanceof SyntaxError) {
-      throw new errors/* MultiEmailError */.G(`Invalid JSON in ${configPath}.`, "INVALID_CONFIG");
+      throw new errors/* MultiEmailError */.G("The Multi Email config contains invalid JSON.", "INVALID_CONFIG");
     }
     throw error;
   }
 }
 
+async function loadConfig(configPath = defaultConfigPath()) {
+  return validateConfig(await readConfigDocument(configPath));
+}
+
+// v0.1.1 accepted malformed Microsoft client IDs and tenant values. Setup may
+// use this narrow loader only when it will immediately replace that provider
+// block; every other config field is still validated before anything is saved.
+async function loadConfigForMicrosoftRepair(configPath = defaultConfigPath()) {
+  const input = await readConfigDocument(configPath);
+  const providerInput =
+    input?.providers && typeof input.providers === "object" && !Array.isArray(input.providers)
+      ? input.providers
+      : {};
+  let tenant = "organizations";
+  try {
+    tenant = (0,validation/* normalizeMicrosoftTenant */.Cw)(providerInput.microsoft?.tenant || tenant, {
+      code: "INVALID_CONFIG",
+    });
+  } catch {
+    // The setup command using this loader immediately replaces the Microsoft
+    // block; an invalid legacy tenant safely falls back to organizations.
+  }
+  return validateConfig({
+    ...input,
+    providers: {
+      ...providerInput,
+      microsoft: { tenant },
+    },
+  });
+}
+
 async function saveConfig(config, configPath = defaultConfigPath()) {
   const validated = validateConfig(config);
   const parent = external_node_path_.dirname(configPath);
-  const tempPath = `${configPath}.${process.pid}.tmp`;
-  await (0,promises_.mkdir)(parent, { recursive: true, mode: 0o700 });
-  await (0,promises_.chmod)(parent, 0o700);
-  await (0,promises_.writeFile)(tempPath, `${JSON.stringify(validated, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  await (0,promises_.chmod)(tempPath, 0o600);
-  await (0,promises_.rename)(tempPath, configPath);
-  await (0,promises_.chmod)(configPath, 0o600);
-  return validated;
+  const tempPath = `${configPath}.${process.pid}.${(0,external_node_crypto_.randomUUID)()}.tmp`;
+  let handle;
+
+  try {
+    const target = await (0,promises_.lstat)(configPath).catch((error) => {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    });
+    if (target && (!target.isFile() || target.isSymbolicLink())) {
+      throw new errors/* MultiEmailError */.G(
+        "The Multi Email config path must be a regular file, not a link or special file.",
+        "INVALID_CONFIG_PATH",
+      );
+    }
+
+    const created = await (0,promises_.mkdir)(parent, { recursive: true, mode: 0o700 });
+    if (created !== undefined) await (0,promises_.chmod)(parent, 0o700);
+
+    const flags =
+      external_node_fs_.constants.O_WRONLY |
+      external_node_fs_.constants.O_CREAT |
+      external_node_fs_.constants.O_EXCL |
+      (external_node_fs_.constants.O_NOFOLLOW || 0);
+    handle = await (0,promises_.open)(tempPath, flags, 0o600);
+    await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
+    await handle.chmod(0o600);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await (0,promises_.rename)(tempPath, configPath);
+    return validated;
+  } finally {
+    await handle?.close().catch(() => {});
+    await (0,promises_.unlink)(tempPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+  }
 }
 
 function findAccount(config, alias) {
@@ -39589,7 +39660,7 @@ function findAccount(config, alias) {
 /* harmony export */ });
 /* unused harmony export MICROSOFT_SCOPES */
 const APP_NAME = "codex-multi-email";
-const APP_VERSION = "0.1.1";
+const APP_VERSION = "0.1.2";
 const CONFIG_VERSION = 2;
 const KEYCHAIN_SERVICE = "io.github.lanfuli.multi-email";
 const LEGACY_KEYCHAIN_SERVICE = "com.openai.codex.multi-email";
@@ -39834,9 +39905,9 @@ class MemoryCredentialStore {
 /* harmony export */ });
 /* unused harmony exports encodeHeader, decodeBase64Url */
 /* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(178);
+/* harmony import */ var _validation_mjs__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(6918);
 
 
-const EMAIL_PATTERN = /^[^\s@,<>]+@[^\s@,<>]+\.[^\s@,<>]+$/u;
 
 function assertNoHeaderBreak(value, field) {
   if (/[\r\n]/.test(String(value))) {
@@ -39848,14 +39919,12 @@ function normalizeAddresses(values = [], field = "recipient") {
   if (!Array.isArray(values)) {
     throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G(`${field} must be an array.`, "INVALID_MESSAGE");
   }
-  return values.map((value) => {
-    const address = String(value).trim().toLowerCase();
-    assertNoHeaderBreak(address, field);
-    if (!EMAIL_PATTERN.test(address)) {
-      throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G(`Invalid ${field} address '${address}'.`, "INVALID_MESSAGE");
-    }
-    return address;
-  });
+  return values.map((value) =>
+    (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_1__/* .normalizeMailboxAddress */ .o9)(value, {
+      field: `${field} address`,
+      code: "INVALID_MESSAGE",
+    }),
+  );
 }
 
 function encodeHeader(value) {
@@ -39990,13 +40059,69 @@ function extractGmailBody(payload) {
 }
 
 function splitAddressHeader(value = "") {
-  return String(value)
-    .split(",")
-    .map((entry) => {
-      const angle = entry.match(/<([^>]+)>/);
-      return (angle?.[1] || entry).trim().toLowerCase();
-    })
-    .filter((entry) => EMAIL_PATTERN.test(entry));
+  const text = String(value);
+  if (!text.trim()) return [];
+  if (/[\x00-\x1f\x7f]/u.test(text)) {
+    throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G("Address header contains a control character.", "INVALID_MESSAGE");
+  }
+
+  const entries = [];
+  let entry = "";
+  let inQuotes = false;
+  let escaped = false;
+  let angleDepth = 0;
+
+  for (const character of text) {
+    if (escaped) {
+      entry += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && inQuotes) {
+      entry += character;
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      inQuotes = !inQuotes;
+      entry += character;
+      continue;
+    }
+    if (!inQuotes && character === "<") angleDepth += 1;
+    if (!inQuotes && character === ">") angleDepth -= 1;
+    if (
+      angleDepth < 0 ||
+      angleDepth > 1 ||
+      (!inQuotes && angleDepth === 0 && (character === ":" || character === ";"))
+    ) {
+      throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G("Address header is malformed.", "INVALID_MESSAGE");
+    }
+    if (!inQuotes && angleDepth === 0 && character === ",") {
+      if (!entry.trim()) {
+        throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G("Address header is malformed.", "INVALID_MESSAGE");
+      }
+      entries.push(entry.trim());
+      entry = "";
+      continue;
+    }
+    entry += character;
+  }
+
+  if (inQuotes || escaped || angleDepth !== 0 || !entry.trim()) {
+    throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G("Address header is malformed.", "INVALID_MESSAGE");
+  }
+  entries.push(entry.trim());
+
+  return entries.map((item) => {
+    const angle = item.match(/^[^<>]*<([^<>]+)>$/u);
+    if (!angle && /[<>]/u.test(item)) {
+      throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G("Address header is malformed.", "INVALID_MESSAGE");
+    }
+    return (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_1__/* .normalizeMailboxAddress */ .o9)((angle?.[1] || item).trim(), {
+      field: "address header mailbox",
+      code: "INVALID_MESSAGE",
+    });
+  });
 }
 
 
@@ -44987,7 +45112,14 @@ function singleBareAddress(value, headerName) {
   }
   const angleAddress = text.match(/^[^<>]*<([^<>]+)>$/u);
   const candidate = (angleAddress?.[1] || text).trim();
-  const addresses = (0,mime/* splitAddressHeader */.wr)(candidate);
+  let addresses;
+  try {
+    addresses = (0,mime/* splitAddressHeader */.wr)(candidate);
+  } catch {
+    throw draftNotReviewable(
+      `The Gmail draft ${headerName} header must contain exactly one email address.`,
+    );
+  }
   if (
     addresses.length !== 1 ||
     candidate.toLowerCase() !== addresses[0] ||
@@ -45002,50 +45134,11 @@ function singleBareAddress(value, headerName) {
 
 function addressHeaderList(value, headerName) {
   if (value === undefined || value === "") return [];
-  const text = String(value);
-  const entries = [];
-  let entry = "";
-  let inQuotes = false;
-  let escaped = false;
-  let angleDepth = 0;
-
-  for (const character of text) {
-    if (escaped) {
-      entry += character;
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && inQuotes) {
-      entry += character;
-      escaped = true;
-      continue;
-    }
-    if (character === '"') {
-      inQuotes = !inQuotes;
-      entry += character;
-      continue;
-    }
-    if (!inQuotes && character === "<") angleDepth += 1;
-    if (!inQuotes && character === ">") angleDepth -= 1;
-    if (angleDepth < 0 || angleDepth > 1 || /\r|\n/u.test(character)) {
-      throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
-    }
-    if (!inQuotes && angleDepth === 0 && character === ",") {
-      if (!entry.trim()) {
-        throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
-      }
-      entries.push(entry);
-      entry = "";
-      continue;
-    }
-    entry += character;
-  }
-
-  if (inQuotes || escaped || angleDepth !== 0 || !entry.trim()) {
+  try {
+    return (0,mime/* splitAddressHeader */.wr)(value);
+  } catch {
     throw draftNotReviewable(`The Gmail draft ${headerName} header is invalid.`);
   }
-  entries.push(entry);
-  return entries.map((item) => singleBareAddress(item, headerName));
 }
 
 function singleAddressHeader(value, headerName) {
@@ -45498,7 +45591,7 @@ class GmailProvider {
     const provider = this.config.providers.google || {};
     if (!provider.clientId || !provider.clientSecret) {
       throw new errors/* MultiEmailError */.G(
-        "Google OAuth client is not configured. Run setup init with a Desktop OAuth client JSON file.",
+        "Google OAuth client is not configured. Run 'multi-email init --google-client-json <desktop-oauth.json>' (or the same node ./scripts/multi-email command from a Git clone).",
         "GOOGLE_CLIENT_NOT_CONFIGURED",
       );
     }
@@ -45630,7 +45723,7 @@ class GmailProvider {
     const record = await this.credentialRecord(account, { allowLegacy });
     if (!record) {
       throw new errors/* MultiEmailError */.G(
-        `Account '${account.alias}' is not authorized. Run setup auth ${account.alias}.`,
+        `Account '${account.alias}' is not authorized. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "NOT_AUTHENTICATED",
       );
     }
@@ -61040,7 +61133,10 @@ var errors = __nccwpck_require__(178);
 var keychain = __nccwpck_require__(9055);
 // EXTERNAL MODULE: ./src/mime.mjs
 var mime = __nccwpck_require__(7123);
+// EXTERNAL MODULE: ./src/validation.mjs
+var validation = __nccwpck_require__(6918);
 ;// CONCATENATED MODULE: ./src/providers/microsoft.mjs
+
 
 
 
@@ -61139,7 +61235,10 @@ function draftNotReviewable(message, details = undefined) {
 }
 
 function draftIdentity(account, value, field, { allowDefault = false } = {}) {
-  const expected = account.email.toLowerCase();
+  const expected = (0,validation/* normalizeMailboxAddress */.o9)(account.email, {
+    field: "configured Microsoft mailbox",
+    code: "DRAFT_NOT_REVIEWABLE",
+  });
   if (value === undefined || value === null) {
     if (allowDefault) return expected;
     throw draftNotReviewable(
@@ -61147,8 +61246,18 @@ function draftIdentity(account, value, field, { allowDefault = false } = {}) {
     );
   }
 
-  const actual = String(value?.emailAddress?.address || "").trim().toLowerCase();
-  if (!actual || actual !== expected) {
+  let actual;
+  try {
+    actual = (0,validation/* normalizeMailboxAddress */.o9)(value?.emailAddress?.address, {
+      field: `Microsoft draft ${field} address`,
+      code: "DRAFT_NOT_REVIEWABLE",
+    });
+  } catch {
+    throw draftNotReviewable(
+      `The Microsoft draft ${field} identity is not a canonical mailbox address.`,
+    );
+  }
+  if (actual !== expected) {
     throw draftNotReviewable(
       `The Microsoft draft ${field} identity does not match the configured mailbox.`,
     );
@@ -61164,13 +61273,16 @@ function draftRecipients(values, field) {
   }
 
   return values.map((value) => {
-    const address = String(value?.emailAddress?.address || "").trim().toLowerCase();
-    if (!address) {
+    try {
+      return (0,validation/* normalizeMailboxAddress */.o9)(value?.emailAddress?.address, {
+        field: `Microsoft draft ${field} recipient`,
+        code: "DRAFT_NOT_REVIEWABLE",
+      });
+    } catch {
       throw draftNotReviewable(
-        `Microsoft returned an incomplete ${field} recipient for this draft.`,
+        `Microsoft returned an invalid ${field} recipient for this draft.`,
       );
     }
-    return address;
   });
 }
 
@@ -61548,17 +61660,19 @@ class MicrosoftProvider {
     const provider = this.config.providers.microsoft || {};
     if (!provider.clientId) {
       throw new errors/* MultiEmailError */.G(
-        "Microsoft OAuth is not configured. Add the public desktop app client ID during setup.",
+        "Microsoft OAuth is not configured. Run 'multi-email set-microsoft-client <application-guid>' (or the same node ./scripts/multi-email command from a Git clone).",
         "MICROSOFT_CLIENT_NOT_CONFIGURED",
       );
     }
 
-    const tenant = String(provider.tenant || "organizations").trim();
-    if (!tenant || /[\s/?#]/.test(tenant)) {
-      throw new errors/* MultiEmailError */.G("Invalid Microsoft tenant value in config.", "INVALID_CONFIG");
-    }
+    const clientId = (0,validation/* normalizeMicrosoftClientId */.U)(provider.clientId, {
+      code: "INVALID_CONFIG",
+    });
+    const tenant = (0,validation/* normalizeMicrosoftTenant */.Cw)(provider.tenant || "organizations", {
+      code: "INVALID_CONFIG",
+    });
     return {
-      clientId: provider.clientId,
+      clientId,
       tenant,
       authority: `https://login.microsoftonline.com/${encodeURIComponent(tenant)}`,
     };
@@ -61691,7 +61805,7 @@ class MicrosoftProvider {
 
     if (!accounts.length) {
       throw new errors/* MultiEmailError */.G(
-        `Account '${account.alias}' is not authorized. Run setup auth ${account.alias}.`,
+        `Account '${account.alias}' is not authorized. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "NOT_AUTHENTICATED",
       );
     }
@@ -61715,7 +61829,7 @@ class MicrosoftProvider {
       });
     } catch (error) {
       throw new errors/* MultiEmailError */.G(
-        `Microsoft authorization for '${account.alias}' must be refreshed. Run setup auth ${account.alias}.`,
+        `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "REAUTHENTICATION_REQUIRED",
         { providerCode: error?.errorCode || error?.code || null },
       );
@@ -61894,7 +62008,7 @@ class MicrosoftProvider {
       provider_grant_revoked: false,
       manual_action_required: true,
       instruction:
-        "Microsoft does not expose a safe per-app delegated-token revocation through this client. Remove Multi Email access in Microsoft My Apps, then run setup logout for this alias.",
+        "Microsoft does not expose a safe per-app delegated-token revocation through this client. Remove Multi Email access in Microsoft My Apps, then run 'multi-email logout <alias> --confirm' (or the same node ./scripts/multi-email command from a Git clone).",
     };
   }
 
@@ -62506,7 +62620,7 @@ class MicrosoftProvider {
 /* harmony export */   P: () => (/* binding */ EFFECTIVE_SEND_POLICY_VERSION),
 /* harmony export */   n$: () => (/* binding */ SendApprovalStore)
 /* harmony export */ });
-/* unused harmony export stableDraftFingerprint */
+/* unused harmony exports SEND_APPROVAL_STORE_LIMITS, stableDraftFingerprint */
 /* harmony import */ var node_crypto__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(7598);
 /* harmony import */ var _constants_mjs__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(1102);
 /* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(178);
@@ -62516,6 +62630,10 @@ class MicrosoftProvider {
 
 const EFFECTIVE_SEND_MANIFEST_VERSION = 1;
 const EFFECTIVE_SEND_POLICY_VERSION = 2;
+const SEND_APPROVAL_STORE_LIMITS = Object.freeze({
+  maxPendingRequests: 16,
+  maxRetainedBytes: 16 * 1024 * 1024,
+});
 
 function cloneProviderRevision(review, messageId, threadId) {
   const revision = review.providerRevision || {};
@@ -62578,7 +62696,12 @@ function safeEqual(first, second) {
 }
 
 class SendApprovalStore {
-  constructor({ ttlSeconds = 300, clock = () => Date.now() } = {}) {
+  constructor({
+    ttlSeconds = 300,
+    clock = () => Date.now(),
+    maxPendingRequests = SEND_APPROVAL_STORE_LIMITS.maxPendingRequests,
+    maxRetainedBytes = SEND_APPROVAL_STORE_LIMITS.maxRetainedBytes,
+  } = {}) {
     if (
       !Number.isInteger(ttlSeconds) ||
       ttlSeconds <= 0 ||
@@ -62589,43 +62712,108 @@ class SendApprovalStore {
         "INVALID_CONFIG",
       );
     }
+    if (
+      !Number.isInteger(maxPendingRequests) ||
+      maxPendingRequests <= 0 ||
+      maxPendingRequests > SEND_APPROVAL_STORE_LIMITS.maxPendingRequests
+    ) {
+      throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_2__/* .MultiEmailError */ .G(
+        `Send approval capacity must be an integer from 1 to ${SEND_APPROVAL_STORE_LIMITS.maxPendingRequests}.`,
+        "INVALID_CONFIG",
+      );
+    }
+    if (
+      !Number.isInteger(maxRetainedBytes) ||
+      maxRetainedBytes <= 0 ||
+      maxRetainedBytes > SEND_APPROVAL_STORE_LIMITS.maxRetainedBytes
+    ) {
+      throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_2__/* .MultiEmailError */ .G(
+        `Send approval retained-byte capacity must be an integer from 1 to ${SEND_APPROVAL_STORE_LIMITS.maxRetainedBytes}.`,
+        "INVALID_CONFIG",
+      );
+    }
     this.ttlMs = ttlSeconds * 1000;
     this.clock = clock;
+    this.maxPendingRequests = maxPendingRequests;
+    this.maxRetainedBytes = maxRetainedBytes;
     this.requests = new Map();
+    this.retainedBytes = 0;
   }
 
   prepare(review) {
+    this.#sweepExpired();
     const requestId = `sar_${(0,node_crypto__WEBPACK_IMPORTED_MODULE_0__.randomBytes)(24).toString("base64url")}`;
     const expiresAt = this.clock() + this.ttlMs;
     const snapshot = cloneReview(review);
+    const snapshotBytes = Buffer.byteLength(JSON.stringify(snapshot), "utf8");
+    if (
+      this.requests.size >= this.maxPendingRequests ||
+      snapshotBytes > this.maxRetainedBytes - this.retainedBytes
+    ) {
+      throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_2__/* .MultiEmailError */ .G(
+        "Too many send approvals are awaiting review. Finish, reject, or let an existing review expire before preparing another draft.",
+        "SEND_APPROVAL_CAPACITY",
+      );
+    }
     this.requests.set(requestId, {
       snapshot,
+      snapshotBytes,
       fingerprint: stableDraftFingerprint(snapshot),
       status: "pending",
       expiresAt,
     });
+    this.retainedBytes += snapshotBytes;
     return {
       requestId,
       expiresAt: new Date(expiresAt).toISOString(),
     };
   }
 
+  #delete(requestId) {
+    const request = this.requests.get(requestId);
+    if (!request) return false;
+    this.requests.delete(requestId);
+    this.retainedBytes -= request.snapshotBytes;
+    return true;
+  }
+
+  #sweepExpired(now = this.clock()) {
+    for (const [requestId, request] of this.requests) {
+      if (request.expiresAt <= now) this.#delete(requestId);
+    }
+  }
+
   #request(requestId) {
     const request = this.requests.get(requestId);
+    const now = this.clock();
+    const expired = request?.expiresAt <= now;
+    this.#sweepExpired(now);
     if (!request) {
       throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_2__/* .MultiEmailError */ .G(
         "Send approval is missing, rejected, or already used. Prepare the draft again.",
         "SEND_APPROVAL_REQUIRED",
       );
     }
-    if (request.expiresAt <= this.clock()) {
-      this.requests.delete(requestId);
+    if (expired) {
       throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_2__/* .MultiEmailError */ .G(
         "Send approval expired. Prepare and review the draft again.",
         "SEND_APPROVAL_EXPIRED",
       );
     }
     return request;
+  }
+
+  stats() {
+    this.#sweepExpired();
+    return {
+      pendingRequests: this.requests.size,
+      retainedBytes: this.retainedBytes,
+    };
+  }
+
+  // Safe, idempotent cleanup for callers that could not present the review UI.
+  discard(requestId) {
+    return this.#delete(requestId);
   }
 
   getPendingReview(requestId) {
@@ -62667,7 +62855,7 @@ class SendApprovalStore {
   // Rejection is also out of band. Removing the request makes rejection final.
   rejectOutOfBand(requestId) {
     this.#request(requestId);
-    this.requests.delete(requestId);
+    this.#delete(requestId);
     return { requestId, status: "rejected" };
   }
 
@@ -62683,7 +62871,7 @@ class SendApprovalStore {
       (expected.account && request.snapshot.account !== expected.account) ||
       (expected.draftId && request.snapshot.draftId !== expected.draftId)
     ) {
-      this.requests.delete(requestId);
+      this.#delete(requestId);
       throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_2__/* .MultiEmailError */ .G(
         "Send approval does not match this account and draft.",
         "SEND_APPROVAL_MISMATCH",
@@ -62701,7 +62889,7 @@ class SendApprovalStore {
 
     // Approval is spent before any validation or provider network call. A mismatch
     // or ambiguous provider outcome must always require a fresh human review.
-    this.requests.delete(requestId);
+    this.#delete(requestId);
 
     if (!safeEqual(stableDraftFingerprint(review), request.fingerprint)) {
       throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_2__/* .MultiEmailError */ .G(
@@ -83166,7 +83354,12 @@ class MailService {
     const preview = safePreview(canonical.body);
     let approvalWindowOpened = false;
     if (this.approvalUi) {
-      await this.approvalUi.requestApproval(approval.requestId);
+      try {
+        await this.approvalUi.requestApproval(approval.requestId);
+      } catch (error) {
+        this.approvals.discard(approval.requestId);
+        throw error;
+      }
       approvalWindowOpened = true;
     }
     return {
@@ -83252,6 +83445,7 @@ var external_node_http_ = __nccwpck_require__(7067);
 const LOOPBACK_HOST = "127.0.0.1";
 const COOKIE_NAME = "multi_email_send_review";
 const MAX_FORM_BYTES = 4_096;
+const MAX_APPROVAL_UI_SESSIONS = 16;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -83322,7 +83516,7 @@ function cookieValue(request, name) {
   return undefined;
 }
 
-function openInDefaultBrowser(url) {
+function defaultBrowserCommand(url, platform = process.platform) {
   const target = new URL(url);
   if (target.protocol !== "http:" || target.hostname !== LOOPBACK_HOST) {
     throw new errors/* MultiEmailError */.G(
@@ -83333,10 +83527,10 @@ function openInDefaultBrowser(url) {
 
   let command;
   let args;
-  if (process.platform === "darwin") {
-    command = "open";
+  if (platform === "darwin") {
+    command = "/usr/bin/open";
     args = [target.href];
-  } else if (process.platform === "win32") {
+  } else if (platform === "win32") {
     command = "rundll32.exe";
     args = ["url.dll,FileProtocolHandler", target.href];
   } else {
@@ -83344,8 +83538,17 @@ function openInDefaultBrowser(url) {
     args = [target.href];
   }
 
+  return { command, args };
+}
+
+function openInDefaultBrowser(
+  url,
+  { platform = process.platform, spawnProcess = external_node_child_process_.spawn } = {},
+) {
+  const { command, args } = defaultBrowserCommand(url, platform);
+
   return new Promise((resolve, reject) => {
-    const child = (0,external_node_child_process_.spawn)(command, args, { detached: true, stdio: "ignore" });
+    const child = spawnProcess(command, args, { detached: true, stdio: "ignore" });
     child.once("error", reject);
     child.once("spawn", () => {
       child.unref();
@@ -83355,16 +83558,34 @@ function openInDefaultBrowser(url) {
 }
 
 class LocalSendApprovalUi {
-  constructor({ approvalStore, browserOpener = openInDefaultBrowser, port = 0 } = {}) {
+  constructor({
+    approvalStore,
+    browserOpener = openInDefaultBrowser,
+    port = 0,
+    clock = () => Date.now(),
+    maxSessions = MAX_APPROVAL_UI_SESSIONS,
+  } = {}) {
     if (!approvalStore) {
       throw new errors/* MultiEmailError */.G(
         "LocalSendApprovalUi requires an approval store.",
         "INVALID_CONFIG",
       );
     }
+    if (
+      !Number.isInteger(maxSessions) ||
+      maxSessions <= 0 ||
+      maxSessions > MAX_APPROVAL_UI_SESSIONS
+    ) {
+      throw new errors/* MultiEmailError */.G(
+        `Local approval session capacity must be an integer from 1 to ${MAX_APPROVAL_UI_SESSIONS}.`,
+        "INVALID_CONFIG",
+      );
+    }
     this.approvalStore = approvalStore;
     this.browserOpener = browserOpener;
     this.port = port;
+    this.clock = clock;
+    this.maxSessions = maxSessions;
     this.sessions = new Map();
     this.server = undefined;
     this.startPromise = undefined;
@@ -83431,7 +83652,13 @@ class LocalSendApprovalUi {
         "SEND_APPROVAL_ALREADY_APPROVED",
       );
     }
-    await this.start();
+    this.#sweepExpired();
+    if (this.sessions.size >= this.maxSessions) {
+      throw new errors/* MultiEmailError */.G(
+        "Too many local approval windows are awaiting a decision. Finish or close an existing review before opening another.",
+        "APPROVAL_UI_CAPACITY",
+      );
+    }
 
     const sessionId = (0,external_node_crypto_.randomBytes)(24).toString("base64url");
     const csrf = (0,external_node_crypto_.randomBytes)(24).toString("base64url");
@@ -83442,6 +83669,13 @@ class LocalSendApprovalUi {
       cookie,
       expiresAt: Date.parse(pending.expiresAt),
     });
+
+    try {
+      await this.start();
+    } catch (error) {
+      this.sessions.delete(sessionId);
+      throw error;
+    }
     const url = `${this.origin}/review/${sessionId}`;
 
     try {
@@ -83455,6 +83689,11 @@ class LocalSendApprovalUi {
     }
 
     return { url, expiresAt: pending.expiresAt };
+  }
+
+  sessionCount() {
+    this.#sweepExpired();
+    return this.sessions.size;
   }
 
   async stop() {
@@ -83482,12 +83721,15 @@ class LocalSendApprovalUi {
   }
 
   #session(sessionId) {
+    this.#sweepExpired();
     const session = this.sessions.get(sessionId);
-    if (!session || session.expiresAt <= Date.now()) {
-      this.sessions.delete(sessionId);
-      return undefined;
-    }
     return session;
+  }
+
+  #sweepExpired(now = this.clock()) {
+    for (const [sessionId, session] of this.sessions) {
+      if (session.expiresAt <= now) this.sessions.delete(sessionId);
+    }
   }
 
   async #handle(request, response) {
@@ -83550,7 +83792,7 @@ class LocalSendApprovalUi {
     const { review } = pending;
     const styleNonce = (0,external_node_crypto_.randomBytes)(18).toString("base64url");
     const action = `/review/${sessionId}/decision`;
-    const maxAge = Math.max(0, Math.ceil((session.expiresAt - Date.now()) / 1000));
+    const maxAge = Math.max(0, Math.ceil((session.expiresAt - this.clock()) / 1000));
     const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -83987,17 +84229,23 @@ if (process.argv[1] && new URL(require("url").pathToFileURL(__filename).href).pa
 "use strict";
 __nccwpck_require__.r(__webpack_exports__);
 /* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
+/* harmony export */   formatSetupError: () => (/* binding */ formatSetupError),
 /* harmony export */   parseCliArgs: () => (/* binding */ parseCliArgs),
 /* harmony export */   readGoogleDesktopClient: () => (/* binding */ readGoogleDesktopClient),
-/* harmony export */   run: () => (/* binding */ run)
+/* harmony export */   run: () => (/* binding */ run),
+/* harmony export */   runSetupCli: () => (/* binding */ runSetupCli)
 /* harmony export */ });
 /* harmony import */ var node_fs_promises__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(1455);
 /* harmony import */ var node_path__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(6760);
 /* harmony import */ var node_url__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(3136);
 /* harmony import */ var node_util__WEBPACK_IMPORTED_MODULE_3__ = __nccwpck_require__(7975);
 /* harmony import */ var _config_mjs__WEBPACK_IMPORTED_MODULE_4__ = __nccwpck_require__(9539);
-/* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_5__ = __nccwpck_require__(178);
-/* harmony import */ var _keychain_mjs__WEBPACK_IMPORTED_MODULE_6__ = __nccwpck_require__(9055);
+/* harmony import */ var _constants_mjs__WEBPACK_IMPORTED_MODULE_5__ = __nccwpck_require__(1102);
+/* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_6__ = __nccwpck_require__(178);
+/* harmony import */ var _keychain_mjs__WEBPACK_IMPORTED_MODULE_7__ = __nccwpck_require__(9055);
+/* harmony import */ var _validation_mjs__WEBPACK_IMPORTED_MODULE_8__ = __nccwpck_require__(6918);
+
+
 
 
 
@@ -84010,16 +84258,20 @@ __nccwpck_require__.r(__webpack_exports__);
 const HELP = `Multi Email setup
 
 Usage:
-  npm run setup -- init --google-client-json <desktop-oauth.json> [--microsoft-client-id <id>] [--microsoft-tenant <tenant>]
-  npm run setup -- add-account <alias> <email> <google|microsoft>
-  npm run setup -- set-microsoft-client <client-id> [--microsoft-tenant <tenant>]
-  npm run setup -- auth <alias>
-  npm run setup -- doctor [alias]
-  npm run setup -- logout <alias> --confirm
-  npm run setup -- revoke <alias> --confirm
-  npm run setup -- list
+  multi-email init --google-client-json <desktop-oauth.json> [--microsoft-client-id <guid>] [--microsoft-tenant <tenant>]
+  multi-email init --microsoft-client-id <guid> [--microsoft-tenant <tenant>]
+  multi-email add-account <alias> <email> <google|microsoft>
+  multi-email set-microsoft-client <guid> [--microsoft-tenant <tenant>]
+  multi-email auth <alias>
+  multi-email doctor [alias]
+  multi-email logout <alias> --confirm
+  multi-email revoke <alias> --confirm
+  multi-email list
+  multi-email --version
 
 Notes:
+  - From a Git clone, replace 'multi-email' with 'node ./scripts/multi-email'.
+  - init requires at least one Google or Microsoft OAuth client option.
   - Aliases are lowercase identifiers used by every mail tool.
   - OAuth tokens are stored in macOS Keychain and are never printed.
   - The config path defaults to ~/.config/codex-multi-email/config.json.
@@ -84028,18 +84280,22 @@ Notes:
 `;
 
 function fail(message, code = "INVALID_ARGUMENT") {
-  throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_5__/* .MultiEmailError */ .G(message, code);
+  throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_6__/* .MultiEmailError */ .G(message, code);
 }
 
 function requireNoExtraPositionals(positionals, expected) {
   if (positionals.length !== expected) {
-    fail("Invalid arguments. Run 'npm run setup -- --help' for usage.");
+    fail(
+      "Invalid arguments. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.",
+    );
   }
 }
 
-async function loadConfigOrEmpty(configPath) {
+async function loadConfigOrEmpty(configPath, { repairMicrosoft = false } = {}) {
   try {
-    return await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath);
+    return await (repairMicrosoft
+      ? (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfigForMicrosoftRepair */ .Vp)(configPath)
+      : (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath));
   } catch (error) {
     if (error?.code === "NOT_CONFIGURED") return (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .emptyConfig */ .i4)();
     throw error;
@@ -84090,60 +84346,95 @@ async function instantiateProvider(provider, config, credentialStore) {
   fail(`Unsupported provider '${provider}'.`);
 }
 
-function optionalTenant(value) {
-  const tenant = value ? String(value).trim() : "organizations";
-  if (!tenant || /[\s\r\n/]/.test(tenant)) {
-    fail("Microsoft tenant must be 'organizations', 'common', a tenant ID, or a tenant domain.");
-  }
-  return tenant;
-}
-
 async function initCommand({ values, positionals, configPath, output }) {
   requireNoExtraPositionals(positionals, 0);
-  const google = await readGoogleDesktopClient(values["google-client-json"]);
-  const config = await loadConfigOrEmpty(configPath);
-  config.providers.google = google;
-
-  if (values["microsoft-client-id"]) {
-    config.providers.microsoft = {
-      clientId: String(values["microsoft-client-id"]).trim(),
-      tenant: optionalTenant(values["microsoft-tenant"]),
-    };
-  } else if (values["microsoft-tenant"]) {
+  const googleClientPath = values["google-client-json"];
+  const microsoftClientIdValue = values["microsoft-client-id"];
+  if (!googleClientPath && !microsoftClientIdValue) {
+    fail(
+      "init requires --google-client-json, --microsoft-client-id, or both.",
+    );
+  }
+  if (values["microsoft-tenant"] && !microsoftClientIdValue) {
     fail("--microsoft-tenant requires --microsoft-client-id during init.");
   }
 
-  await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .saveConfig */ .ql)(config, configPath);
+  const google = googleClientPath
+    ? await readGoogleDesktopClient(googleClientPath)
+    : undefined;
+  const microsoftClientId = microsoftClientIdValue
+    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftClientId */ .U)(microsoftClientIdValue)
+    : undefined;
+  const microsoftTenant = microsoftClientId
+    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftTenant */ .Cw)(values["microsoft-tenant"] || "organizations")
+    : undefined;
+  const config = await loadConfigOrEmpty(configPath, {
+    repairMicrosoft: Boolean(microsoftClientId),
+  });
+  if (google) config.providers.google = google;
+
+  if (microsoftClientId) {
+    config.providers.microsoft = {
+      clientId: microsoftClientId,
+      tenant: microsoftTenant,
+    };
+  }
+
+  const saved = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .saveConfig */ .ql)(config, configPath);
   output(`Initialized Multi Email configuration at ${configPath}.`);
-  output(
-    values["microsoft-client-id"]
-      ? "Google and Microsoft OAuth clients are configured."
-      : "Google OAuth is configured. Microsoft can be added later with set-microsoft-client.",
-  );
+  const googleConfigured = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .googleProviderConfigured */ .jS)(saved.providers.google);
+  const microsoftConfigured = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .microsoftProviderConfigured */ .CH)(saved.providers.microsoft);
+  if (googleConfigured && microsoftConfigured) {
+    output("Google and Microsoft OAuth clients are configured.");
+  } else if (googleConfigured) {
+    output("Google OAuth is configured. Microsoft can be added later with set-microsoft-client.");
+  } else if (microsoftConfigured) {
+    output("Microsoft OAuth is configured. Google can be added later with init --google-client-json.");
+  }
 }
 
 async function addAccountCommand({ positionals, configPath, output }) {
   requireNoExtraPositionals(positionals, 3);
-  const [alias, email, provider] = positionals;
+  const [alias, email, providerValue] = positionals;
+  const provider = String(providerValue || "").toLowerCase();
+  if (provider !== "google" && provider !== "microsoft") {
+    fail("Account provider must be 'google' or 'microsoft'.");
+  }
   const config = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath);
+  if (provider === "google" && !(0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .googleProviderConfigured */ .jS)(config.providers.google)) {
+    fail(
+      "Google OAuth is not configured. Run 'multi-email init --google-client-json <desktop-oauth.json>' (or use 'node ./scripts/multi-email init ...' from a Git clone) before adding a Google account.",
+      "PROVIDER_NOT_CONFIGURED",
+    );
+  }
+  if (
+    provider === "microsoft" &&
+    !(0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .microsoftProviderConfigured */ .CH)(config.providers.microsoft)
+  ) {
+    fail(
+      "Microsoft OAuth is not configured. Run 'multi-email set-microsoft-client <application-guid>' (or use 'node ./scripts/multi-email set-microsoft-client ...' from a Git clone) before adding a Microsoft account.",
+      "PROVIDER_NOT_CONFIGURED",
+    );
+  }
   config.accounts.push({ alias, email, provider });
   const saved = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .saveConfig */ .ql)(config, configPath);
   const added = (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .findAccount */ .vF)(saved, alias);
   output(`Added '${added.alias}' (${added.provider}, ${added.email}).`);
-  output(`Next: npm run setup -- auth ${added.alias}`);
+  output(
+    `Next: multi-email auth ${added.alias} (or node ./scripts/multi-email auth ${added.alias} from a Git clone).`,
+  );
 }
 
 async function setMicrosoftClientCommand({ values, positionals, configPath, output }) {
   requireNoExtraPositionals(positionals, 1);
-  const clientId = String(positionals[0] || "").trim();
-  if (!clientId || /[\s\r\n]/.test(clientId)) {
-    fail("set-microsoft-client requires a valid public client application ID.");
-  }
+  const clientId = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftClientId */ .U)(positionals[0]);
 
-  const config = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath);
+  const config = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfigForMicrosoftRepair */ .Vp)(configPath);
   config.providers.microsoft = {
     clientId,
-    tenant: optionalTenant(values["microsoft-tenant"] || config.providers.microsoft?.tenant),
+    tenant: (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftTenant */ .Cw)(
+      values["microsoft-tenant"] || config.providers.microsoft?.tenant || "organizations",
+    ),
   };
   await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .saveConfig */ .ql)(config, configPath);
   output("Microsoft OAuth client configuration updated.");
@@ -84226,6 +84517,7 @@ function parseCliArgs(args) {
       "microsoft-client-id": { type: "string" },
       "microsoft-tenant": { type: "string" },
       confirm: { type: "boolean" },
+      version: { type: "boolean", short: "V" },
     },
   });
 }
@@ -84233,10 +84525,25 @@ function parseCliArgs(args) {
 async function run(args = process.argv.slice(2), dependencies = {}) {
   const output = dependencies.output || console.log;
   const configPath = dependencies.configPath || (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .defaultConfigPath */ .jE)();
-  const credentialStore = dependencies.credentialStore || new _keychain_mjs__WEBPACK_IMPORTED_MODULE_6__/* .KeychainStore */ .kG();
+  const credentialStore = dependencies.credentialStore || new _keychain_mjs__WEBPACK_IMPORTED_MODULE_7__/* .KeychainStore */ .kG();
   const providerFactory = dependencies.providerFactory || instantiateProvider;
-  const parsed = parseCliArgs(args);
+  let parsed;
+  try {
+    parsed = parseCliArgs(args);
+  } catch (error) {
+    if (String(error?.code || "").startsWith("ERR_PARSE_ARGS_")) {
+      fail(
+        "Invalid arguments. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.",
+      );
+    }
+    throw error;
+  }
   const [command, ...positionals] = parsed.positionals;
+
+  if (parsed.values.version) {
+    output(_constants_mjs__WEBPACK_IMPORTED_MODULE_5__/* .APP_VERSION */ .hl);
+    return;
+  }
 
   if (parsed.values.help || !command) {
     output(HELP.trimEnd());
@@ -84269,7 +84576,34 @@ async function run(args = process.argv.slice(2), dependencies = {}) {
     case "list":
       return listCommand(context);
     default:
-      fail(`Unknown command '${command}'. Run 'npm run setup -- --help' for usage.`);
+      fail(
+        `Unknown command '${command}'. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.`,
+      );
+  }
+}
+
+function formatSetupError(error) {
+  if (error instanceof _errors_mjs__WEBPACK_IMPORTED_MODULE_6__/* .MultiEmailError */ .G) {
+    const code = error.code ? ` [${error.code}]` : "";
+    return `Setup failed${code}: ${error.message}`;
+  }
+  return "Setup failed: an unexpected local or provider error occurred.";
+}
+
+async function runSetupCli(args = process.argv.slice(2), dependencies = {}) {
+  const errorOutput = dependencies.errorOutput || console.error;
+  const setExitCode =
+    dependencies.setExitCode ||
+    ((code) => {
+      process.exitCode = code;
+    });
+  try {
+    await run(args, dependencies);
+    return true;
+  } catch (error) {
+    errorOutput(formatSetupError(error));
+    setExitCode(1);
+    return false;
   }
 }
 
@@ -84277,17 +84611,124 @@ const invokedAsScript =
   process.argv[1] && (0,node_url__WEBPACK_IMPORTED_MODULE_2__.pathToFileURL)(node_path__WEBPACK_IMPORTED_MODULE_1__.resolve(process.argv[1])).href === require("url").pathToFileURL(__filename).href;
 
 if (invokedAsScript) {
-  run().catch((error) => {
-    if (error instanceof _errors_mjs__WEBPACK_IMPORTED_MODULE_5__/* .MultiEmailError */ .G) {
-      const code = error.code ? ` [${error.code}]` : "";
-      console.error(`Setup failed${code}: ${error.message}`);
-    } else {
-      // Provider and parser errors can carry request context. Do not risk printing
-      // authorization codes, tokens, or client credentials from an unknown error.
-      console.error("Setup failed: an unexpected local or provider error occurred.");
-    }
-    process.exitCode = 1;
-  });
+  void runSetupCli();
+}
+
+
+/***/ }),
+
+/***/ 6918:
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+"use strict";
+/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
+/* harmony export */   CH: () => (/* binding */ microsoftProviderConfigured),
+/* harmony export */   Cw: () => (/* binding */ normalizeMicrosoftTenant),
+/* harmony export */   U: () => (/* binding */ normalizeMicrosoftClientId),
+/* harmony export */   jS: () => (/* binding */ googleProviderConfigured),
+/* harmony export */   o9: () => (/* binding */ normalizeMailboxAddress)
+/* harmony export */ });
+/* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(178);
+
+
+const ATEXT_SEGMENT = /^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~]+$/u;
+const DNS_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/u;
+const MICROSOFT_CLIENT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const WELL_KNOWN_MICROSOFT_TENANTS = new Set(["common", "consumers", "organizations"]);
+
+function invalid(message, code) {
+  throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G(message, code);
+}
+
+function normalizeMailboxAddress(
+  value,
+  { field = "email address", code = "INVALID_MESSAGE" } = {},
+) {
+  if (typeof value !== "string") {
+    invalid(`${field} must be a single canonical mailbox address.`, code);
+  }
+
+  const address = value.trim().toLowerCase();
+  if (
+    !address ||
+    address.length > 254 ||
+    /[^\x21-\x7e]/u.test(address) ||
+    address.indexOf("@") <= 0 ||
+    address.indexOf("@") !== address.lastIndexOf("@")
+  ) {
+    invalid(`${field} must be a single canonical mailbox address.`, code);
+  }
+
+  const [local, domain] = address.split("@");
+  const localSegments = local.split(".");
+  const domainLabels = domain.split(".");
+  if (
+    local.length > 64 ||
+    domain.length > 253 ||
+    localSegments.some((segment) => !ATEXT_SEGMENT.test(segment)) ||
+    domainLabels.length < 2 ||
+    domainLabels.some((label) => !DNS_LABEL.test(label))
+  ) {
+    invalid(`${field} must be a single canonical mailbox address.`, code);
+  }
+
+  return address;
+}
+
+function normalizeMicrosoftClientId(
+  value,
+  { code = "INVALID_ARGUMENT" } = {},
+) {
+  const clientId = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!MICROSOFT_CLIENT_ID.test(clientId)) {
+    invalid("Microsoft client ID must be a standard application GUID.", code);
+  }
+  return clientId;
+}
+
+function normalizeMicrosoftTenant(
+  value = "organizations",
+  { code = "INVALID_ARGUMENT" } = {},
+) {
+  const tenant = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (WELL_KNOWN_MICROSOFT_TENANTS.has(tenant) || MICROSOFT_CLIENT_ID.test(tenant)) {
+    return tenant;
+  }
+
+  const labels = tenant.split(".");
+  if (
+    tenant.length > 253 ||
+    labels.length < 2 ||
+    labels.some((label) => !DNS_LABEL.test(label))
+  ) {
+    invalid(
+      "Microsoft tenant must be 'organizations', 'common', 'consumers', a tenant GUID, or a tenant domain.",
+      code,
+    );
+  }
+  return tenant;
+}
+
+function googleProviderConfigured(provider) {
+  return Boolean(
+    provider &&
+      typeof provider.clientId === "string" &&
+      provider.clientId.trim() &&
+      typeof provider.clientSecret === "string" &&
+      provider.clientSecret.trim(),
+  );
+}
+
+function microsoftProviderConfigured(provider) {
+  if (!provider?.clientId) return false;
+  try {
+    normalizeMicrosoftClientId(provider.clientId, { code: "INVALID_CONFIG" });
+    normalizeMicrosoftTenant(provider.tenant || "organizations", { code: "INVALID_CONFIG" });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 

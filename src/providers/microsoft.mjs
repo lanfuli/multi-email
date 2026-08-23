@@ -4,6 +4,11 @@ import { PublicClientApplication } from "@azure/msal-node";
 import { MultiEmailError } from "../errors.mjs";
 import { credentialAccountKey, legacyCredentialAccountKey } from "../keychain.mjs";
 import { buildRawMessage } from "../mime.mjs";
+import {
+  normalizeMailboxAddress,
+  normalizeMicrosoftClientId,
+  normalizeMicrosoftTenant,
+} from "../validation.mjs";
 
 const GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0/";
 const DELEGATED_SCOPES = Object.freeze(["User.Read", "Mail.ReadWrite", "Mail.Send"]);
@@ -96,7 +101,10 @@ function draftNotReviewable(message, details = undefined) {
 }
 
 function draftIdentity(account, value, field, { allowDefault = false } = {}) {
-  const expected = account.email.toLowerCase();
+  const expected = normalizeMailboxAddress(account.email, {
+    field: "configured Microsoft mailbox",
+    code: "DRAFT_NOT_REVIEWABLE",
+  });
   if (value === undefined || value === null) {
     if (allowDefault) return expected;
     throw draftNotReviewable(
@@ -104,8 +112,18 @@ function draftIdentity(account, value, field, { allowDefault = false } = {}) {
     );
   }
 
-  const actual = String(value?.emailAddress?.address || "").trim().toLowerCase();
-  if (!actual || actual !== expected) {
+  let actual;
+  try {
+    actual = normalizeMailboxAddress(value?.emailAddress?.address, {
+      field: `Microsoft draft ${field} address`,
+      code: "DRAFT_NOT_REVIEWABLE",
+    });
+  } catch {
+    throw draftNotReviewable(
+      `The Microsoft draft ${field} identity is not a canonical mailbox address.`,
+    );
+  }
+  if (actual !== expected) {
     throw draftNotReviewable(
       `The Microsoft draft ${field} identity does not match the configured mailbox.`,
     );
@@ -121,13 +139,16 @@ function draftRecipients(values, field) {
   }
 
   return values.map((value) => {
-    const address = String(value?.emailAddress?.address || "").trim().toLowerCase();
-    if (!address) {
+    try {
+      return normalizeMailboxAddress(value?.emailAddress?.address, {
+        field: `Microsoft draft ${field} recipient`,
+        code: "DRAFT_NOT_REVIEWABLE",
+      });
+    } catch {
       throw draftNotReviewable(
-        `Microsoft returned an incomplete ${field} recipient for this draft.`,
+        `Microsoft returned an invalid ${field} recipient for this draft.`,
       );
     }
-    return address;
   });
 }
 
@@ -505,17 +526,19 @@ export class MicrosoftProvider {
     const provider = this.config.providers.microsoft || {};
     if (!provider.clientId) {
       throw new MultiEmailError(
-        "Microsoft OAuth is not configured. Add the public desktop app client ID during setup.",
+        "Microsoft OAuth is not configured. Run 'multi-email set-microsoft-client <application-guid>' (or the same node ./scripts/multi-email command from a Git clone).",
         "MICROSOFT_CLIENT_NOT_CONFIGURED",
       );
     }
 
-    const tenant = String(provider.tenant || "organizations").trim();
-    if (!tenant || /[\s/?#]/.test(tenant)) {
-      throw new MultiEmailError("Invalid Microsoft tenant value in config.", "INVALID_CONFIG");
-    }
+    const clientId = normalizeMicrosoftClientId(provider.clientId, {
+      code: "INVALID_CONFIG",
+    });
+    const tenant = normalizeMicrosoftTenant(provider.tenant || "organizations", {
+      code: "INVALID_CONFIG",
+    });
     return {
-      clientId: provider.clientId,
+      clientId,
       tenant,
       authority: `https://login.microsoftonline.com/${encodeURIComponent(tenant)}`,
     };
@@ -648,7 +671,7 @@ export class MicrosoftProvider {
 
     if (!accounts.length) {
       throw new MultiEmailError(
-        `Account '${account.alias}' is not authorized. Run setup auth ${account.alias}.`,
+        `Account '${account.alias}' is not authorized. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "NOT_AUTHENTICATED",
       );
     }
@@ -672,7 +695,7 @@ export class MicrosoftProvider {
       });
     } catch (error) {
       throw new MultiEmailError(
-        `Microsoft authorization for '${account.alias}' must be refreshed. Run setup auth ${account.alias}.`,
+        `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "REAUTHENTICATION_REQUIRED",
         { providerCode: error?.errorCode || error?.code || null },
       );
@@ -851,7 +874,7 @@ export class MicrosoftProvider {
       provider_grant_revoked: false,
       manual_action_required: true,
       instruction:
-        "Microsoft does not expose a safe per-app delegated-token revocation through this client. Remove Multi Email access in Microsoft My Apps, then run setup logout for this alias.",
+        "Microsoft does not expose a safe per-app delegated-token revocation through this client. Remove Multi Email access in Microsoft My Apps, then run 'multi-email logout <alias> --confirm' (or the same node ./scripts/multi-email command from a Git clone).",
     };
   }
 

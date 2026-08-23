@@ -4,7 +4,7 @@ Multi Email is an open-source Codex plugin and MCP server for independently auth
 
 It supports searching, reading, drafting, archiving, read-state changes, Gmail labels, Microsoft categories, and sending through a server-enforced localhost review window.
 
-> Release status: `0.1.1` is official only when installed from the annotated `v0.1.1` tag or matching GitHub release under `lanfuli/multi-email`. The `codex-multi-email` npm package is not yet published; verify the repository owner and release tag before installation.
+> Release status: `0.1.2` is official only when installed from the annotated `v0.1.2` tag or matching GitHub release under `lanfuli/multi-email`. The `codex-multi-email` npm package is not yet published; verify the repository owner and release tag before installation.
 
 ## Why this exists
 
@@ -32,7 +32,7 @@ The MCP process and credential store run on the Mac, but the end-to-end workflow
 - Search, write-batch, recipient, and body sizes are bounded.
 - Sending is blocked until the user reviews the complete supported plain-text draft in a `127.0.0.1` window and clicks Approve.
 - A short-lived `approval_request_id` is bound to an effective-send manifest: authenticated principal, mailbox, effective sender identity, draft and thread identity, every recipient, subject, complete body, provider revision, and the verified absence of attachments. Approval expires, is one-use, and is invalidated by any bound change.
-- Version `0.1.1` fails closed before review or send when a provider draft contains HTML, multipart or unknown MIME, inline content, attachments, an unsupported From/Sender/Reply-To identity, or an incomplete provider revision.
+- Version `0.1.2` fails closed before review or send when a provider draft contains HTML, multipart or unknown MIME, inline content, attachments, a malformed mailbox address, an unsupported From/Sender/Reply-To identity, or an incomplete provider revision.
 - The provider send request is built from the approved allowlisted plain-text fields. Gmail supplies that frozen raw message in the draft-send request; Microsoft uses one MIME `sendMail` request instead of sending a mutable provider draft.
 - No MCP tool can approve its own send request.
 - A send is never automatically retried after an ambiguous result because the provider may already have accepted it.
@@ -52,7 +52,7 @@ These controls reduce accidental and prompt-injected actions; they do not make O
 | Labels/categories | List and modify label IDs | Modify an exact known category name |
 | Human-reviewed frozen send | Local full-review window | Local full-review window; source draft is retained |
 
-The plugin does not intentionally call provider attachment-content endpoints, expose attachment contents through MCP, permanently delete mail, operate calendars, expose arbitrary provider APIs, or automatically enable send-as aliases, delegated identities, or shared mailboxes. Gmail `format=full` responses can still deliver small inline MIME-part bytes to the local process; they are not returned by the tool. Message reads expose attachment names only. Drafts created by the plugin are plain text. Provider drafts containing HTML, inline content, attachments, or unsupported identities cannot pass the send-review gate in version `0.1.1`.
+The plugin does not intentionally call provider attachment-content endpoints, expose attachment contents through MCP, permanently delete mail, operate calendars, expose arbitrary provider APIs, or automatically enable send-as aliases, delegated identities, or shared mailboxes. Gmail `format=full` responses can still deliver small inline MIME-part bytes to the local process; they are not returned by the tool. Message reads expose attachment names only. Drafts created by the plugin are plain text. Provider drafts containing HTML, inline content, attachments, malformed mailbox addresses, or unsupported identities cannot pass the send-review gate in version `0.1.2`.
 
 Search queries are provider-native: Gmail search syntax for Google and Microsoft Graph mail search syntax for Microsoft 365.
 
@@ -73,8 +73,9 @@ The committed `dist/` bundle contains its JavaScript dependencies and both macOS
 The most transparent install is a local clone:
 
 ```bash
-git clone --branch v0.1.1 --depth 1 https://github.com/lanfuli/multi-email.git
+git clone https://github.com/lanfuli/multi-email.git
 cd multi-email
+git checkout --detach v0.1.2
 node ./scripts/multi-email --help
 codex plugin marketplace add "$(pwd)"
 codex plugin add multi-email@multi-email
@@ -85,11 +86,13 @@ Start a new Codex task after installation so the skill and MCP tools are discove
 Codex also accepts a Git marketplace source once the repository exists:
 
 ```bash
-codex plugin marketplace add lanfuli/multi-email
+codex plugin marketplace add lanfuli/multi-email --ref v0.1.2
 codex plugin add multi-email@multi-email
 ```
 
-The repo marketplace entry uses the documented repo-root local source (`"./"`). The current documented Codex marketplace schema also has URL, git-subdir, and npm source forms; this repo does not use an npm source because no npm publication has occurred.
+The explicit `--ref` keeps the installed snapshot on the reviewed release instead of the moving default branch. The repo marketplace entry uses the documented repo-root local source (`"./"`). The current documented Codex marketplace schema also has URL, git-subdir, and npm source forms; this repo does not use an npm source because no npm publication has occurred.
+
+The setup examples below run from the matching local clone. A future npm installation can use the equivalent `multi-email ...` binary directly; do not run `npm run setup` from a consuming project.
 
 ## Configure OAuth
 
@@ -99,9 +102,26 @@ The default config path is:
 ~/.config/codex-multi-email/config.json
 ```
 
-Set `CODEX_MULTI_EMAIL_CONFIG` to use another absolute path. The setup CLI writes the config directory with mode `0700` and the file with mode `0600`.
+Set `CODEX_MULTI_EMAIL_CONFIG` to use another absolute path. The setup CLI creates a missing config directory with mode `0700`, leaves an existing parent directory's permissions unchanged, writes the config file with mode `0600`, and refuses a config target that is a symlink or non-regular file.
 
-Initialize with a Google Desktop OAuth client. Microsoft settings are optional at this stage:
+Initialize either provider independently, or supply both provider settings in one command.
+
+Google only:
+
+```bash
+node ./scripts/multi-email init \
+  --google-client-json /absolute/path/to/desktop-oauth.json
+```
+
+Microsoft only:
+
+```bash
+node ./scripts/multi-email init \
+  --microsoft-client-id <entra-application-client-id> \
+  --microsoft-tenant organizations
+```
+
+Both providers:
 
 ```bash
 node ./scripts/multi-email init \
@@ -110,7 +130,7 @@ node ./scripts/multi-email init \
   --microsoft-tenant organizations
 ```
 
-If Microsoft was omitted during initialization:
+To add or replace Microsoft settings later:
 
 ```bash
 node ./scripts/multi-email set-microsoft-client <entra-application-client-id> \
@@ -167,14 +187,17 @@ Do not paste the local review URL, cookies, nonces, fingerprints, OAuth values, 
 For a local clone marketplace:
 
 ```bash
-git pull --ff-only
+git fetch origin --tags
+git checkout --detach v0.1.2
 codex plugin add multi-email@multi-email
 ```
 
-For a configured Git marketplace:
+Replace `v0.1.2` only with a newer annotated release tag that you have reviewed. A Git marketplace installed with `--ref` stays pinned, so move it to a new release explicitly:
 
 ```bash
-codex plugin marketplace upgrade multi-email
+codex plugin remove multi-email@multi-email
+codex plugin marketplace remove multi-email
+codex plugin marketplace add lanfuli/multi-email --ref v0.1.2
 codex plugin add multi-email@multi-email
 ```
 

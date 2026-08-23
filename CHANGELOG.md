@@ -2,6 +2,25 @@
 
 All notable changes to Multi Email are documented here. The project follows semantic versioning after its first public release.
 
+## [0.1.2] - 2026-08-22
+
+Installation, onboarding, and local hardening release. The npm package remains unpublished in this release.
+
+### Fixed
+
+- Added first-class Microsoft-only initialization, strict Microsoft application-ID and tenant validation, a narrow repair path for invalid values accepted by v0.1.1, provider-readiness checks before adding an account, truthful preserved-provider status, and CLI version output.
+- Replaced package-consumer-incompatible `npm run setup` guidance with the installed `multi-email` command and the matching Git-clone fallback.
+- Pinned Git marketplace instructions to the annotated release tag and replaced the ineffective shallow-tag `git pull` upgrade path with explicit tag fetch and checkout instructions.
+- Included the contributing guide and code of conduct in the npm tarball so README links remain valid for package consumers.
+
+### Security
+
+- Hardened config persistence with exclusive randomized temporary files, no-follow semantics, fsync before atomic replacement, symlink and non-regular target rejection, and preservation of permissions on existing parent directories.
+- Removed absolute config paths from invalid-JSON errors and unified packaged CLI error redaction so unknown provider or parser exceptions cannot expose request context.
+- Canonicalized mailbox addresses with strict single-mailbox validation and fail-closed provider-draft parsing to reject control characters, group syntax, and semantic address ambiguity.
+- Bounded approval-request and browser-session retention, swept expired state, and immediately discarded requests when the local approval UI cannot open.
+- Used the absolute macOS `/usr/bin/open` path for the local approval window.
+
 ## [0.1.1] - 2026-08-22
 
 Security hardening release. The npm package remains unpublished in this release.
