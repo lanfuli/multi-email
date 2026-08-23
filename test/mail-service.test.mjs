@@ -57,6 +57,7 @@ function harness({
     sentManifest: undefined,
   };
   let currentDraft = structuredClone(initialDraft);
+  let currentReviewError = null;
   const provider = {
     async isAuthenticated() {
       return true;
@@ -98,6 +99,7 @@ function harness({
     },
     async reviewDraft() {
       calls.reviewDraft += 1;
+      if (currentReviewError) throw currentReviewError;
       return structuredClone(currentDraft);
     },
     async sendDraft(_account, _draftId, expectedManifest) {
@@ -132,6 +134,9 @@ function harness({
     service,
     changeDraft(patch) {
       currentDraft = { ...currentDraft, ...patch };
+    },
+    failReview(error) {
+      currentReviewError = error;
     },
     approve(prepared) {
       const pending = approvalStore.getPendingReview(prepared.approvalRequestId);
@@ -188,6 +193,22 @@ test("connection diagnostics are read-only and remain labeled by account alias",
   assert.equal(calls.diagnose, 1);
   assert.equal(calls.createDraft, 0);
   assert.equal(calls.sendDraft, 0);
+});
+
+test("connection diagnostics canonicalize provider-controlled error codes", async () => {
+  const { provider, service } = harness();
+  provider.diagnose = async (account) => ({
+    alias: account.alias,
+    provider: account.provider,
+    credential_present: true,
+    status: "provider_unavailable",
+    error_code: "PROVIDER_CODE\n/Users/private/oauth-token-must-not-leak",
+  });
+
+  const [diagnostic] = await service.diagnoseAccounts("work");
+
+  assert.equal(diagnostic.error_code, "GOOGLE_PROFILE_FAILED");
+  assert.doesNotMatch(JSON.stringify(diagnostic), /private|oauth-token|PROVIDER_CODE/u);
 });
 
 test("write batch and total recipient limits stop calls before the provider", async () => {
@@ -375,6 +396,33 @@ test("a provider draft message identity change invalidates human approval", asyn
   assert.equal(calls.sendDraft, 0);
 });
 
+test("known transport failures during the approved recheck prove that nothing was sent", async () => {
+  for (const code of [
+    "OPERATION_DEADLINE_EXCEEDED",
+    "GOOGLE_REQUEST_TIMEOUT",
+    "MICROSOFT_REQUEST_ABORTED",
+    "ENOTFOUND",
+  ]) {
+    const { approve, calls, failReview, service } = harness();
+    const prepared = await service.reviewDraft("work", "draft-1");
+    approve(prepared);
+    failReview(Object.assign(new Error("sensitive provider error"), { code }));
+
+    await assert.rejects(
+      service.sendDraft("work", "draft-1", prepared.approvalRequestId),
+      {
+        code: "SEND_VERIFICATION_FAILED",
+        message: "The approved draft could not be rechecked before sending. Nothing was sent.",
+      },
+    );
+    assert.equal(calls.sendDraft, 0);
+    await assert.rejects(
+      service.sendDraft("work", "draft-1", prepared.approvalRequestId),
+      { code: "SEND_APPROVAL_REQUIRED" },
+    );
+  }
+});
+
 test("identity, HTML, attachment, and revision changes are rejected before send", async () => {
   const changes = [
     { sender: "owner@example.com", code: "DRAFT_CHANGED" },
@@ -466,6 +514,33 @@ test("provider send failure becomes unknown status and is never retried", async 
     { code: "SEND_APPROVAL_REQUIRED" },
   );
   assert.equal(calls.sendDraft, 1);
+});
+
+test("unknown send logging canonicalizes provider-controlled error codes", async (context) => {
+  const logs = [];
+  context.mock.method(console, "error", (...values) => logs.push(values.join(" ")));
+  const sensitiveDraftId = "draft-1\n/Users/private/draft-token-must-not-leak";
+  const sendError = Object.assign(new Error("must-not-leak"), {
+    code: "PROVIDER_CODE\n/Users/private/oauth-token-must-not-leak",
+  });
+  const { approve, service } = harness({
+    initialDraft: draft({ draftId: sensitiveDraftId }),
+    sendError,
+  });
+  const prepared = await service.reviewDraft("work", sensitiveDraftId);
+  approve(prepared);
+
+  await assert.rejects(
+    service.sendDraft("work", sensitiveDraftId, prepared.approvalRequestId),
+    { code: "SEND_STATUS_UNKNOWN" },
+  );
+
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /PROVIDER_ERROR/u);
+  assert.doesNotMatch(
+    logs[0],
+    /private|oauth-token|draft-token|PROVIDER_CODE|must-not-leak/u,
+  );
 });
 
 test("provider final revision mismatch remains DRAFT_CHANGED", async () => {

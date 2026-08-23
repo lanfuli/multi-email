@@ -39660,7 +39660,7 @@ function findAccount(config, alias) {
 /* harmony export */ });
 /* unused harmony export MICROSOFT_SCOPES */
 const APP_NAME = "codex-multi-email";
-const APP_VERSION = "0.1.2";
+const APP_VERSION = "0.1.3";
 const CONFIG_VERSION = 2;
 const KEYCHAIN_SERVICE = "io.github.lanfuli.multi-email";
 const LEGACY_KEYCHAIN_SERVICE = "com.openai.codex.multi-email";
@@ -40122,6 +40122,125 @@ function splitAddressHeader(value = "") {
       code: "INVALID_MESSAGE",
     });
   });
+}
+
+
+/***/ }),
+
+/***/ 6378:
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+"use strict";
+
+// EXPORTS
+__nccwpck_require__.d(__webpack_exports__, {
+  uT: () => (/* binding */ operationRequestBudget),
+  Je: () => (/* binding */ raceWithOperationDeadline),
+  Fe: () => (/* binding */ remainingOperationTimeMs),
+  $S: () => (/* binding */ runWithOperationDeadline)
+});
+
+// UNUSED EXPORTS: MCP_OPERATION_TIMEOUT_MS, operationDeadlineSignal
+
+;// CONCATENATED MODULE: external "node:async_hooks"
+const external_node_async_hooks_namespaceObject = require("node:async_hooks");
+// EXTERNAL MODULE: ./src/errors.mjs
+var errors = __nccwpck_require__(178);
+;// CONCATENATED MODULE: ./src/operation-deadline.mjs
+
+
+
+const MCP_OPERATION_TIMEOUT_MS = 108_000;
+
+const operationDeadline = new external_node_async_hooks_namespaceObject.AsyncLocalStorage();
+
+function deadlineExceeded() {
+  return new errors/* MultiEmailError */.G(
+    "The MCP operation deadline expired.",
+    "OPERATION_DEADLINE_EXCEEDED",
+  );
+}
+
+async function runWithOperationDeadline(
+  action,
+  { timeoutMs = MCP_OPERATION_TIMEOUT_MS } = {},
+) {
+  if (operationDeadline.getStore()) return action();
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw deadlineExceeded();
+
+  const controller = new AbortController();
+  const context = {
+    deadlineAt: Date.now() + Math.floor(timeoutMs),
+    signal: controller.signal,
+  };
+  const timer = setTimeout(() => controller.abort(deadlineExceeded()), timeoutMs);
+  try {
+    return await operationDeadline.run(context, () =>
+      raceWithOperationDeadline(Promise.resolve().then(action)),
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function raceWithOperationDeadline(promise) {
+  const operation = Promise.resolve(promise);
+  const context = operationDeadline.getStore();
+  if (!context) return operation;
+  if (context.signal.aborted) {
+    // The caller still owns an already-started promise. Observe a later
+    // rejection even though the public result must fail immediately.
+    operation.catch(() => {});
+    return Promise.reject(deadlineExceeded());
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      context.signal.removeEventListener("abort", onAbort);
+      reject(deadlineExceeded());
+    };
+    context.signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        context.signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        context.signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function operationDeadlineSignal() {
+  return operationDeadline.getStore()?.signal;
+}
+
+function remainingOperationTimeMs({ fallbackMs, reserveMs = 0 }) {
+  if (!Number.isFinite(fallbackMs) || fallbackMs <= 0) {
+    throw new TypeError("fallbackMs must be a positive finite number.");
+  }
+  if (!Number.isFinite(reserveMs) || reserveMs < 0) {
+    throw new TypeError("reserveMs must be a non-negative finite number.");
+  }
+
+  const context = operationDeadline.getStore();
+  if (!context) return Math.floor(fallbackMs);
+  if (context.signal.aborted) throw deadlineExceeded();
+
+  const remainingMs = Math.floor(context.deadlineAt - Date.now() - reserveMs);
+  if (remainingMs <= 0) throw deadlineExceeded();
+  return Math.min(Math.floor(fallbackMs), remainingMs);
+}
+
+function operationRequestBudget({ fallbackMs, reserveMs = 250 }) {
+  const timeout = remainingOperationTimeMs({ fallbackMs, reserveMs });
+  const signal = operationDeadlineSignal();
+  return {
+    timeout,
+    ...(signal ? { signal } : {}),
+  };
 }
 
 
@@ -45019,11 +45138,14 @@ var constants = __nccwpck_require__(1102);
 var errors = __nccwpck_require__(178);
 // EXTERNAL MODULE: ./src/keychain.mjs
 var keychain = __nccwpck_require__(9055);
+// EXTERNAL MODULE: ./src/operation-deadline.mjs + 1 modules
+var operation_deadline = __nccwpck_require__(6378);
 // EXTERNAL MODULE: ./src/mime.mjs
 var mime = __nccwpck_require__(7123);
 // EXTERNAL MODULE: ./src/send-approval.mjs
 var send_approval = __nccwpck_require__(2443);
 ;// CONCATENATED MODULE: ./src/providers/gmail.mjs
+
 
 
 
@@ -45052,6 +45174,30 @@ const MAX_REVIEW_RAW_BYTES = 2 * 1024 * 1024;
 const MAX_SUBJECT_BYTES = 998;
 const MAX_IN_REPLY_TO_BYTES = 900;
 const MAX_REFERENCES_BYTES = 8192;
+const GOOGLE_REQUEST_TIMEOUT_MS = 90_000;
+const GOOGLE_RESPONSE_LIMIT_BYTES = 4 * 1024 * 1024;
+const GOOGLE_TIMEOUT_CODES = new Set([
+  "ABORT_ERR",
+  "AbortError",
+  "OPERATION_DEADLINE_EXCEEDED",
+  "TimeoutError",
+  "ETIMEDOUT",
+  "ESOCKETTIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+const GOOGLE_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "EAI_AGAIN",
+]);
+const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
 const UNSUPPORTED_MATERIAL_HEADERS = new Set([
   "apparently-to",
   "bounces-to",
@@ -45067,6 +45213,11 @@ const UNSUPPORTED_MATERIAL_HEADERS = new Set([
 
 function draftNotReviewable(message) {
   return new errors/* MultiEmailError */.G(message, "DRAFT_NOT_REVIEWABLE");
+}
+
+function safeDiagnosticErrorCode(value, fallback) {
+  const code = typeof value === "string" ? value.trim() : "";
+  return DIAGNOSTIC_ERROR_CODE.test(code) ? code : fallback;
 }
 
 function headerValues(headers, name) {
@@ -45579,6 +45730,209 @@ function compactBody(body, limit = 80_000) {
   return { body: `${body.slice(0, limit)}\n\n[truncated]`, truncated: true };
 }
 
+function isGoogleRequestTimeout(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    if (
+      GOOGLE_TIMEOUT_CODES.has(String(current.code || "")) ||
+      GOOGLE_TIMEOUT_CODES.has(String(current.name || ""))
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+function isGoogleNetworkError(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    if (GOOGLE_NETWORK_CODES.has(String(current.code || ""))) return true;
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+function isGoogleRedirectError(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const type = String(current.type || "");
+    const message = String(current.message || "");
+    if (
+      type === "no-redirect" ||
+      type === "max-redirect" ||
+      /redirect mode is set to error|maximum redirect reached/iu.test(message)
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+function isGoogleResponseTooLarge(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const message = String(current.message || "");
+    if (
+      current.type === "max-size" ||
+      message === "Response's `Content-Length` is over the limit." ||
+      /^content size at .* over limit: \d+$/u.test(message)
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+async function abandonGoogleResponse(error) {
+  const body = error?.response?.body;
+  try {
+    if (typeof body?.cancel === "function") {
+      await body.cancel();
+    } else if (typeof body?.destroy === "function") {
+      body.destroy();
+    }
+  } catch {
+    // Best-effort transport cleanup must not replace the safe public error.
+  }
+}
+
+function googleRequestTimeout() {
+  return new errors/* MultiEmailError */.G(
+    "The Google request timed out before completing.",
+    "GOOGLE_REQUEST_TIMEOUT",
+  );
+}
+
+function googleNetworkError() {
+  return new errors/* MultiEmailError */.G(
+    "The Google request could not reach the provider.",
+    "GOOGLE_NETWORK_ERROR",
+  );
+}
+
+function googleResponseTooLarge() {
+  return new errors/* MultiEmailError */.G(
+    "The Google response exceeded the safe transport limit.",
+    "GOOGLE_RESPONSE_TOO_LARGE",
+  );
+}
+
+function googleNoRetryOptions() {
+  return {
+    retry: false,
+    retryConfig: { retry: 0 },
+    // A 307/308 redirect can replay a POST body even when gaxios retries are
+    // disabled. Provider endpoints are fixed, so fail closed on every redirect.
+    maxRedirects: 0,
+    // gaxios does not map maxRedirects from transporter defaults to node-fetch's
+    // `follow` field, so set both native fetch controls explicitly as well.
+    follow: 0,
+    redirect: "error",
+  };
+}
+
+function googleResponseLimitOptions() {
+  return {
+    maxContentLength: GOOGLE_RESPONSE_LIMIT_BYTES,
+    // gaxios only derives node-fetch's streaming `size` from per-call input,
+    // so keep it explicit for OAuth requests that originate inside the library.
+    size: GOOGLE_RESPONSE_LIMIT_BYTES,
+  };
+}
+
+function googleRequestOptions() {
+  const budget = (0,operation_deadline/* operationRequestBudget */.uT)({ fallbackMs: GOOGLE_REQUEST_TIMEOUT_MS });
+  const requestSignal = AbortSignal.timeout(budget.timeout);
+  return {
+    ...budget,
+    // gaxios prepares its timeout signal before request interceptors run. The
+    // interceptor therefore has to preserve both the shared operation signal
+    // and a fresh provider-request timeout when it replaces the options.
+    signal: budget.signal
+      ? AbortSignal.any([budget.signal, requestSignal])
+      : requestSignal,
+    ...googleResponseLimitOptions(),
+    ...googleNoRetryOptions(),
+  };
+}
+
+function hasUsableTokenExpiry(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+async function prepareGoogleApiCredentials(oauth) {
+  const credentials = oauth.credentials || {};
+  if (credentials.refresh_token && !hasUsableTokenExpiry(credentials.expiry_date)) {
+    await oauth.refreshAccessToken();
+  } else {
+    await oauth.getAccessToken();
+  }
+
+  const prepared = oauth.credentials || {};
+  if (
+    !prepared.access_token ||
+    (prepared.refresh_token && !hasUsableTokenExpiry(prepared.expiry_date))
+  ) {
+    throw new errors/* MultiEmailError */.G(
+      "The Google credential could not be normalized safely. Reauthorize this account.",
+      "INVALID_CREDENTIAL",
+    );
+  }
+  return prepared;
+}
+
+function gmailSendVerificationFailed() {
+  return new errors/* MultiEmailError */.G(
+    "The Gmail draft could not be verified before sending. Nothing was sent.",
+    "SEND_VERIFICATION_FAILED",
+  );
+}
+
+function createGoogleOAuthClient(provider, redirectUri) {
+  const oauth = new build/* auth */.j2.OAuth2({
+    clientId: provider.clientId,
+    clientSecret: provider.clientSecret,
+    ...(redirectUri ? { redirectUri } : {}),
+    forceRefreshOnFailure: false,
+    // google-auth-library applies these public transporter defaults to token
+    // exchange, refresh, token-info, and revocation requests.
+    transporterOptions: {
+      timeout: GOOGLE_REQUEST_TIMEOUT_MS,
+      ...googleResponseLimitOptions(),
+      ...googleNoRetryOptions(),
+    },
+  });
+  oauth.transporter.interceptors.request.add({
+    resolved: (options) => ({ ...options, ...googleRequestOptions() }),
+    rejected: (error) => Promise.reject(error),
+  });
+  oauth.transporter.interceptors.response.add({
+    resolved: (response) => response,
+    rejected: async (error) => {
+      if (isGoogleRequestTimeout(error)) throw googleRequestTimeout();
+      if (isGoogleResponseTooLarge(error)) {
+        await abandonGoogleResponse(error);
+        throw googleResponseTooLarge();
+      }
+      if (isGoogleRedirectError(error)) throw googleNetworkError();
+      if (isGoogleNetworkError(error)) throw googleNetworkError();
+      throw error;
+    },
+  });
+  return oauth;
+}
+
 class GmailProvider {
   constructor({ config, credentialStore, browserOpener = openBrowser }) {
     this.config = config;
@@ -45663,7 +46017,7 @@ class GmailProvider {
     try {
       const port = await listen(server);
       const redirectUri = `http://127.0.0.1:${port}/oauth/google/callback`;
-      const oauth = new build/* auth */.j2.OAuth2(provider.clientId, provider.clientSecret, redirectUri);
+      const oauth = createGoogleOAuthClient(provider, redirectUri);
       const authorizationUrl = oauth.generateAuthUrl({
         access_type: "offline",
         prompt: "consent",
@@ -45692,7 +46046,8 @@ class GmailProvider {
           );
         }),
       ]);
-      const { tokens } = await oauth.getToken(code);
+      const exchange = await oauth.getToken(code);
+      let tokens = exchange.tokens;
       if (!tokens.refresh_token) {
         throw new errors/* MultiEmailError */.G(
           "Google did not return a refresh token. Revoke the app grant and authorize again.",
@@ -45700,8 +46055,14 @@ class GmailProvider {
         );
       }
       oauth.setCredentials(tokens);
+      const preparedTokens = await prepareGoogleApiCredentials(oauth);
+      tokens = { ...tokens, ...preparedTokens };
+      oauth.setCredentials(tokens);
       const gmail = (0,build/* gmail */.tc)({ version: "v1", auth: oauth });
-      const profile = await gmail.users.getProfile({ userId: "me" });
+      const profile = await gmail.users.getProfile(
+        { userId: "me" },
+        googleRequestOptions(),
+      );
       const actualEmail = assertProfileMatches(account, profile);
       if (tokens.scope && !hasRequiredScopes(tokens.scope)) {
         throw new errors/* MultiEmailError */.G(
@@ -45728,7 +46089,7 @@ class GmailProvider {
       );
     }
     let tokens = parseToken(record.raw, account.alias);
-    const oauth = new build/* auth */.j2.OAuth2(provider.clientId, provider.clientSecret);
+    const oauth = createGoogleOAuthClient(provider);
     oauth.setCredentials(tokens);
     oauth.on("tokens", (updates) => {
       tokens = { ...tokens, ...updates };
@@ -45752,9 +46113,13 @@ class GmailProvider {
 
   async client(account) {
     const session = await this.oauthSession(account);
+    await prepareGoogleApiCredentials(session.oauth);
     const gmail = (0,build/* gmail */.tc)({ version: "v1", auth: session.oauth });
     if (!this.verifiedAliases.has(account.alias) || session.record.source === "legacy") {
-      const response = await gmail.users.getProfile({ userId: "me" });
+      const response = await gmail.users.getProfile(
+        { userId: "me" },
+        googleRequestOptions(),
+      );
       assertProfileMatches(account, response);
       if (session.record.source === "legacy") {
         // Copy, but do not delete, the old entry. The old namespace is shared by
@@ -45771,7 +46136,10 @@ class GmailProvider {
 
   async profile(account) {
     const gmail = await this.client(account);
-    const response = await gmail.users.getProfile({ userId: "me" });
+    const response = await gmail.users.getProfile(
+      { userId: "me" },
+      googleRequestOptions(),
+    );
     const email = assertProfileMatches(account, response);
     return {
       email,
@@ -45809,7 +46177,7 @@ class GmailProvider {
       } catch (error) {
         diagnostic.token_valid = false;
         diagnostic.status = "invalid_credential";
-        diagnostic.error_code = error?.code || "INVALID_CREDENTIAL";
+        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "INVALID_CREDENTIAL");
         return diagnostic;
       }
 
@@ -45821,7 +46189,12 @@ class GmailProvider {
         if (!accessToken) throw new Error("missing access token");
         tokenInfo = await session.oauth.getTokenInfo(accessToken);
         diagnostic.token_valid = true;
-      } catch {
+      } catch (error) {
+        if (error?.code === "GOOGLE_REQUEST_TIMEOUT") {
+          diagnostic.status = "provider_unavailable";
+          diagnostic.error_code = "GOOGLE_REQUEST_TIMEOUT";
+          return diagnostic;
+        }
         diagnostic.token_valid = false;
         diagnostic.status = "reauthorization_required";
         diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
@@ -45837,7 +46210,10 @@ class GmailProvider {
 
       try {
         const gmail = (0,build/* gmail */.tc)({ version: "v1", auth: session.oauth });
-        const profile = await gmail.users.getProfile({ userId: "me" });
+        const profile = await gmail.users.getProfile(
+          { userId: "me" },
+          googleRequestOptions(),
+        );
         assertProfileMatches(account, profile);
         diagnostic.identity_verified = true;
         diagnostic.status = "ok";
@@ -45845,12 +46221,15 @@ class GmailProvider {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
         diagnostic.status =
           diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = error?.code || "GOOGLE_PROFILE_FAILED";
+        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "GOOGLE_PROFILE_FAILED");
       }
       return diagnostic;
     } catch (error) {
       diagnostic.status = "configuration_error";
-      diagnostic.error_code = error?.code || "GOOGLE_CLIENT_NOT_CONFIGURED";
+      diagnostic.error_code = safeDiagnosticErrorCode(
+        error?.code,
+        "GOOGLE_CLIENT_NOT_CONFIGURED",
+      );
       return diagnostic;
     }
   }
@@ -45868,10 +46247,16 @@ class GmailProvider {
         try {
           const provider = this.providerConfig();
           const tokens = parseToken(legacy, account.alias);
-          const oauth = new build/* auth */.j2.OAuth2(provider.clientId, provider.clientSecret);
+          const oauth = createGoogleOAuthClient(provider);
           oauth.setCredentials(tokens);
           const gmail = (0,build/* gmail */.tc)({ version: "v1", auth: oauth });
-          assertProfileMatches(account, await gmail.users.getProfile({ userId: "me" }));
+          assertProfileMatches(
+            account,
+            await gmail.users.getProfile(
+              { userId: "me" },
+              googleRequestOptions(),
+            ),
+          );
           legacyRemoved = await this.credentialStore.deleteLegacy(legacyKey);
         } catch {
           // Never delete a shared legacy entry unless its provider identity was proven.
@@ -45893,7 +46278,13 @@ class GmailProvider {
   async revoke(account) {
     const session = await this.oauthSession(account, { persistUpdates: false });
     const gmail = (0,build/* gmail */.tc)({ version: "v1", auth: session.oauth });
-    assertProfileMatches(account, await gmail.users.getProfile({ userId: "me" }));
+    assertProfileMatches(
+      account,
+      await gmail.users.getProfile(
+        { userId: "me" },
+        googleRequestOptions(),
+      ),
+    );
     let verifiedLegacyKey = session.record.source === "legacy" ? session.record.legacyKey : null;
     if (!verifiedLegacyKey && typeof this.credentialStore.getLegacy === "function") {
       const candidateKey = legacyCredentialKey(account);
@@ -45901,10 +46292,16 @@ class GmailProvider {
       if (raw !== null) {
         try {
           const provider = this.providerConfig();
-          const legacyOauth = new build/* auth */.j2.OAuth2(provider.clientId, provider.clientSecret);
+          const legacyOauth = createGoogleOAuthClient(provider);
           legacyOauth.setCredentials(parseToken(raw, account.alias));
           const legacyGmail = (0,build/* gmail */.tc)({ version: "v1", auth: legacyOauth });
-          assertProfileMatches(account, await legacyGmail.users.getProfile({ userId: "me" }));
+          assertProfileMatches(
+            account,
+            await legacyGmail.users.getProfile(
+              { userId: "me" },
+              googleRequestOptions(),
+            ),
+          );
           verifiedLegacyKey = candidateKey;
         } catch {
           // A shared legacy entry is left untouched unless independently verified.
@@ -45943,20 +46340,26 @@ class GmailProvider {
 
   async search(account, { query, maxResults, pageToken }) {
     const gmail = await this.client(account);
-    const list = await gmail.users.messages.list({
-      userId: "me",
-      q: query,
-      maxResults,
-      pageToken: pageToken || undefined,
-    });
+    const list = await gmail.users.messages.list(
+      {
+        userId: "me",
+        q: query,
+        maxResults,
+        pageToken: pageToken || undefined,
+      },
+      googleRequestOptions(),
+    );
     const summaries = await Promise.all(
       (list.data.messages || []).map(async ({ id }) => {
-        const response = await gmail.users.messages.get({
-          userId: "me",
-          id,
-          format: "metadata",
-          metadataHeaders: PROFILE_HEADERS,
-        });
+        const response = await gmail.users.messages.get(
+          {
+            userId: "me",
+            id,
+            format: "metadata",
+            metadataHeaders: PROFILE_HEADERS,
+          },
+          googleRequestOptions(),
+        );
         const headers = (0,mime/* headersToObject */.fC)(response.data.payload?.headers);
         return {
           id: response.data.id,
@@ -45980,11 +46383,14 @@ class GmailProvider {
 
   async getMessage(account, messageId) {
     const gmail = await this.client(account);
-    const response = await gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "full",
-    });
+    const response = await gmail.users.messages.get(
+      {
+        userId: "me",
+        id: messageId,
+        format: "full",
+      },
+      googleRequestOptions(),
+    );
     const headers = (0,mime/* headersToObject */.fC)(response.data.payload?.headers);
     const extracted = (0,mime/* extractGmailBody */.eA)(response.data.payload);
     const preferredBody = extracted.body || extracted.htmlBody;
@@ -46017,12 +46423,15 @@ class GmailProvider {
     let to = input.to || [];
 
     if (input.replyToMessageId) {
-      const original = await gmail.users.messages.get({
-        userId: "me",
-        id: input.replyToMessageId,
-        format: "metadata",
-        metadataHeaders: PROFILE_HEADERS,
-      });
+      const original = await gmail.users.messages.get(
+        {
+          userId: "me",
+          id: input.replyToMessageId,
+          format: "metadata",
+          metadataHeaders: PROFILE_HEADERS,
+        },
+        googleRequestOptions(),
+      );
       const headers = (0,mime/* headersToObject */.fC)(original.data.payload?.headers);
       threadId = original.data.threadId;
       inReplyTo = headers["message-id"] || undefined;
@@ -46044,10 +46453,13 @@ class GmailProvider {
       inReplyTo,
       references,
     });
-    const response = await gmail.users.drafts.create({
-      userId: "me",
-      requestBody: { message: { raw, threadId } },
-    });
+    const response = await gmail.users.drafts.create(
+      {
+        userId: "me",
+        requestBody: { message: { raw, threadId } },
+      },
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       provider: "google",
@@ -46071,11 +46483,14 @@ class GmailProvider {
 
   async updateDraft(account, draftId, input) {
     const gmail = await this.client(account);
-    const current = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "full",
-    });
+    const current = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "full",
+      },
+      googleRequestOptions(),
+    );
     const message = current.data.message || {};
     const headers = (0,mime/* headersToObject */.fC)(message.payload?.headers);
     const extracted = (0,mime/* extractGmailBody */.eA)(message.payload);
@@ -46089,14 +46504,17 @@ class GmailProvider {
       inReplyTo: headers["in-reply-to"] || undefined,
       references: headers.references || undefined,
     });
-    const response = await gmail.users.drafts.update({
-      userId: "me",
-      id: draftId,
-      requestBody: {
+    const response = await gmail.users.drafts.update(
+      {
+        userId: "me",
         id: draftId,
-        message: { raw, threadId: message.threadId },
+        requestBody: {
+          id: draftId,
+          message: { raw, threadId: message.threadId },
+        },
       },
-    });
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       provider: "google",
@@ -46109,21 +46527,30 @@ class GmailProvider {
 
   async reviewDraft(account, draftId) {
     const gmail = await this.client(account);
-    const rawBeforeResponse = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "raw",
-    });
-    const fullResponse = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "full",
-    });
-    const rawAfterResponse = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "raw",
-    });
+    const rawBeforeResponse = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "raw",
+      },
+      googleRequestOptions(),
+    );
+    const fullResponse = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "full",
+      },
+      googleRequestOptions(),
+    );
+    const rawAfterResponse = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "raw",
+      },
+      googleRequestOptions(),
+    );
     const revisionBefore = rawDraftRevision(rawBeforeResponse, draftId);
     const revisionAfter = rawDraftRevision(rawAfterResponse, draftId);
     assertSameRawRevision(revisionBefore, revisionAfter);
@@ -46212,16 +46639,33 @@ class GmailProvider {
       throw draftChanged("The approved Gmail send manifest could not be reconstructed safely.");
     }
 
-    const gmail = await this.client(account);
+    let gmail;
+    try {
+      gmail = await this.client(account);
+    } catch {
+      throw gmailSendVerificationFailed();
+    }
     let currentRevision;
     try {
-      const rawResponse = await gmail.users.drafts.get({
-        userId: "me",
-        id: draftId,
-        format: "raw",
-      });
+      const rawResponse = await gmail.users.drafts.get(
+        {
+          userId: "me",
+          id: draftId,
+          format: "raw",
+        },
+        googleRequestOptions(),
+      );
       currentRevision = rawDraftRevision(rawResponse, draftId);
-    } catch {
+    } catch (error) {
+      if (
+        error?.code === "GOOGLE_REQUEST_TIMEOUT" ||
+        error?.code === "GOOGLE_NETWORK_ERROR" ||
+        error?.code === "OPERATION_DEADLINE_EXCEEDED" ||
+        isGoogleRequestTimeout(error) ||
+        isGoogleNetworkError(error)
+      ) {
+        throw gmailSendVerificationFailed();
+      }
       throw draftChanged(
         "The Gmail draft could not be verified against the reviewed revision. Prepare and review it again before sending.",
       );
@@ -46237,10 +46681,23 @@ class GmailProvider {
     }
     const message = { raw };
     if (approved.threadId) message.threadId = approved.threadId;
-    const response = await gmail.users.drafts.send({
-      userId: "me",
-      requestBody: { id: draftId, message },
-    });
+    let requestOptions;
+    try {
+      requestOptions = googleRequestOptions();
+    } catch (error) {
+      if (error?.code !== "OPERATION_DEADLINE_EXCEEDED") throw error;
+      throw new errors/* MultiEmailError */.G(
+        "The Gmail send deadline expired before the send request started. Nothing was sent.",
+        "SEND_VERIFICATION_FAILED",
+      );
+    }
+    const response = await gmail.users.drafts.send(
+      {
+        userId: "me",
+        requestBody: { id: draftId, message },
+      },
+      requestOptions,
+    );
     return {
       account: account.alias,
       provider: "google",
@@ -46252,29 +46709,38 @@ class GmailProvider {
 
   async archive(account, messageIds) {
     const gmail = await this.client(account);
-    await gmail.users.messages.batchModify({
-      userId: "me",
-      requestBody: { ids: messageIds, removeLabelIds: ["INBOX"] },
-    });
+    await gmail.users.messages.batchModify(
+      {
+        userId: "me",
+        requestBody: { ids: messageIds, removeLabelIds: ["INBOX"] },
+      },
+      googleRequestOptions(),
+    );
     return { account: account.alias, archived: messageIds.length };
   }
 
   async markRead(account, messageIds, isRead) {
     const gmail = await this.client(account);
-    await gmail.users.messages.batchModify({
-      userId: "me",
-      requestBody: {
-        ids: messageIds,
-        addLabelIds: isRead ? [] : ["UNREAD"],
-        removeLabelIds: isRead ? ["UNREAD"] : [],
+    await gmail.users.messages.batchModify(
+      {
+        userId: "me",
+        requestBody: {
+          ids: messageIds,
+          addLabelIds: isRead ? [] : ["UNREAD"],
+          removeLabelIds: isRead ? ["UNREAD"] : [],
+        },
       },
-    });
+      googleRequestOptions(),
+    );
     return { account: account.alias, changed: messageIds.length, isRead };
   }
 
   async listLabels(account) {
     const gmail = await this.client(account);
-    const response = await gmail.users.labels.list({ userId: "me" });
+    const response = await gmail.users.labels.list(
+      { userId: "me" },
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       labels: (response.data.labels || []).map((label) => ({
@@ -46287,10 +46753,13 @@ class GmailProvider {
 
   async modifyLabels(account, messageIds, { addLabelIds = [], removeLabelIds = [] }) {
     const gmail = await this.client(account);
-    await gmail.users.messages.batchModify({
-      userId: "me",
-      requestBody: { ids: messageIds, addLabelIds, removeLabelIds },
-    });
+    await gmail.users.messages.batchModify(
+      {
+        userId: "me",
+        requestBody: { ids: messageIds, addLabelIds, removeLabelIds },
+      },
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       changed: messageIds.length,
@@ -61133,9 +61602,12 @@ var errors = __nccwpck_require__(178);
 var keychain = __nccwpck_require__(9055);
 // EXTERNAL MODULE: ./src/mime.mjs
 var mime = __nccwpck_require__(7123);
+// EXTERNAL MODULE: ./src/operation-deadline.mjs + 1 modules
+var operation_deadline = __nccwpck_require__(6378);
 // EXTERNAL MODULE: ./src/validation.mjs
 var validation = __nccwpck_require__(6918);
 ;// CONCATENATED MODULE: ./src/providers/microsoft.mjs
+
 
 
 
@@ -61150,7 +61622,13 @@ const BODY_LIMIT = 80_000;
 const PAGE_TOKEN_LIMIT = 12_000;
 const RAW_DRAFT_LIMIT = 2 * 1024 * 1024;
 const MIME_HEADER_LIMIT = 128 * 1024;
+const GRAPH_REQUEST_TIMEOUT_MS = 100_000;
+const OPERATION_SETTLE_RESERVE_MS = 250;
+const GRAPH_JSON_BODY_LIMIT = 2 * 1024 * 1024;
 const GRAPH_ERROR_BODY_LIMIT = 64 * 1024;
+const MICROSOFT_IDENTITY_BODY_LIMIT = 2 * 1024 * 1024;
+const MICROSOFT_IDENTITY_ORIGIN = "https://login.microsoftonline.com";
+const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
 
 function credentialKey(config, account) {
   return (0,keychain/* credentialAccountKey */.kq)(config, account, ":msal-cache");
@@ -61506,15 +61984,26 @@ async function readBoundedResponse(
   } = {},
 ) {
   const contentLength = response.headers?.get?.("content-length");
+  const reader = response.body?.getReader?.();
   if (/^\d+$/u.test(String(contentLength || "")) && Number(contentLength) > limit) {
+    if (reader) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The response is already being abandoned because its declared size exceeds the cap.
+      } finally {
+        reader.releaseLock?.();
+      }
+    }
     throw new errors/* MultiEmailError */.G(message, code);
   }
 
-  const reader = response.body?.getReader?.();
+  if (!response.body) return Buffer.alloc(0);
   if (!reader) {
-    const value = Buffer.from(await response.arrayBuffer());
-    if (value.length > limit) throw new errors/* MultiEmailError */.G(message, code);
-    return value;
+    throw new errors/* MultiEmailError */.G(
+      "Microsoft Graph returned an unreadable response stream.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
   }
 
   const chunks = [];
@@ -61539,6 +62028,127 @@ async function readBoundedResponse(
     reader.releaseLock?.();
   }
   return Buffer.concat(chunks, total);
+}
+
+function microsoftIdentityUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new errors/* MultiEmailError */.G(
+      "Microsoft identity returned an invalid endpoint.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
+  }
+  if (
+    url.origin !== MICROSOFT_IDENTITY_ORIGIN ||
+    url.username ||
+    url.password
+  ) {
+    throw new errors/* MultiEmailError */.G(
+      "Refusing to call an unexpected Microsoft identity endpoint.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
+  }
+  return url;
+}
+
+function microsoftIdentityNetworkError() {
+  return new errors/* MultiEmailError */.G(
+    "The Microsoft identity request did not return a response.",
+    "MICROSOFT_NETWORK_ERROR",
+  );
+}
+
+function microsoftIdentityInvalidResponse() {
+  return new errors/* MultiEmailError */.G(
+    "Microsoft identity returned an invalid response.",
+    "INVALID_PROVIDER_RESPONSE",
+  );
+}
+
+class BoundedMicrosoftNetworkClient {
+  constructor({ fetchImpl, timeoutMs }) {
+    this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
+  }
+
+  async sendGetRequestAsync(url, options = {}, timeout = undefined) {
+    const requestedTimeout =
+      Number.isFinite(timeout) && timeout > 0
+        ? Math.min(Math.floor(timeout), this.timeoutMs)
+        : this.timeoutMs;
+    return this.request(url, "GET", options, requestedTimeout);
+  }
+
+  async sendPostRequestAsync(url, options = {}) {
+    return this.request(url, "POST", options, this.timeoutMs);
+  }
+
+  async request(urlValue, method, options, timeoutMs) {
+    const url = microsoftIdentityUrl(urlValue);
+    const requestBudget = (0,operation_deadline/* operationRequestBudget */.uT)({ fallbackMs: timeoutMs });
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => timeoutController.abort(), requestBudget.timeout);
+    timer.unref?.();
+    const signal = requestBudget.signal
+      ? AbortSignal.any([requestBudget.signal, timeoutController.signal])
+      : timeoutController.signal;
+
+    try {
+      let headers;
+      try {
+        headers = new Headers(options?.headers || {});
+      } catch {
+        throw microsoftIdentityInvalidResponse();
+      }
+      const response = await this.fetchImpl(url, {
+        method,
+        headers,
+        ...(method === "POST" ? { body: options?.body || "" } : {}),
+        redirect: "error",
+        signal,
+      });
+      const responseBytes = await readBoundedResponse(
+        response,
+        MICROSOFT_IDENTITY_BODY_LIMIT,
+        {
+          message: "The Microsoft identity response exceeded its safety limit.",
+          code: "INVALID_PROVIDER_RESPONSE",
+        },
+      );
+      if (requestBudget.signal?.aborted) throw requestBudget.signal.reason;
+      if (timeoutController.signal.aborted) {
+        throw silentTokenTimeout(requestBudget.timeout);
+      }
+
+      let body;
+      try {
+        body = JSON.parse(responseBytes.toString("utf8"));
+      } catch {
+        throw microsoftIdentityInvalidResponse();
+      }
+      const responseHeaders = {};
+      response.headers.forEach((value, name) => {
+        responseHeaders[name] = value;
+      });
+      return { headers: responseHeaders, body, status: response.status };
+    } catch (error) {
+      if (
+        requestBudget.signal?.aborted &&
+        requestBudget.signal.reason?.code === "OPERATION_DEADLINE_EXCEEDED"
+      ) {
+        throw requestBudget.signal.reason;
+      }
+      if (timeoutController.signal.aborted) {
+        throw silentTokenTimeout(requestBudget.timeout);
+      }
+      if (error instanceof errors/* MultiEmailError */.G) throw error;
+      throw microsoftIdentityNetworkError();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function profileEmails(profile) {
@@ -61618,9 +62228,87 @@ function graphUrl(pathOrUrl) {
 function graphErrorDetails(response, payload) {
   return {
     status: response.status,
-    providerCode: payload?.error?.code || null,
-    retryAfter: response.headers.get("retry-after") || null,
+    providerCode: safeDetailCode(payload?.error?.code),
+    retryAfter: safeRetryAfter(response.headers.get("retry-after")),
   };
+}
+
+function safeDetailCode(value) {
+  const code = typeof value === "string" ? value.trim() : "";
+  return /^[A-Za-z0-9_.-]{1,80}$/u.test(code) ? code : null;
+}
+
+function safeDiagnosticErrorCode(value, fallback) {
+  const code = typeof value === "string" ? value.trim() : "";
+  return DIAGNOSTIC_ERROR_CODE.test(code) ? code : fallback;
+}
+
+function safeRetryAfter(value) {
+  const retryAfter = typeof value === "string" ? value.trim() : "";
+  return /^\d{1,10}$/u.test(retryAfter) ? retryAfter : null;
+}
+
+function graphMutationWasDefinitelyRejected(error) {
+  const status = error?.details?.status;
+  return Number.isInteger(status) && status >= 400 && status < 500 && status !== 408;
+}
+
+function mutationFailureId(messageId, error, mutationStarted) {
+  if (!mutationStarted || graphMutationWasDefinitelyRejected(error)) {
+    return { failedId: messageId };
+  }
+  // A timeout, missing/malformed response, 408, or 5xx after dispatch does not
+  // prove the provider rejected the mutation. Preserve the ambiguity so callers
+  // verify state before deciding whether another write is safe.
+  return { unknownOutcomeId: messageId };
+}
+
+function silentTokenTimeout(timeoutMs) {
+  return new errors/* MultiEmailError */.G(
+    "Microsoft token acquisition timed out before it completed.",
+    "MICROSOFT_TIMEOUT",
+    { timeoutMs },
+  );
+}
+
+async function runTokenStage(action, fallbackMs) {
+  const availableMs = (0,operation_deadline/* remainingOperationTimeMs */.Fe)({ fallbackMs });
+  const reserveMs = Math.min(
+    OPERATION_SETTLE_RESERVE_MS,
+    Math.max(1, Math.ceil(availableMs / 2)),
+  );
+  const timeoutMs = availableMs - reserveMs;
+  if (timeoutMs <= 0) throw silentTokenTimeout(0);
+
+  const timeoutError = silentTokenTimeout(timeoutMs);
+  let expired = false;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      expired = true;
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  const checkDeadline = () => {
+    if (expired) throw timeoutError;
+    (0,operation_deadline/* remainingOperationTimeMs */.Fe)({ fallbackMs });
+  };
+  const tokenStage = Promise.resolve().then(() => action(checkDeadline));
+  try {
+    return await (0,operation_deadline/* raceWithOperationDeadline */.Je)(Promise.race([tokenStage, timeout]));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function graphErrorPayload(response) {
+  try {
+    const bytes = await readBoundedResponse(response, GRAPH_ERROR_BODY_LIMIT);
+    return JSON.parse(bytes.toString("utf8"));
+  } catch {
+    // The HTTP status is authoritative. Ignore malformed or oversized provider text.
+    return null;
+  }
 }
 
 function searchExpression(query) {
@@ -61647,11 +62335,21 @@ function messageSummary(account, message) {
 }
 
 class MicrosoftProvider {
-  constructor({ config, credentialStore, browserOpener = openBrowser, fetchImpl = globalThis.fetch }) {
+  constructor({
+    config,
+    credentialStore,
+    browserOpener = openBrowser,
+    fetchImpl = globalThis.fetch,
+    graphRequestTimeoutMs = GRAPH_REQUEST_TIMEOUT_MS,
+  }) {
     this.config = config;
     this.credentialStore = credentialStore;
     this.browserOpener = browserOpener;
     this.fetchImpl = fetchImpl;
+    this.graphRequestTimeoutMs =
+      Number.isFinite(graphRequestTimeoutMs) && graphRequestTimeoutMs > 0
+        ? Math.min(Math.floor(graphRequestTimeoutMs), GRAPH_REQUEST_TIMEOUT_MS)
+        : GRAPH_REQUEST_TIMEOUT_MS;
     this.applications = new Map();
     this.verifiedAliases = new Set();
   }
@@ -61701,6 +62399,13 @@ class MicrosoftProvider {
               ),
             }
           : undefined,
+      system: {
+        networkClient: new BoundedMicrosoftNetworkClient({
+          fetchImpl: this.fetchImpl,
+          timeoutMs: this.graphRequestTimeoutMs,
+        }),
+        disableInternalRetries: true,
+      },
     });
   }
 
@@ -61756,7 +62461,7 @@ class MicrosoftProvider {
       throw new errors/* MultiEmailError */.G(
         "Microsoft authorization was not completed. Check the account selection and consent policy, then try again.",
         "MICROSOFT_AUTH_FAILED",
-        { providerCode: error?.errorCode || error?.code || null },
+        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
       );
     }
 
@@ -61791,10 +62496,19 @@ class MicrosoftProvider {
   }
 
   async accessToken(account) {
+    return runTokenStage(
+      (checkDeadline) => this.loadAccessToken(account, checkDeadline),
+      this.graphRequestTimeoutMs,
+    );
+  }
+
+  async loadAccessToken(account, checkDeadline) {
     const { application, record } = await this.application(account);
+    checkDeadline();
     let accounts;
     try {
       accounts = await application.getAllAccounts();
+      checkDeadline();
     } catch (error) {
       if (error instanceof errors/* MultiEmailError */.G) throw error;
       throw new errors/* MultiEmailError */.G(
@@ -61827,11 +62541,18 @@ class MicrosoftProvider {
         account: selected,
         scopes: [...DELEGATED_SCOPES],
       });
+      checkDeadline();
     } catch (error) {
+      if (
+        error?.code === "MICROSOFT_TIMEOUT" ||
+        error?.code === "OPERATION_DEADLINE_EXCEEDED"
+      ) {
+        throw error;
+      }
       throw new errors/* MultiEmailError */.G(
         `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "REAUTHENTICATION_REQUIRED",
-        { providerCode: error?.errorCode || error?.code || null },
+        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
       );
     }
 
@@ -61851,15 +62572,18 @@ class MicrosoftProvider {
         result.accessToken,
         "me?$select=id,displayName,mail,userPrincipalName",
       );
+      checkDeadline();
       assertProfileMatches(account, profile);
       this.verifiedAliases.add(account.alias);
     }
     if (record?.source === "legacy") {
       // Copy only after both silent token acquisition and /me identity verification.
+      checkDeadline();
       await this.credentialStore.set(
         record.key,
         application.getTokenCache().serialize(),
       );
+      checkDeadline();
       this.applications.delete(account.alias);
     }
     return result.accessToken;
@@ -61922,13 +62646,26 @@ class MicrosoftProvider {
 
       let result;
       try {
-        result = await application.acquireTokenSilent({
-          account: selected,
-          scopes: [...DELEGATED_SCOPES],
-        });
+        result = await runTokenStage(
+          async (checkDeadline) => {
+            const token = await application.acquireTokenSilent({
+              account: selected,
+              scopes: [...DELEGATED_SCOPES],
+            });
+            checkDeadline();
+            return token;
+          },
+          this.graphRequestTimeoutMs,
+        );
         if (!result?.accessToken) throw new Error("missing access token");
         diagnostic.token_valid = true;
-      } catch {
+      } catch (error) {
+        if (
+          error?.code === "MICROSOFT_TIMEOUT" ||
+          error?.code === "OPERATION_DEADLINE_EXCEEDED"
+        ) {
+          throw error;
+        }
         diagnostic.token_valid = false;
         diagnostic.status = "reauthorization_required";
         diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
@@ -61954,12 +62691,18 @@ class MicrosoftProvider {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
         diagnostic.status =
           diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = error?.code || "MICROSOFT_PROFILE_FAILED";
+        diagnostic.error_code = safeDiagnosticErrorCode(
+          error?.code,
+          "MICROSOFT_PROFILE_FAILED",
+        );
       }
       return diagnostic;
     } catch (error) {
       diagnostic.status = "configuration_error";
-      diagnostic.error_code = error?.code || "MICROSOFT_CLIENT_NOT_CONFIGURED";
+      diagnostic.error_code = safeDiagnosticErrorCode(
+        error?.code,
+        "MICROSOFT_CLIENT_NOT_CONFIGURED",
+      );
       return diagnostic;
     }
   }
@@ -62022,6 +62765,7 @@ class MicrosoftProvider {
       rawBody = false,
       responseType = "json",
       maxResponseBytes = undefined,
+      onDispatch,
     } = {},
   ) {
     const url = graphUrl(pathOrUrl);
@@ -62033,76 +62777,106 @@ class MicrosoftProvider {
     };
     if (body !== undefined && !rawBody) requestHeaders["content-type"] = "application/json";
 
-    let response;
+    const requestBudget = (0,operation_deadline/* operationRequestBudget */.uT)({
+      fallbackMs: this.graphRequestTimeoutMs,
+    });
+    const requestSignal = AbortSignal.timeout(requestBudget.timeout);
+    const signal = requestBudget.signal
+      ? AbortSignal.any([requestBudget.signal, requestSignal])
+      : requestSignal;
     try {
-      response = await this.fetchImpl(url, {
+      const request = {
         method,
         headers: requestHeaders,
         body: body === undefined ? undefined : rawBody ? body : JSON.stringify(body),
-      });
-    } catch {
-      throw new errors/* MultiEmailError */.G(
-        "The Microsoft Graph request did not return a response.",
-        "MICROSOFT_NETWORK_ERROR",
-      );
-    }
+        signal,
+        // Never let fetch replay a mutation body through a 307/308 redirect.
+        // Graph URLs are fixed and validated before dispatch.
+        redirect: "error",
+      };
+      onDispatch?.();
+      const response = await this.fetchImpl(url, request);
 
-    if (responseType === "buffer") {
-      if (!response.ok) {
-        const errorBytes = await readBoundedResponse(response, GRAPH_ERROR_BODY_LIMIT);
-        let errorPayload = null;
-        try {
-          errorPayload = JSON.parse(errorBytes.toString("utf8"));
-        } catch {
-          // Preserve the status even when Graph did not return its normal JSON error shape.
+      if (responseType === "buffer") {
+        if (!response.ok) {
+          const errorPayload = await graphErrorPayload(response);
+          const code =
+            response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
+          throw new errors/* MultiEmailError */.G(
+            `Microsoft Graph rejected the request (${response.status}).`,
+            code,
+            graphErrorDetails(response, errorPayload),
+          );
         }
-        const code =
-          response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
-        throw new errors/* MultiEmailError */.G(
-          `Microsoft Graph rejected the request (${response.status}).`,
-          code,
-          graphErrorDetails(response, errorPayload),
-        );
+        if (!Number.isInteger(maxResponseBytes) || maxResponseBytes <= 0) {
+          throw new errors/* MultiEmailError */.G(
+            "A positive response limit is required for binary Graph requests.",
+            "INVALID_INPUT",
+          );
+        }
+        return readBoundedResponse(response, maxResponseBytes, {
+          message: "The Microsoft raw MIME draft exceeds the 2 MB review limit.",
+          code: "DRAFT_TOO_LARGE",
+        });
       }
-      if (!Number.isInteger(maxResponseBytes) || maxResponseBytes <= 0) {
-        throw new errors/* MultiEmailError */.G(
-          "A positive response limit is required for binary Graph requests.",
-          "INVALID_INPUT",
-        );
+      if (responseType !== "json") {
+        throw new errors/* MultiEmailError */.G("Unsupported Microsoft Graph response type.", "INVALID_INPUT");
       }
-      return readBoundedResponse(response, maxResponseBytes, {
-        message: "The Microsoft raw MIME draft exceeds the 2 MB review limit.",
-        code: "DRAFT_TOO_LARGE",
-      });
-    }
-    if (responseType !== "json") {
-      throw new errors/* MultiEmailError */.G("Unsupported Microsoft Graph response type.", "INVALID_INPUT");
-    }
 
-    const text = await response.text();
-    let payload = null;
-    if (text) {
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        if (response.ok) {
+      let payload = null;
+      if (response.ok) {
+        const responseBytes = await readBoundedResponse(response, GRAPH_JSON_BODY_LIMIT);
+        const text = responseBytes.toString("utf8");
+        try {
+          payload = text ? JSON.parse(text) : null;
+        } catch {
           throw new errors/* MultiEmailError */.G(
             "Microsoft Graph returned an invalid response.",
             "INVALID_PROVIDER_RESPONSE",
           );
         }
+      } else {
+        payload = await graphErrorPayload(response);
       }
-    }
 
-    if (!response.ok) {
-      const code = response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
+      if (!response.ok) {
+        const code = response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
+        throw new errors/* MultiEmailError */.G(
+          `Microsoft Graph rejected the request (${response.status}).`,
+          code,
+          graphErrorDetails(response, payload),
+        );
+      }
+      return payload;
+    } catch (error) {
+      if (
+        requestBudget.signal?.aborted &&
+        requestBudget.signal.reason?.code === "OPERATION_DEADLINE_EXCEEDED"
+      ) {
+        throw requestBudget.signal.reason;
+      }
+      if (
+        error?.name === "TimeoutError" ||
+        (signal.aborted && signal.reason?.name === "TimeoutError")
+      ) {
+        throw new errors/* MultiEmailError */.G(
+          "The Microsoft Graph request timed out before it completed.",
+          "MICROSOFT_TIMEOUT",
+          { timeoutMs: requestBudget.timeout },
+        );
+      }
+      if (error?.name === "AbortError" || error?.code === "ABORT_ERR") {
+        throw new errors/* MultiEmailError */.G(
+          "The Microsoft Graph request was aborted before it completed.",
+          "MICROSOFT_REQUEST_ABORTED",
+        );
+      }
+      if (error instanceof errors/* MultiEmailError */.G) throw error;
       throw new errors/* MultiEmailError */.G(
-        `Microsoft Graph rejected the request (${response.status}).`,
-        code,
-        graphErrorDetails(response, payload),
+        "The Microsoft Graph request did not return a response.",
+        "MICROSOFT_NETWORK_ERROR",
       );
     }
-    return payload;
   }
 
   async graphRequest(account, pathOrUrl, options) {
@@ -62477,21 +63251,34 @@ class MicrosoftProvider {
     } catch (error) {
       if (error?.code === "DRAFT_CHANGED") throw error;
       throw new errors/* MultiEmailError */.G(
-        "The Microsoft draft could not be verified before sending. Prepare and approve it again.",
+        "The Microsoft draft could not be verified before sending. Nothing was sent. Prepare and approve it again.",
         "SEND_VERIFICATION_FAILED",
-        { causeCode: error?.code || null },
+        { causeCode: safeDetailCode(error?.code) },
       );
     }
 
     // Freeze the approved allowlisted fields into the one send request. Graph's
     // existing-draft send action has no conditional revision header, so it
     // cannot prevent another client changing the draft between a GET and POST.
-    await this.graphRequest(account, "me/sendMail", {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "text/plain" },
-      body: mimeBase64,
-      rawBody: true,
-    });
+    let sendDispatched = false;
+    try {
+      await this.graphRequest(account, "me/sendMail", {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "text/plain" },
+        body: mimeBase64,
+        rawBody: true,
+        onDispatch: () => {
+          sendDispatched = true;
+        },
+      });
+    } catch (error) {
+      if (sendDispatched) throw error;
+      throw new errors/* MultiEmailError */.G(
+        "The Microsoft send request could not start. Nothing was sent.",
+        "SEND_VERIFICATION_FAILED",
+        { causeCode: safeDetailCode(error?.code) },
+      );
+    }
     return {
       account: account.alias,
       provider: "microsoft",
@@ -62506,7 +63293,9 @@ class MicrosoftProvider {
     const folder = await this.graphRequest(account, "me/mailFolders/archive?$select=id,displayName");
     let archived = 0;
     let moved = 0;
-    for (const messageId of messageIds) {
+    const completedIds = [];
+    for (const [index, messageId] of messageIds.entries()) {
+      let mutationStarted = false;
       try {
         const id = encodeURIComponent(messageId);
         const message = await this.graphRequest(
@@ -62517,15 +63306,26 @@ class MicrosoftProvider {
           await this.graphRequest(account, `me/messages/${id}/move`, {
             method: "POST",
             body: { destinationId: folder.id },
+            onDispatch: () => {
+              mutationStarted = true;
+            },
           });
           moved += 1;
         }
         archived += 1;
+        completedIds.push(messageId);
       } catch (error) {
         throw new errors/* MultiEmailError */.G(
           `Microsoft archived ${archived} of ${messageIds.length} messages before an error occurred.`,
           "PARTIAL_ARCHIVE",
-          { archived, requested: messageIds.length, causeCode: error?.code || null },
+          {
+            archived,
+            requested: messageIds.length,
+            completedIds,
+            ...mutationFailureId(messageId, error, mutationStarted),
+            remainingIds: messageIds.slice(index + 1),
+            causeCode: safeDetailCode(error?.code),
+          },
         );
       }
     }
@@ -62534,18 +63334,32 @@ class MicrosoftProvider {
 
   async markRead(account, messageIds, isRead) {
     let changed = 0;
-    for (const messageId of messageIds) {
+    const completedIds = [];
+    for (const [index, messageId] of messageIds.entries()) {
+      let mutationStarted = false;
       try {
         await this.graphRequest(account, `me/messages/${encodeURIComponent(messageId)}`, {
           method: "PATCH",
           body: { isRead: Boolean(isRead) },
+          onDispatch: () => {
+            mutationStarted = true;
+          },
         });
         changed += 1;
+        completedIds.push(messageId);
       } catch (error) {
         throw new errors/* MultiEmailError */.G(
           `Microsoft updated ${changed} of ${messageIds.length} messages before an error occurred.`,
           "PARTIAL_MARK_READ",
-          { changed, requested: messageIds.length, isRead: Boolean(isRead), causeCode: error?.code || null },
+          {
+            changed,
+            requested: messageIds.length,
+            isRead: Boolean(isRead),
+            completedIds,
+            ...mutationFailureId(messageId, error, mutationStarted),
+            remainingIds: messageIds.slice(index + 1),
+            causeCode: safeDetailCode(error?.code),
+          },
         );
       }
     }
@@ -62564,7 +63378,9 @@ class MicrosoftProvider {
     const additions = new Set(add);
     const removals = new Set(remove);
     let changed = 0;
-    for (const messageId of messageIds) {
+    const completedIds = [];
+    for (const [index, messageId] of messageIds.entries()) {
+      let mutationStarted = false;
       try {
         const id = encodeURIComponent(messageId);
         const message = await this.graphRequest(account, `me/messages/${id}?$select=id,categories`);
@@ -62574,13 +63390,24 @@ class MicrosoftProvider {
         await this.graphRequest(account, `me/messages/${id}`, {
           method: "PATCH",
           body: { categories: [...categories] },
+          onDispatch: () => {
+            mutationStarted = true;
+          },
         });
         changed += 1;
+        completedIds.push(messageId);
       } catch (error) {
         throw new errors/* MultiEmailError */.G(
           `Microsoft updated categories on ${changed} of ${messageIds.length} messages before an error occurred.`,
           "PARTIAL_CATEGORY_UPDATE",
-          { changed, requested: messageIds.length, causeCode: error?.code || null },
+          {
+            changed,
+            requested: messageIds.length,
+            completedIds,
+            ...mutationFailureId(messageId, error, mutationStarted),
+            remainingIds: messageIds.slice(index + 1),
+            causeCode: safeDetailCode(error?.code),
+          },
         );
       }
     }
@@ -62915,6 +63742,7 @@ __nccwpck_require__.r(__webpack_exports__);
 
 // EXPORTS
 __nccwpck_require__.d(__webpack_exports__, {
+  safeMcpOperation: () => (/* binding */ safeMcpOperation),
   server: () => (/* binding */ server),
   startServer: () => (/* binding */ startServer)
 });
@@ -82875,6 +83703,77 @@ var send_approval = __nccwpck_require__(2443);
 
 
 const MAX_BODY_BYTES = 1024 * 1024;
+const PUBLIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
+const PRE_SEND_TRANSPORT_CODES = new Set([
+  "ABORT_ERR",
+  "AbortError",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ESOCKETTIMEDOUT",
+  "GOOGLE_NETWORK_ERROR",
+  "GOOGLE_REQUEST_TIMEOUT",
+  "MICROSOFT_NETWORK_ERROR",
+  "MICROSOFT_REQUEST_ABORTED",
+  "MICROSOFT_TIMEOUT",
+  "OPERATION_DEADLINE_EXCEEDED",
+  "TimeoutError",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+]);
+
+function safePublicErrorCode(value, fallback = "PROVIDER_ERROR") {
+  const code = typeof value === "string" ? value.trim() : "";
+  return PUBLIC_ERROR_CODE.test(code) ? code : fallback;
+}
+
+function diagnosticErrorFallback(provider) {
+  if (provider === "google") return "GOOGLE_PROFILE_FAILED";
+  if (provider === "microsoft") return "MICROSOFT_PROFILE_FAILED";
+  return "PROVIDER_DIAGNOSIS_FAILED";
+}
+
+function sanitizeDiagnostic(account, diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object") {
+    throw new errors/* MultiEmailError */.G(
+      "The provider returned an invalid diagnostic result.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
+  }
+  if (!Object.hasOwn(diagnostic, "error_code") || diagnostic.error_code === null) {
+    return diagnostic;
+  }
+  return {
+    ...diagnostic,
+    error_code: safePublicErrorCode(
+      diagnostic.error_code,
+      diagnosticErrorFallback(account.provider),
+    ),
+  };
+}
+
+function isKnownPreSendTransportFailure(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    if (
+      PRE_SEND_TRANSPORT_CODES.has(String(current.code || "")) ||
+      PRE_SEND_TRANSPORT_CODES.has(String(current.name || ""))
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
 
 function boundedSafety(config) {
   const configured = config.safety || {};
@@ -83163,7 +84062,7 @@ class MailService {
             "UNSUPPORTED_OPERATION",
           );
         }
-        return provider.diagnose(account);
+        return sanitizeDiagnostic(account, await provider.diagnose(account));
       }),
     );
   }
@@ -83410,6 +84309,13 @@ class MailService {
       } catch {
         // Preserve the provider/review failure that caused this approval to be spent.
       }
+      if (isKnownPreSendTransportFailure(error)) {
+        throw new errors/* MultiEmailError */.G(
+          "The approved draft could not be rechecked before sending. Nothing was sent.",
+          "SEND_VERIFICATION_FAILED",
+          { account: account.alias, draftId: normalizedDraftId },
+        );
+      }
       throw error;
     }
     this.approvals.consumeApproved(requestId, canonical);
@@ -83420,8 +84326,8 @@ class MailService {
         throw error;
       }
       console.error(
-        `[multi-email] send outcome unknown for ${account.alias}/${normalizedDraftId}: ` +
-          String(error?.code || error?.name || "provider_error"),
+        `[multi-email] send outcome unknown for ${account.alias}: ` +
+          safePublicErrorCode(error?.code || error?.name),
       );
       throw new errors/* MultiEmailError */.G(
         "The send request did not complete cleanly, so delivery status is unknown. Do not retry automatically; check Sent first.",
@@ -83432,6 +84338,8 @@ class MailService {
   }
 }
 
+// EXTERNAL MODULE: ./src/operation-deadline.mjs + 1 modules
+var operation_deadline = __nccwpck_require__(6378);
 // EXTERNAL MODULE: external "node:child_process"
 var external_node_child_process_ = __nccwpck_require__(1421);
 // EXTERNAL MODULE: external "node:http"
@@ -83903,6 +84811,7 @@ class LocalSendApprovalUi {
 
 
 
+
 const server = new McpServer({
   name: constants/* APP_NAME */.C3,
   version: constants/* APP_VERSION */.hl,
@@ -83937,20 +84846,22 @@ function resultContent(value) {
   };
 }
 
+async function safeMcpOperation(action, deadlineOptions = undefined) {
+  try {
+    return resultContent(await (0,operation_deadline/* runWithOperationDeadline */.$S)(action, deadlineOptions));
+  } catch (error) {
+    const safe = (0,errors/* publicError */.O)(error);
+    console.error(`[multi-email] ${safe.code}: ${safe.error}`);
+    return {
+      content: [{ type: "text", text: JSON.stringify(safe, null, 2) }],
+      structuredContent: { ok: false, ...safe },
+      isError: true,
+    };
+  }
+}
+
 function safeHandler(action) {
-  return async (input) => {
-    try {
-      return resultContent(await action(await service(), input));
-    } catch (error) {
-      const safe = (0,errors/* publicError */.O)(error);
-      console.error(`[multi-email] ${safe.code}: ${safe.error}`);
-      return {
-        content: [{ type: "text", text: JSON.stringify(safe, null, 2) }],
-        structuredContent: { ok: false, ...safe },
-        isError: true,
-      };
-    }
-  };
+  return (input) => safeMcpOperation(async () => action(await service(), input));
 }
 
 const accountAlias = classic_schemas_string()
@@ -84258,12 +85169,13 @@ __nccwpck_require__.r(__webpack_exports__);
 const HELP = `Multi Email setup
 
 Usage:
+  multi-email setup
   multi-email init --google-client-json <desktop-oauth.json> [--microsoft-client-id <guid>] [--microsoft-tenant <tenant>]
   multi-email init --microsoft-client-id <guid> [--microsoft-tenant <tenant>]
   multi-email add-account <alias> <email> <google|microsoft>
   multi-email set-microsoft-client <guid> [--microsoft-tenant <tenant>]
   multi-email auth <alias>
-  multi-email doctor [alias]
+  multi-email doctor [alias] [--json]
   multi-email logout <alias> --confirm
   multi-email revoke <alias> --confirm
   multi-email list
@@ -84275,9 +85187,34 @@ Notes:
   - Aliases are lowercase identifiers used by every mail tool.
   - OAuth tokens are stored in macOS Keychain and are never printed.
   - The config path defaults to ~/.config/codex-multi-email/config.json.
+  - setup is a non-interactive, read-only preflight and never reads credentials.
   - doctor may contact the provider but never writes or migrates credentials.
+  - doctor --json emits one stable JSON object per line.
   - logout removes local credentials. revoke also removes the provider grant where supported.
 `;
+
+const COMMAND_OPTIONS = Object.freeze({
+  setup: new Set(),
+  init: new Set(["google-client-json", "microsoft-client-id", "microsoft-tenant"]),
+  "add-account": new Set(),
+  "set-microsoft-client": new Set(["microsoft-tenant"]),
+  auth: new Set(),
+  doctor: new Set(["json"]),
+  logout: new Set(["confirm"]),
+  revoke: new Set(["confirm"]),
+  list: new Set(),
+});
+
+const DIAGNOSTIC_STATUSES = new Set([
+  "ok",
+  "not_authorized",
+  "invalid_credential",
+  "reauthorization_required",
+  "insufficient_scopes",
+  "identity_mismatch",
+  "provider_unavailable",
+  "configuration_error",
+]);
 
 function fail(message, code = "INVALID_ARGUMENT") {
   throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_6__/* .MultiEmailError */ .G(message, code);
@@ -84299,6 +85236,128 @@ async function loadConfigOrEmpty(configPath, { repairMicrosoft = false } = {}) {
   } catch (error) {
     if (error?.code === "NOT_CONFIGURED") return (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .emptyConfig */ .i4)();
     throw error;
+  }
+}
+
+async function inspectConfiguration(configPath) {
+  try {
+    return { config: await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath), status: "ready" };
+  } catch (error) {
+    if (error?.code === "NOT_CONFIGURED") {
+      return { config: (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .emptyConfig */ .i4)(), status: "missing" };
+    }
+    if (error?.code !== "INVALID_CONFIG") throw error;
+    return {
+      config: await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfigForMicrosoftRepair */ .Vp)(configPath),
+      status: "microsoft_repair_required",
+    };
+  }
+}
+
+function providerReady(config, provider) {
+  return provider === "google"
+    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .googleProviderConfigured */ .jS)(config.providers.google)
+    : (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .microsoftProviderConfigured */ .CH)(config.providers.microsoft);
+}
+
+function executableCommand(command) {
+  const prefix = "multi-email ";
+  if (!command.startsWith(prefix)) return command;
+  return `${command} (or node ./scripts/multi-email ${command.slice(prefix.length)} from a Git clone)`;
+}
+
+function providerSetupCommand(provider, { configExists = true } = {}) {
+  if (provider === "microsoft") {
+    return executableCommand(
+      configExists
+        ? "multi-email set-microsoft-client <application-guid>"
+        : "multi-email init --microsoft-client-id <application-guid> --microsoft-tenant organizations",
+    );
+  }
+  return executableCommand(
+    "multi-email init --google-client-json <desktop-oauth.json>",
+  );
+}
+
+function nextAddAccountCommand(provider) {
+  return executableCommand(`multi-email add-account <alias> <email> ${provider}`);
+}
+
+function setupNextCommands({ config, status }) {
+  if (status === "microsoft_repair_required") {
+    return [providerSetupCommand("microsoft")];
+  }
+
+  const missingAccountProviders = [];
+  for (const account of config.accounts) {
+    if (
+      !providerReady(config, account.provider) &&
+      !missingAccountProviders.includes(account.provider)
+    ) {
+      missingAccountProviders.push(account.provider);
+    }
+  }
+  if (missingAccountProviders.length) {
+    return missingAccountProviders.map((provider) => providerSetupCommand(provider));
+  }
+
+  if (config.accounts.length) return [executableCommand("multi-email doctor")];
+
+  const configuredProviders = ["google", "microsoft"].filter((provider) =>
+    providerReady(config, provider),
+  );
+  if (configuredProviders.length) {
+    return configuredProviders.map((provider) => nextAddAccountCommand(provider));
+  }
+
+  return [
+    providerSetupCommand("google", { configExists: status !== "missing" }),
+    providerSetupCommand("microsoft", { configExists: status !== "missing" }),
+  ];
+}
+
+function safeCell(value) {
+  return String(value ?? "-").replace(/[\u0000-\u001f\u007f]/gu, "?");
+}
+
+function assertCommandOptions(command, values) {
+  const allowed = COMMAND_OPTIONS[command];
+  if (!allowed) return;
+  for (const option of Object.keys(values)) {
+    if (option === "help" || option === "version" || allowed.has(option)) continue;
+    fail(
+      `Option '--${option}' is not valid for '${command}'. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.`,
+    );
+  }
+}
+
+async function setupCommand({ positionals, configPath, configLocation, output }) {
+  requireNoExtraPositionals(positionals, 0);
+  const state = await inspectConfiguration(configPath);
+  const googleReady = providerReady(state.config, "google");
+  const microsoftReady = providerReady(state.config, "microsoft");
+  const nextCommands = setupNextCommands(state);
+
+  output("Multi Email setup status");
+  output("ITEM\tSTATUS\tDETAIL");
+  output(`Version\tready\t${safeCell(_constants_mjs__WEBPACK_IMPORTED_MODULE_5__/* .APP_VERSION */ .hl)}`);
+  output(`Config\t${safeCell(state.status)}\t${configLocation}`);
+  output(
+    `Google OAuth\t${googleReady ? "ready" : "not_configured"}\t${
+      googleReady ? "client configured" : "client required"
+    }`,
+  );
+  output(
+    `Microsoft OAuth\t${microsoftReady ? "ready" : "not_configured"}\t${
+      microsoftReady ? "client configured" : "client required"
+    }`,
+  );
+  output(
+    `Accounts\t${state.config.accounts.length ? "configured" : "none"}\t${state.config.accounts.length}`,
+  );
+  output(`Next: ${nextCommands[0]}`);
+  for (const alternative of nextCommands.slice(1)) {
+    output(`Alternative: ${alternative}`);
   }
 }
 
@@ -84449,21 +85508,173 @@ async function authCommand({ positionals, configPath, output, credentialStore, p
   output(`Authorized '${result.alias}' as ${result.email} with ${result.provider}.`);
 }
 
-async function doctorCommand({ positionals, configPath, output, credentialStore, providerFactory }) {
-  if (positionals.length > 1) {
-    fail("doctor accepts at most one account alias.");
+function triState(value) {
+  return value === true ? true : value === false ? false : null;
+}
+
+function safeErrorCode(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const code = String(value);
+  return /^[A-Z0-9][A-Z0-9_-]{0,63}$/u.test(code) ? code : fallback;
+}
+
+function diagnosticNextStep(account, status) {
+  switch (status) {
+    case "ok":
+      return "none (ready)";
+    case "not_authorized":
+    case "invalid_credential":
+    case "reauthorization_required":
+    case "insufficient_scopes":
+    case "identity_mismatch":
+      return executableCommand(`multi-email auth ${account.alias}`);
+    case "configuration_error":
+      return providerSetupCommand(account.provider);
+    case "provider_unavailable":
+    default:
+      return executableCommand(`multi-email doctor ${account.alias}`);
   }
-  const config = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath);
-  const accounts = positionals.length ? [(0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .findAccount */ .vF)(config, positionals[0])] : config.accounts;
-  if (accounts.length === 0) {
-    output("No accounts configured.");
+}
+
+function diagnosticRecord(account, input = {}) {
+  const status = DIAGNOSTIC_STATUSES.has(input?.status)
+    ? input.status
+    : "provider_unavailable";
+  const credentialSource = ["profile", "legacy"].includes(input?.credential_source)
+    ? input.credential_source
+    : null;
+  return {
+    type: "account",
+    alias: account.alias,
+    provider: account.provider,
+    expected_email: account.email,
+    credential_present: triState(input?.credential_present),
+    token_valid: triState(input?.token_valid),
+    identity_verified: triState(input?.identity_verified),
+    scopes_valid: triState(input?.scopes_valid),
+    credential_source: credentialSource,
+    legacy_migration_pending: input?.legacy_migration_pending === true,
+    status,
+    error_code: safeErrorCode(input?.error_code),
+    next_step: diagnosticNextStep(account, status),
+  };
+}
+
+function doctorSummaryRecord(status, nextStep) {
+  return {
+    type: "summary",
+    alias: null,
+    provider: null,
+    expected_email: null,
+    credential_present: null,
+    token_valid: null,
+    identity_verified: null,
+    scopes_valid: null,
+    credential_source: null,
+    legacy_migration_pending: false,
+    status,
+    error_code: null,
+    next_step: nextStep,
+  };
+}
+
+function humanBoolean(value) {
+  return value === true ? "yes" : value === false ? "no" : "-";
+}
+
+function renderDoctorRecords(records, { json, output }) {
+  if (json) {
+    for (const record of records) output(JSON.stringify(record));
     return;
   }
 
-  for (const account of accounts) {
-    const provider = await providerFactory(account.provider, config, credentialStore);
-    output(JSON.stringify(await provider.diagnose(account)));
+  output("ALIAS\tPROVIDER\tSTATUS\tCREDENTIAL\tTOKEN\tIDENTITY\tSCOPES\tNEXT STEP");
+  for (const record of records) {
+    output(
+      [
+        safeCell(record.alias),
+        safeCell(record.provider),
+        safeCell(record.status),
+        humanBoolean(record.credential_present),
+        humanBoolean(record.token_valid),
+        humanBoolean(record.identity_verified),
+        humanBoolean(record.scopes_valid),
+        safeCell(record.next_step),
+      ].join("\t"),
+    );
   }
+}
+
+async function doctorCommand({
+  values,
+  positionals,
+  configPath,
+  output,
+  credentialStore,
+  providerFactory,
+}) {
+  if (positionals.length > 1) {
+    fail("doctor accepts at most one account alias.");
+  }
+  const state = await inspectConfiguration(configPath);
+  if (state.status === "missing") {
+    renderDoctorRecords(
+      [doctorSummaryRecord("not_configured", executableCommand("multi-email setup"))],
+      { json: values.json, output },
+    );
+    return;
+  }
+  if (state.status === "microsoft_repair_required") {
+    renderDoctorRecords(
+      [
+        doctorSummaryRecord(
+          "microsoft_repair_required",
+          providerSetupCommand("microsoft"),
+        ),
+      ],
+      { json: values.json, output },
+    );
+    return;
+  }
+
+  const config = state.config;
+  const accounts = positionals.length ? [(0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .findAccount */ .vF)(config, positionals[0])] : config.accounts;
+  if (accounts.length === 0) {
+    renderDoctorRecords(
+      [doctorSummaryRecord("no_accounts", setupNextCommands(state)[0])],
+      { json: values.json, output },
+    );
+    return;
+  }
+
+  const records = [];
+  for (const account of accounts) {
+    if (!providerReady(config, account.provider)) {
+      records.push(
+        diagnosticRecord(account, {
+          status: "configuration_error",
+          error_code:
+            account.provider === "google"
+              ? "GOOGLE_CLIENT_NOT_CONFIGURED"
+              : "MICROSOFT_CLIENT_NOT_CONFIGURED",
+        }),
+      );
+      continue;
+    }
+
+    try {
+      const provider = await providerFactory(account.provider, config, credentialStore);
+      records.push(diagnosticRecord(account, await provider.diagnose(account)));
+    } catch (error) {
+      records.push(
+        diagnosticRecord(account, {
+          status: "provider_unavailable",
+          error_code: safeErrorCode(error?.code, "PROVIDER_DIAGNOSIS_FAILED"),
+        }),
+      );
+    }
+  }
+  renderDoctorRecords(records, { json: values.json, output });
 }
 
 function requireConfirmation(values, command) {
@@ -84517,6 +85728,7 @@ function parseCliArgs(args) {
       "microsoft-client-id": { type: "string" },
       "microsoft-tenant": { type: "string" },
       confirm: { type: "boolean" },
+      json: { type: "boolean" },
       version: { type: "boolean", short: "V" },
     },
   });
@@ -84524,7 +85736,11 @@ function parseCliArgs(args) {
 
 async function run(args = process.argv.slice(2), dependencies = {}) {
   const output = dependencies.output || console.log;
-  const configPath = dependencies.configPath || (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .defaultConfigPath */ .jE)();
+  const env = dependencies.env || process.env;
+  const configPath = dependencies.configPath || (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .defaultConfigPath */ .jE)(env);
+  const configLocation = dependencies.configPath || env.CODEX_MULTI_EMAIL_CONFIG
+    ? "custom"
+    : "default";
   const credentialStore = dependencies.credentialStore || new _keychain_mjs__WEBPACK_IMPORTED_MODULE_7__/* .KeychainStore */ .kG();
   const providerFactory = dependencies.providerFactory || instantiateProvider;
   let parsed;
@@ -84550,15 +85766,20 @@ async function run(args = process.argv.slice(2), dependencies = {}) {
     return;
   }
 
+  assertCommandOptions(command, parsed.values);
+
   const context = {
     values: parsed.values,
     positionals,
     configPath,
+    configLocation,
     output,
     credentialStore,
     providerFactory,
   };
   switch (command) {
+    case "setup":
+      return setupCommand(context);
     case "init":
       return initCommand(context);
     case "add-account":

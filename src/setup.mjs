@@ -25,12 +25,13 @@ import {
 const HELP = `Multi Email setup
 
 Usage:
+  multi-email setup
   multi-email init --google-client-json <desktop-oauth.json> [--microsoft-client-id <guid>] [--microsoft-tenant <tenant>]
   multi-email init --microsoft-client-id <guid> [--microsoft-tenant <tenant>]
   multi-email add-account <alias> <email> <google|microsoft>
   multi-email set-microsoft-client <guid> [--microsoft-tenant <tenant>]
   multi-email auth <alias>
-  multi-email doctor [alias]
+  multi-email doctor [alias] [--json]
   multi-email logout <alias> --confirm
   multi-email revoke <alias> --confirm
   multi-email list
@@ -42,9 +43,34 @@ Notes:
   - Aliases are lowercase identifiers used by every mail tool.
   - OAuth tokens are stored in macOS Keychain and are never printed.
   - The config path defaults to ~/.config/codex-multi-email/config.json.
+  - setup is a non-interactive, read-only preflight and never reads credentials.
   - doctor may contact the provider but never writes or migrates credentials.
+  - doctor --json emits one stable JSON object per line.
   - logout removes local credentials. revoke also removes the provider grant where supported.
 `;
+
+const COMMAND_OPTIONS = Object.freeze({
+  setup: new Set(),
+  init: new Set(["google-client-json", "microsoft-client-id", "microsoft-tenant"]),
+  "add-account": new Set(),
+  "set-microsoft-client": new Set(["microsoft-tenant"]),
+  auth: new Set(),
+  doctor: new Set(["json"]),
+  logout: new Set(["confirm"]),
+  revoke: new Set(["confirm"]),
+  list: new Set(),
+});
+
+const DIAGNOSTIC_STATUSES = new Set([
+  "ok",
+  "not_authorized",
+  "invalid_credential",
+  "reauthorization_required",
+  "insufficient_scopes",
+  "identity_mismatch",
+  "provider_unavailable",
+  "configuration_error",
+]);
 
 function fail(message, code = "INVALID_ARGUMENT") {
   throw new MultiEmailError(message, code);
@@ -66,6 +92,128 @@ async function loadConfigOrEmpty(configPath, { repairMicrosoft = false } = {}) {
   } catch (error) {
     if (error?.code === "NOT_CONFIGURED") return emptyConfig();
     throw error;
+  }
+}
+
+async function inspectConfiguration(configPath) {
+  try {
+    return { config: await loadConfig(configPath), status: "ready" };
+  } catch (error) {
+    if (error?.code === "NOT_CONFIGURED") {
+      return { config: emptyConfig(), status: "missing" };
+    }
+    if (error?.code !== "INVALID_CONFIG") throw error;
+    return {
+      config: await loadConfigForMicrosoftRepair(configPath),
+      status: "microsoft_repair_required",
+    };
+  }
+}
+
+function providerReady(config, provider) {
+  return provider === "google"
+    ? googleProviderConfigured(config.providers.google)
+    : microsoftProviderConfigured(config.providers.microsoft);
+}
+
+function executableCommand(command) {
+  const prefix = "multi-email ";
+  if (!command.startsWith(prefix)) return command;
+  return `${command} (or node ./scripts/multi-email ${command.slice(prefix.length)} from a Git clone)`;
+}
+
+function providerSetupCommand(provider, { configExists = true } = {}) {
+  if (provider === "microsoft") {
+    return executableCommand(
+      configExists
+        ? "multi-email set-microsoft-client <application-guid>"
+        : "multi-email init --microsoft-client-id <application-guid> --microsoft-tenant organizations",
+    );
+  }
+  return executableCommand(
+    "multi-email init --google-client-json <desktop-oauth.json>",
+  );
+}
+
+function nextAddAccountCommand(provider) {
+  return executableCommand(`multi-email add-account <alias> <email> ${provider}`);
+}
+
+function setupNextCommands({ config, status }) {
+  if (status === "microsoft_repair_required") {
+    return [providerSetupCommand("microsoft")];
+  }
+
+  const missingAccountProviders = [];
+  for (const account of config.accounts) {
+    if (
+      !providerReady(config, account.provider) &&
+      !missingAccountProviders.includes(account.provider)
+    ) {
+      missingAccountProviders.push(account.provider);
+    }
+  }
+  if (missingAccountProviders.length) {
+    return missingAccountProviders.map((provider) => providerSetupCommand(provider));
+  }
+
+  if (config.accounts.length) return [executableCommand("multi-email doctor")];
+
+  const configuredProviders = ["google", "microsoft"].filter((provider) =>
+    providerReady(config, provider),
+  );
+  if (configuredProviders.length) {
+    return configuredProviders.map((provider) => nextAddAccountCommand(provider));
+  }
+
+  return [
+    providerSetupCommand("google", { configExists: status !== "missing" }),
+    providerSetupCommand("microsoft", { configExists: status !== "missing" }),
+  ];
+}
+
+function safeCell(value) {
+  return String(value ?? "-").replace(/[\u0000-\u001f\u007f]/gu, "?");
+}
+
+function assertCommandOptions(command, values) {
+  const allowed = COMMAND_OPTIONS[command];
+  if (!allowed) return;
+  for (const option of Object.keys(values)) {
+    if (option === "help" || option === "version" || allowed.has(option)) continue;
+    fail(
+      `Option '--${option}' is not valid for '${command}'. Run 'multi-email --help' (or 'node ./scripts/multi-email --help' from a Git clone) for usage.`,
+    );
+  }
+}
+
+async function setupCommand({ positionals, configPath, configLocation, output }) {
+  requireNoExtraPositionals(positionals, 0);
+  const state = await inspectConfiguration(configPath);
+  const googleReady = providerReady(state.config, "google");
+  const microsoftReady = providerReady(state.config, "microsoft");
+  const nextCommands = setupNextCommands(state);
+
+  output("Multi Email setup status");
+  output("ITEM\tSTATUS\tDETAIL");
+  output(`Version\tready\t${safeCell(APP_VERSION)}`);
+  output(`Config\t${safeCell(state.status)}\t${configLocation}`);
+  output(
+    `Google OAuth\t${googleReady ? "ready" : "not_configured"}\t${
+      googleReady ? "client configured" : "client required"
+    }`,
+  );
+  output(
+    `Microsoft OAuth\t${microsoftReady ? "ready" : "not_configured"}\t${
+      microsoftReady ? "client configured" : "client required"
+    }`,
+  );
+  output(
+    `Accounts\t${state.config.accounts.length ? "configured" : "none"}\t${state.config.accounts.length}`,
+  );
+  output(`Next: ${nextCommands[0]}`);
+  for (const alternative of nextCommands.slice(1)) {
+    output(`Alternative: ${alternative}`);
   }
 }
 
@@ -216,21 +364,173 @@ async function authCommand({ positionals, configPath, output, credentialStore, p
   output(`Authorized '${result.alias}' as ${result.email} with ${result.provider}.`);
 }
 
-async function doctorCommand({ positionals, configPath, output, credentialStore, providerFactory }) {
-  if (positionals.length > 1) {
-    fail("doctor accepts at most one account alias.");
+function triState(value) {
+  return value === true ? true : value === false ? false : null;
+}
+
+function safeErrorCode(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const code = String(value);
+  return /^[A-Z0-9][A-Z0-9_-]{0,63}$/u.test(code) ? code : fallback;
+}
+
+function diagnosticNextStep(account, status) {
+  switch (status) {
+    case "ok":
+      return "none (ready)";
+    case "not_authorized":
+    case "invalid_credential":
+    case "reauthorization_required":
+    case "insufficient_scopes":
+    case "identity_mismatch":
+      return executableCommand(`multi-email auth ${account.alias}`);
+    case "configuration_error":
+      return providerSetupCommand(account.provider);
+    case "provider_unavailable":
+    default:
+      return executableCommand(`multi-email doctor ${account.alias}`);
   }
-  const config = await loadConfig(configPath);
-  const accounts = positionals.length ? [findAccount(config, positionals[0])] : config.accounts;
-  if (accounts.length === 0) {
-    output("No accounts configured.");
+}
+
+function diagnosticRecord(account, input = {}) {
+  const status = DIAGNOSTIC_STATUSES.has(input?.status)
+    ? input.status
+    : "provider_unavailable";
+  const credentialSource = ["profile", "legacy"].includes(input?.credential_source)
+    ? input.credential_source
+    : null;
+  return {
+    type: "account",
+    alias: account.alias,
+    provider: account.provider,
+    expected_email: account.email,
+    credential_present: triState(input?.credential_present),
+    token_valid: triState(input?.token_valid),
+    identity_verified: triState(input?.identity_verified),
+    scopes_valid: triState(input?.scopes_valid),
+    credential_source: credentialSource,
+    legacy_migration_pending: input?.legacy_migration_pending === true,
+    status,
+    error_code: safeErrorCode(input?.error_code),
+    next_step: diagnosticNextStep(account, status),
+  };
+}
+
+function doctorSummaryRecord(status, nextStep) {
+  return {
+    type: "summary",
+    alias: null,
+    provider: null,
+    expected_email: null,
+    credential_present: null,
+    token_valid: null,
+    identity_verified: null,
+    scopes_valid: null,
+    credential_source: null,
+    legacy_migration_pending: false,
+    status,
+    error_code: null,
+    next_step: nextStep,
+  };
+}
+
+function humanBoolean(value) {
+  return value === true ? "yes" : value === false ? "no" : "-";
+}
+
+function renderDoctorRecords(records, { json, output }) {
+  if (json) {
+    for (const record of records) output(JSON.stringify(record));
     return;
   }
 
-  for (const account of accounts) {
-    const provider = await providerFactory(account.provider, config, credentialStore);
-    output(JSON.stringify(await provider.diagnose(account)));
+  output("ALIAS\tPROVIDER\tSTATUS\tCREDENTIAL\tTOKEN\tIDENTITY\tSCOPES\tNEXT STEP");
+  for (const record of records) {
+    output(
+      [
+        safeCell(record.alias),
+        safeCell(record.provider),
+        safeCell(record.status),
+        humanBoolean(record.credential_present),
+        humanBoolean(record.token_valid),
+        humanBoolean(record.identity_verified),
+        humanBoolean(record.scopes_valid),
+        safeCell(record.next_step),
+      ].join("\t"),
+    );
   }
+}
+
+async function doctorCommand({
+  values,
+  positionals,
+  configPath,
+  output,
+  credentialStore,
+  providerFactory,
+}) {
+  if (positionals.length > 1) {
+    fail("doctor accepts at most one account alias.");
+  }
+  const state = await inspectConfiguration(configPath);
+  if (state.status === "missing") {
+    renderDoctorRecords(
+      [doctorSummaryRecord("not_configured", executableCommand("multi-email setup"))],
+      { json: values.json, output },
+    );
+    return;
+  }
+  if (state.status === "microsoft_repair_required") {
+    renderDoctorRecords(
+      [
+        doctorSummaryRecord(
+          "microsoft_repair_required",
+          providerSetupCommand("microsoft"),
+        ),
+      ],
+      { json: values.json, output },
+    );
+    return;
+  }
+
+  const config = state.config;
+  const accounts = positionals.length ? [findAccount(config, positionals[0])] : config.accounts;
+  if (accounts.length === 0) {
+    renderDoctorRecords(
+      [doctorSummaryRecord("no_accounts", setupNextCommands(state)[0])],
+      { json: values.json, output },
+    );
+    return;
+  }
+
+  const records = [];
+  for (const account of accounts) {
+    if (!providerReady(config, account.provider)) {
+      records.push(
+        diagnosticRecord(account, {
+          status: "configuration_error",
+          error_code:
+            account.provider === "google"
+              ? "GOOGLE_CLIENT_NOT_CONFIGURED"
+              : "MICROSOFT_CLIENT_NOT_CONFIGURED",
+        }),
+      );
+      continue;
+    }
+
+    try {
+      const provider = await providerFactory(account.provider, config, credentialStore);
+      records.push(diagnosticRecord(account, await provider.diagnose(account)));
+    } catch (error) {
+      records.push(
+        diagnosticRecord(account, {
+          status: "provider_unavailable",
+          error_code: safeErrorCode(error?.code, "PROVIDER_DIAGNOSIS_FAILED"),
+        }),
+      );
+    }
+  }
+  renderDoctorRecords(records, { json: values.json, output });
 }
 
 function requireConfirmation(values, command) {
@@ -284,6 +584,7 @@ export function parseCliArgs(args) {
       "microsoft-client-id": { type: "string" },
       "microsoft-tenant": { type: "string" },
       confirm: { type: "boolean" },
+      json: { type: "boolean" },
       version: { type: "boolean", short: "V" },
     },
   });
@@ -291,7 +592,11 @@ export function parseCliArgs(args) {
 
 export async function run(args = process.argv.slice(2), dependencies = {}) {
   const output = dependencies.output || console.log;
-  const configPath = dependencies.configPath || defaultConfigPath();
+  const env = dependencies.env || process.env;
+  const configPath = dependencies.configPath || defaultConfigPath(env);
+  const configLocation = dependencies.configPath || env.CODEX_MULTI_EMAIL_CONFIG
+    ? "custom"
+    : "default";
   const credentialStore = dependencies.credentialStore || new KeychainStore();
   const providerFactory = dependencies.providerFactory || instantiateProvider;
   let parsed;
@@ -317,15 +622,20 @@ export async function run(args = process.argv.slice(2), dependencies = {}) {
     return;
   }
 
+  assertCommandOptions(command, parsed.values);
+
   const context = {
     values: parsed.values,
     positionals,
     configPath,
+    configLocation,
     output,
     credentialStore,
     providerFactory,
   };
   switch (command) {
+    case "setup":
+      return setupCommand(context);
     case "init":
       return initCommand(context);
     case "add-account":

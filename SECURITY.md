@@ -30,6 +30,7 @@ The plugin enforces several boundaries:
 - OAuth token material and the Microsoft MSAL cache are stored as generic-password items in macOS Keychain;
 - tool inputs, recipient counts, body sizes, and write batches are bounded;
 - provider URLs and pagination targets are constrained by provider adapters;
+- MCP tool handlers share one 108-second operation budget below the 120-second host timeout; provider HTTP calls receive the remaining timeout and an abort signal when supported, while an uncancellable SDK promise is abandoned by the handler at the deadline but may settle later; Google API mutation retries and provider redirects are disabled, and bounded Gmail, Microsoft identity, and Graph responses are rejected and abandoned before full buffering;
 - permanent deletion and arbitrary provider API calls are not exposed;
 - message content is treated as untrusted data;
 - sending requires approval in a server-owned `127.0.0.1` review window that shows every field of the supported plain-text effective-send manifest;
@@ -38,6 +39,7 @@ The plugin enforces several boundaries:
 - the provider send request is reconstructed from the approved allowlisted manifest, so unreviewed display names, custom headers, raw MIME fields, and last-moment provider-draft mutations are not copied into the outgoing payload;
 - configurable safety values may tighten but cannot expand the domain-level hard limits;
 - no MCP tool can approve a send request, and a provider send is never automatically retried after an ambiguous result.
+- Microsoft batch errors classify a dispatched timeout, HTTP 408, HTTP 5xx, or missing/malformed response as unknown, while explicit non-408 HTTP 4xx rejections remain definite; receipts distinguish completed IDs, the current outcome, and untouched IDs so callers do not replay work from an inaccurate receipt.
 
 These controls do not make write-capable OAuth scopes harmless. Any process allowed to act as the same macOS user may be able to request Keychain access, and a compromised Codex host, Node runtime, dependency, browser session, or provider account can cross boundaries this plugin cannot defend.
 

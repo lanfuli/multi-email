@@ -5,6 +5,11 @@ import { MultiEmailError } from "../errors.mjs";
 import { credentialAccountKey, legacyCredentialAccountKey } from "../keychain.mjs";
 import { buildRawMessage } from "../mime.mjs";
 import {
+  operationRequestBudget,
+  raceWithOperationDeadline,
+  remainingOperationTimeMs,
+} from "../operation-deadline.mjs";
+import {
   normalizeMailboxAddress,
   normalizeMicrosoftClientId,
   normalizeMicrosoftTenant,
@@ -16,7 +21,13 @@ const BODY_LIMIT = 80_000;
 const PAGE_TOKEN_LIMIT = 12_000;
 const RAW_DRAFT_LIMIT = 2 * 1024 * 1024;
 const MIME_HEADER_LIMIT = 128 * 1024;
+const GRAPH_REQUEST_TIMEOUT_MS = 100_000;
+const OPERATION_SETTLE_RESERVE_MS = 250;
+const GRAPH_JSON_BODY_LIMIT = 2 * 1024 * 1024;
 const GRAPH_ERROR_BODY_LIMIT = 64 * 1024;
+const MICROSOFT_IDENTITY_BODY_LIMIT = 2 * 1024 * 1024;
+const MICROSOFT_IDENTITY_ORIGIN = "https://login.microsoftonline.com";
+const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
 
 function credentialKey(config, account) {
   return credentialAccountKey(config, account, ":msal-cache");
@@ -372,15 +383,26 @@ async function readBoundedResponse(
   } = {},
 ) {
   const contentLength = response.headers?.get?.("content-length");
+  const reader = response.body?.getReader?.();
   if (/^\d+$/u.test(String(contentLength || "")) && Number(contentLength) > limit) {
+    if (reader) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The response is already being abandoned because its declared size exceeds the cap.
+      } finally {
+        reader.releaseLock?.();
+      }
+    }
     throw new MultiEmailError(message, code);
   }
 
-  const reader = response.body?.getReader?.();
+  if (!response.body) return Buffer.alloc(0);
   if (!reader) {
-    const value = Buffer.from(await response.arrayBuffer());
-    if (value.length > limit) throw new MultiEmailError(message, code);
-    return value;
+    throw new MultiEmailError(
+      "Microsoft Graph returned an unreadable response stream.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
   }
 
   const chunks = [];
@@ -405,6 +427,127 @@ async function readBoundedResponse(
     reader.releaseLock?.();
   }
   return Buffer.concat(chunks, total);
+}
+
+function microsoftIdentityUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new MultiEmailError(
+      "Microsoft identity returned an invalid endpoint.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
+  }
+  if (
+    url.origin !== MICROSOFT_IDENTITY_ORIGIN ||
+    url.username ||
+    url.password
+  ) {
+    throw new MultiEmailError(
+      "Refusing to call an unexpected Microsoft identity endpoint.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
+  }
+  return url;
+}
+
+function microsoftIdentityNetworkError() {
+  return new MultiEmailError(
+    "The Microsoft identity request did not return a response.",
+    "MICROSOFT_NETWORK_ERROR",
+  );
+}
+
+function microsoftIdentityInvalidResponse() {
+  return new MultiEmailError(
+    "Microsoft identity returned an invalid response.",
+    "INVALID_PROVIDER_RESPONSE",
+  );
+}
+
+class BoundedMicrosoftNetworkClient {
+  constructor({ fetchImpl, timeoutMs }) {
+    this.fetchImpl = fetchImpl;
+    this.timeoutMs = timeoutMs;
+  }
+
+  async sendGetRequestAsync(url, options = {}, timeout = undefined) {
+    const requestedTimeout =
+      Number.isFinite(timeout) && timeout > 0
+        ? Math.min(Math.floor(timeout), this.timeoutMs)
+        : this.timeoutMs;
+    return this.request(url, "GET", options, requestedTimeout);
+  }
+
+  async sendPostRequestAsync(url, options = {}) {
+    return this.request(url, "POST", options, this.timeoutMs);
+  }
+
+  async request(urlValue, method, options, timeoutMs) {
+    const url = microsoftIdentityUrl(urlValue);
+    const requestBudget = operationRequestBudget({ fallbackMs: timeoutMs });
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => timeoutController.abort(), requestBudget.timeout);
+    timer.unref?.();
+    const signal = requestBudget.signal
+      ? AbortSignal.any([requestBudget.signal, timeoutController.signal])
+      : timeoutController.signal;
+
+    try {
+      let headers;
+      try {
+        headers = new Headers(options?.headers || {});
+      } catch {
+        throw microsoftIdentityInvalidResponse();
+      }
+      const response = await this.fetchImpl(url, {
+        method,
+        headers,
+        ...(method === "POST" ? { body: options?.body || "" } : {}),
+        redirect: "error",
+        signal,
+      });
+      const responseBytes = await readBoundedResponse(
+        response,
+        MICROSOFT_IDENTITY_BODY_LIMIT,
+        {
+          message: "The Microsoft identity response exceeded its safety limit.",
+          code: "INVALID_PROVIDER_RESPONSE",
+        },
+      );
+      if (requestBudget.signal?.aborted) throw requestBudget.signal.reason;
+      if (timeoutController.signal.aborted) {
+        throw silentTokenTimeout(requestBudget.timeout);
+      }
+
+      let body;
+      try {
+        body = JSON.parse(responseBytes.toString("utf8"));
+      } catch {
+        throw microsoftIdentityInvalidResponse();
+      }
+      const responseHeaders = {};
+      response.headers.forEach((value, name) => {
+        responseHeaders[name] = value;
+      });
+      return { headers: responseHeaders, body, status: response.status };
+    } catch (error) {
+      if (
+        requestBudget.signal?.aborted &&
+        requestBudget.signal.reason?.code === "OPERATION_DEADLINE_EXCEEDED"
+      ) {
+        throw requestBudget.signal.reason;
+      }
+      if (timeoutController.signal.aborted) {
+        throw silentTokenTimeout(requestBudget.timeout);
+      }
+      if (error instanceof MultiEmailError) throw error;
+      throw microsoftIdentityNetworkError();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function profileEmails(profile) {
@@ -484,9 +627,87 @@ function graphUrl(pathOrUrl) {
 function graphErrorDetails(response, payload) {
   return {
     status: response.status,
-    providerCode: payload?.error?.code || null,
-    retryAfter: response.headers.get("retry-after") || null,
+    providerCode: safeDetailCode(payload?.error?.code),
+    retryAfter: safeRetryAfter(response.headers.get("retry-after")),
   };
+}
+
+function safeDetailCode(value) {
+  const code = typeof value === "string" ? value.trim() : "";
+  return /^[A-Za-z0-9_.-]{1,80}$/u.test(code) ? code : null;
+}
+
+function safeDiagnosticErrorCode(value, fallback) {
+  const code = typeof value === "string" ? value.trim() : "";
+  return DIAGNOSTIC_ERROR_CODE.test(code) ? code : fallback;
+}
+
+function safeRetryAfter(value) {
+  const retryAfter = typeof value === "string" ? value.trim() : "";
+  return /^\d{1,10}$/u.test(retryAfter) ? retryAfter : null;
+}
+
+function graphMutationWasDefinitelyRejected(error) {
+  const status = error?.details?.status;
+  return Number.isInteger(status) && status >= 400 && status < 500 && status !== 408;
+}
+
+function mutationFailureId(messageId, error, mutationStarted) {
+  if (!mutationStarted || graphMutationWasDefinitelyRejected(error)) {
+    return { failedId: messageId };
+  }
+  // A timeout, missing/malformed response, 408, or 5xx after dispatch does not
+  // prove the provider rejected the mutation. Preserve the ambiguity so callers
+  // verify state before deciding whether another write is safe.
+  return { unknownOutcomeId: messageId };
+}
+
+function silentTokenTimeout(timeoutMs) {
+  return new MultiEmailError(
+    "Microsoft token acquisition timed out before it completed.",
+    "MICROSOFT_TIMEOUT",
+    { timeoutMs },
+  );
+}
+
+async function runTokenStage(action, fallbackMs) {
+  const availableMs = remainingOperationTimeMs({ fallbackMs });
+  const reserveMs = Math.min(
+    OPERATION_SETTLE_RESERVE_MS,
+    Math.max(1, Math.ceil(availableMs / 2)),
+  );
+  const timeoutMs = availableMs - reserveMs;
+  if (timeoutMs <= 0) throw silentTokenTimeout(0);
+
+  const timeoutError = silentTokenTimeout(timeoutMs);
+  let expired = false;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      expired = true;
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  const checkDeadline = () => {
+    if (expired) throw timeoutError;
+    remainingOperationTimeMs({ fallbackMs });
+  };
+  const tokenStage = Promise.resolve().then(() => action(checkDeadline));
+  try {
+    return await raceWithOperationDeadline(Promise.race([tokenStage, timeout]));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function graphErrorPayload(response) {
+  try {
+    const bytes = await readBoundedResponse(response, GRAPH_ERROR_BODY_LIMIT);
+    return JSON.parse(bytes.toString("utf8"));
+  } catch {
+    // The HTTP status is authoritative. Ignore malformed or oversized provider text.
+    return null;
+  }
 }
 
 function searchExpression(query) {
@@ -513,11 +734,21 @@ function messageSummary(account, message) {
 }
 
 export class MicrosoftProvider {
-  constructor({ config, credentialStore, browserOpener = openBrowser, fetchImpl = globalThis.fetch }) {
+  constructor({
+    config,
+    credentialStore,
+    browserOpener = openBrowser,
+    fetchImpl = globalThis.fetch,
+    graphRequestTimeoutMs = GRAPH_REQUEST_TIMEOUT_MS,
+  }) {
     this.config = config;
     this.credentialStore = credentialStore;
     this.browserOpener = browserOpener;
     this.fetchImpl = fetchImpl;
+    this.graphRequestTimeoutMs =
+      Number.isFinite(graphRequestTimeoutMs) && graphRequestTimeoutMs > 0
+        ? Math.min(Math.floor(graphRequestTimeoutMs), GRAPH_REQUEST_TIMEOUT_MS)
+        : GRAPH_REQUEST_TIMEOUT_MS;
     this.applications = new Map();
     this.verifiedAliases = new Set();
   }
@@ -567,6 +798,13 @@ export class MicrosoftProvider {
               ),
             }
           : undefined,
+      system: {
+        networkClient: new BoundedMicrosoftNetworkClient({
+          fetchImpl: this.fetchImpl,
+          timeoutMs: this.graphRequestTimeoutMs,
+        }),
+        disableInternalRetries: true,
+      },
     });
   }
 
@@ -622,7 +860,7 @@ export class MicrosoftProvider {
       throw new MultiEmailError(
         "Microsoft authorization was not completed. Check the account selection and consent policy, then try again.",
         "MICROSOFT_AUTH_FAILED",
-        { providerCode: error?.errorCode || error?.code || null },
+        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
       );
     }
 
@@ -657,10 +895,19 @@ export class MicrosoftProvider {
   }
 
   async accessToken(account) {
+    return runTokenStage(
+      (checkDeadline) => this.loadAccessToken(account, checkDeadline),
+      this.graphRequestTimeoutMs,
+    );
+  }
+
+  async loadAccessToken(account, checkDeadline) {
     const { application, record } = await this.application(account);
+    checkDeadline();
     let accounts;
     try {
       accounts = await application.getAllAccounts();
+      checkDeadline();
     } catch (error) {
       if (error instanceof MultiEmailError) throw error;
       throw new MultiEmailError(
@@ -693,11 +940,18 @@ export class MicrosoftProvider {
         account: selected,
         scopes: [...DELEGATED_SCOPES],
       });
+      checkDeadline();
     } catch (error) {
+      if (
+        error?.code === "MICROSOFT_TIMEOUT" ||
+        error?.code === "OPERATION_DEADLINE_EXCEEDED"
+      ) {
+        throw error;
+      }
       throw new MultiEmailError(
         `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
         "REAUTHENTICATION_REQUIRED",
-        { providerCode: error?.errorCode || error?.code || null },
+        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
       );
     }
 
@@ -717,15 +971,18 @@ export class MicrosoftProvider {
         result.accessToken,
         "me?$select=id,displayName,mail,userPrincipalName",
       );
+      checkDeadline();
       assertProfileMatches(account, profile);
       this.verifiedAliases.add(account.alias);
     }
     if (record?.source === "legacy") {
       // Copy only after both silent token acquisition and /me identity verification.
+      checkDeadline();
       await this.credentialStore.set(
         record.key,
         application.getTokenCache().serialize(),
       );
+      checkDeadline();
       this.applications.delete(account.alias);
     }
     return result.accessToken;
@@ -788,13 +1045,26 @@ export class MicrosoftProvider {
 
       let result;
       try {
-        result = await application.acquireTokenSilent({
-          account: selected,
-          scopes: [...DELEGATED_SCOPES],
-        });
+        result = await runTokenStage(
+          async (checkDeadline) => {
+            const token = await application.acquireTokenSilent({
+              account: selected,
+              scopes: [...DELEGATED_SCOPES],
+            });
+            checkDeadline();
+            return token;
+          },
+          this.graphRequestTimeoutMs,
+        );
         if (!result?.accessToken) throw new Error("missing access token");
         diagnostic.token_valid = true;
-      } catch {
+      } catch (error) {
+        if (
+          error?.code === "MICROSOFT_TIMEOUT" ||
+          error?.code === "OPERATION_DEADLINE_EXCEEDED"
+        ) {
+          throw error;
+        }
         diagnostic.token_valid = false;
         diagnostic.status = "reauthorization_required";
         diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
@@ -820,12 +1090,18 @@ export class MicrosoftProvider {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
         diagnostic.status =
           diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = error?.code || "MICROSOFT_PROFILE_FAILED";
+        diagnostic.error_code = safeDiagnosticErrorCode(
+          error?.code,
+          "MICROSOFT_PROFILE_FAILED",
+        );
       }
       return diagnostic;
     } catch (error) {
       diagnostic.status = "configuration_error";
-      diagnostic.error_code = error?.code || "MICROSOFT_CLIENT_NOT_CONFIGURED";
+      diagnostic.error_code = safeDiagnosticErrorCode(
+        error?.code,
+        "MICROSOFT_CLIENT_NOT_CONFIGURED",
+      );
       return diagnostic;
     }
   }
@@ -888,6 +1164,7 @@ export class MicrosoftProvider {
       rawBody = false,
       responseType = "json",
       maxResponseBytes = undefined,
+      onDispatch,
     } = {},
   ) {
     const url = graphUrl(pathOrUrl);
@@ -899,76 +1176,106 @@ export class MicrosoftProvider {
     };
     if (body !== undefined && !rawBody) requestHeaders["content-type"] = "application/json";
 
-    let response;
+    const requestBudget = operationRequestBudget({
+      fallbackMs: this.graphRequestTimeoutMs,
+    });
+    const requestSignal = AbortSignal.timeout(requestBudget.timeout);
+    const signal = requestBudget.signal
+      ? AbortSignal.any([requestBudget.signal, requestSignal])
+      : requestSignal;
     try {
-      response = await this.fetchImpl(url, {
+      const request = {
         method,
         headers: requestHeaders,
         body: body === undefined ? undefined : rawBody ? body : JSON.stringify(body),
-      });
-    } catch {
-      throw new MultiEmailError(
-        "The Microsoft Graph request did not return a response.",
-        "MICROSOFT_NETWORK_ERROR",
-      );
-    }
+        signal,
+        // Never let fetch replay a mutation body through a 307/308 redirect.
+        // Graph URLs are fixed and validated before dispatch.
+        redirect: "error",
+      };
+      onDispatch?.();
+      const response = await this.fetchImpl(url, request);
 
-    if (responseType === "buffer") {
-      if (!response.ok) {
-        const errorBytes = await readBoundedResponse(response, GRAPH_ERROR_BODY_LIMIT);
-        let errorPayload = null;
-        try {
-          errorPayload = JSON.parse(errorBytes.toString("utf8"));
-        } catch {
-          // Preserve the status even when Graph did not return its normal JSON error shape.
+      if (responseType === "buffer") {
+        if (!response.ok) {
+          const errorPayload = await graphErrorPayload(response);
+          const code =
+            response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
+          throw new MultiEmailError(
+            `Microsoft Graph rejected the request (${response.status}).`,
+            code,
+            graphErrorDetails(response, errorPayload),
+          );
         }
-        const code =
-          response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
-        throw new MultiEmailError(
-          `Microsoft Graph rejected the request (${response.status}).`,
-          code,
-          graphErrorDetails(response, errorPayload),
-        );
+        if (!Number.isInteger(maxResponseBytes) || maxResponseBytes <= 0) {
+          throw new MultiEmailError(
+            "A positive response limit is required for binary Graph requests.",
+            "INVALID_INPUT",
+          );
+        }
+        return readBoundedResponse(response, maxResponseBytes, {
+          message: "The Microsoft raw MIME draft exceeds the 2 MB review limit.",
+          code: "DRAFT_TOO_LARGE",
+        });
       }
-      if (!Number.isInteger(maxResponseBytes) || maxResponseBytes <= 0) {
-        throw new MultiEmailError(
-          "A positive response limit is required for binary Graph requests.",
-          "INVALID_INPUT",
-        );
+      if (responseType !== "json") {
+        throw new MultiEmailError("Unsupported Microsoft Graph response type.", "INVALID_INPUT");
       }
-      return readBoundedResponse(response, maxResponseBytes, {
-        message: "The Microsoft raw MIME draft exceeds the 2 MB review limit.",
-        code: "DRAFT_TOO_LARGE",
-      });
-    }
-    if (responseType !== "json") {
-      throw new MultiEmailError("Unsupported Microsoft Graph response type.", "INVALID_INPUT");
-    }
 
-    const text = await response.text();
-    let payload = null;
-    if (text) {
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        if (response.ok) {
+      let payload = null;
+      if (response.ok) {
+        const responseBytes = await readBoundedResponse(response, GRAPH_JSON_BODY_LIMIT);
+        const text = responseBytes.toString("utf8");
+        try {
+          payload = text ? JSON.parse(text) : null;
+        } catch {
           throw new MultiEmailError(
             "Microsoft Graph returned an invalid response.",
             "INVALID_PROVIDER_RESPONSE",
           );
         }
+      } else {
+        payload = await graphErrorPayload(response);
       }
-    }
 
-    if (!response.ok) {
-      const code = response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
+      if (!response.ok) {
+        const code = response.status === 401 ? "REAUTHENTICATION_REQUIRED" : "MICROSOFT_GRAPH_ERROR";
+        throw new MultiEmailError(
+          `Microsoft Graph rejected the request (${response.status}).`,
+          code,
+          graphErrorDetails(response, payload),
+        );
+      }
+      return payload;
+    } catch (error) {
+      if (
+        requestBudget.signal?.aborted &&
+        requestBudget.signal.reason?.code === "OPERATION_DEADLINE_EXCEEDED"
+      ) {
+        throw requestBudget.signal.reason;
+      }
+      if (
+        error?.name === "TimeoutError" ||
+        (signal.aborted && signal.reason?.name === "TimeoutError")
+      ) {
+        throw new MultiEmailError(
+          "The Microsoft Graph request timed out before it completed.",
+          "MICROSOFT_TIMEOUT",
+          { timeoutMs: requestBudget.timeout },
+        );
+      }
+      if (error?.name === "AbortError" || error?.code === "ABORT_ERR") {
+        throw new MultiEmailError(
+          "The Microsoft Graph request was aborted before it completed.",
+          "MICROSOFT_REQUEST_ABORTED",
+        );
+      }
+      if (error instanceof MultiEmailError) throw error;
       throw new MultiEmailError(
-        `Microsoft Graph rejected the request (${response.status}).`,
-        code,
-        graphErrorDetails(response, payload),
+        "The Microsoft Graph request did not return a response.",
+        "MICROSOFT_NETWORK_ERROR",
       );
     }
-    return payload;
   }
 
   async graphRequest(account, pathOrUrl, options) {
@@ -1343,21 +1650,34 @@ export class MicrosoftProvider {
     } catch (error) {
       if (error?.code === "DRAFT_CHANGED") throw error;
       throw new MultiEmailError(
-        "The Microsoft draft could not be verified before sending. Prepare and approve it again.",
+        "The Microsoft draft could not be verified before sending. Nothing was sent. Prepare and approve it again.",
         "SEND_VERIFICATION_FAILED",
-        { causeCode: error?.code || null },
+        { causeCode: safeDetailCode(error?.code) },
       );
     }
 
     // Freeze the approved allowlisted fields into the one send request. Graph's
     // existing-draft send action has no conditional revision header, so it
     // cannot prevent another client changing the draft between a GET and POST.
-    await this.graphRequest(account, "me/sendMail", {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "text/plain" },
-      body: mimeBase64,
-      rawBody: true,
-    });
+    let sendDispatched = false;
+    try {
+      await this.graphRequest(account, "me/sendMail", {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "text/plain" },
+        body: mimeBase64,
+        rawBody: true,
+        onDispatch: () => {
+          sendDispatched = true;
+        },
+      });
+    } catch (error) {
+      if (sendDispatched) throw error;
+      throw new MultiEmailError(
+        "The Microsoft send request could not start. Nothing was sent.",
+        "SEND_VERIFICATION_FAILED",
+        { causeCode: safeDetailCode(error?.code) },
+      );
+    }
     return {
       account: account.alias,
       provider: "microsoft",
@@ -1372,7 +1692,9 @@ export class MicrosoftProvider {
     const folder = await this.graphRequest(account, "me/mailFolders/archive?$select=id,displayName");
     let archived = 0;
     let moved = 0;
-    for (const messageId of messageIds) {
+    const completedIds = [];
+    for (const [index, messageId] of messageIds.entries()) {
+      let mutationStarted = false;
       try {
         const id = encodeURIComponent(messageId);
         const message = await this.graphRequest(
@@ -1383,15 +1705,26 @@ export class MicrosoftProvider {
           await this.graphRequest(account, `me/messages/${id}/move`, {
             method: "POST",
             body: { destinationId: folder.id },
+            onDispatch: () => {
+              mutationStarted = true;
+            },
           });
           moved += 1;
         }
         archived += 1;
+        completedIds.push(messageId);
       } catch (error) {
         throw new MultiEmailError(
           `Microsoft archived ${archived} of ${messageIds.length} messages before an error occurred.`,
           "PARTIAL_ARCHIVE",
-          { archived, requested: messageIds.length, causeCode: error?.code || null },
+          {
+            archived,
+            requested: messageIds.length,
+            completedIds,
+            ...mutationFailureId(messageId, error, mutationStarted),
+            remainingIds: messageIds.slice(index + 1),
+            causeCode: safeDetailCode(error?.code),
+          },
         );
       }
     }
@@ -1400,18 +1733,32 @@ export class MicrosoftProvider {
 
   async markRead(account, messageIds, isRead) {
     let changed = 0;
-    for (const messageId of messageIds) {
+    const completedIds = [];
+    for (const [index, messageId] of messageIds.entries()) {
+      let mutationStarted = false;
       try {
         await this.graphRequest(account, `me/messages/${encodeURIComponent(messageId)}`, {
           method: "PATCH",
           body: { isRead: Boolean(isRead) },
+          onDispatch: () => {
+            mutationStarted = true;
+          },
         });
         changed += 1;
+        completedIds.push(messageId);
       } catch (error) {
         throw new MultiEmailError(
           `Microsoft updated ${changed} of ${messageIds.length} messages before an error occurred.`,
           "PARTIAL_MARK_READ",
-          { changed, requested: messageIds.length, isRead: Boolean(isRead), causeCode: error?.code || null },
+          {
+            changed,
+            requested: messageIds.length,
+            isRead: Boolean(isRead),
+            completedIds,
+            ...mutationFailureId(messageId, error, mutationStarted),
+            remainingIds: messageIds.slice(index + 1),
+            causeCode: safeDetailCode(error?.code),
+          },
         );
       }
     }
@@ -1430,7 +1777,9 @@ export class MicrosoftProvider {
     const additions = new Set(add);
     const removals = new Set(remove);
     let changed = 0;
-    for (const messageId of messageIds) {
+    const completedIds = [];
+    for (const [index, messageId] of messageIds.entries()) {
+      let mutationStarted = false;
       try {
         const id = encodeURIComponent(messageId);
         const message = await this.graphRequest(account, `me/messages/${id}?$select=id,categories`);
@@ -1440,13 +1789,24 @@ export class MicrosoftProvider {
         await this.graphRequest(account, `me/messages/${id}`, {
           method: "PATCH",
           body: { categories: [...categories] },
+          onDispatch: () => {
+            mutationStarted = true;
+          },
         });
         changed += 1;
+        completedIds.push(messageId);
       } catch (error) {
         throw new MultiEmailError(
           `Microsoft updated categories on ${changed} of ${messageIds.length} messages before an error occurred.`,
           "PARTIAL_CATEGORY_UPDATE",
-          { changed, requested: messageIds.length, causeCode: error?.code || null },
+          {
+            changed,
+            requested: messageIds.length,
+            completedIds,
+            ...mutationFailureId(messageId, error, mutationStarted),
+            remainingIds: messageIds.slice(index + 1),
+            causeCode: safeDetailCode(error?.code),
+          },
         );
       }
     }

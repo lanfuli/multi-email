@@ -21,6 +21,15 @@ const skill = await readFile(path.join(pluginRoot, "skills/multi-email/SKILL.md"
 const readme = await readFile(path.join(pluginRoot, "README.md"), "utf8");
 const changelog = await readFile(path.join(pluginRoot, "CHANGELOG.md"), "utf8");
 const constants = await readFile(path.join(pluginRoot, "src/constants.mjs"), "utf8");
+const googleOAuthGuide = await readFile(path.join(pluginRoot, "docs/google-oauth.md"), "utf8");
+const microsoftEntraGuide = await readFile(
+  path.join(pluginRoot, "docs/microsoft-entra.md"),
+  "utf8",
+);
+const continuousIntegration = await readFile(
+  path.join(pluginRoot, ".github/workflows/ci.yml"),
+  "utf8",
+);
 const buildInputs = await buildInputFiles(pluginRoot);
 const instructionFiles = [
   ...buildInputs.filter((relative) => relative.startsWith("src/")),
@@ -51,6 +60,7 @@ assert(packageJson.repository?.url?.includes("lanfuli/multi-email"), "Repository
 assert(packageJson.bin?.["multi-email"], "The setup CLI bin is missing.");
 assert(packageJson.bin?.["multi-email-mcp"], "The MCP bin is missing.");
 assert(packageJson.files?.includes("dist/"), "The package files whitelist omits dist.");
+assert(packageJson.files?.includes("docs/"), "The package files whitelist omits OAuth guides.");
 assert(
   packageJson.files?.includes("CONTRIBUTING.md") &&
     packageJson.files?.includes("CODE_OF_CONDUCT.md"),
@@ -79,6 +89,42 @@ assert(
     `codex plugin marketplace add lanfuli/multi-email --ref v${packageJson.version}`,
   ),
   "README Git marketplace installation is not pinned to the release tag.",
+);
+assert(
+  readme.includes("does not place the setup CLI on your shell `PATH`") &&
+    skill.includes("do not assume a marketplace install placed the setup CLI on `PATH`"),
+  "Marketplace setup guidance incorrectly assumes that the CLI binary is installed.",
+);
+assert(
+  readme.includes("docs/google-oauth.md") && readme.includes("docs/microsoft-entra.md"),
+  "README does not link both provider OAuth guides.",
+);
+assert(
+  googleOAuthGuide.includes("https://developers.google.com/workspace/gmail/api/auth/scopes") &&
+    microsoftEntraGuide.includes("https://learn.microsoft.com/en-us/graph/permissions-reference"),
+  "OAuth guides do not link their authoritative provider permission references.",
+);
+assert(
+  googleOAuthGuide.includes("**Desktop app**") &&
+    googleOAuthGuide.includes("`openid`") &&
+    googleOAuthGuide.includes("`email`") &&
+    googleOAuthGuide.includes("`https://www.googleapis.com/auth/gmail.modify`"),
+  "Google OAuth guide no longer preserves the supported desktop client and exact scopes.",
+);
+assert(
+  microsoftEntraGuide.includes("**Add a platform > Mobile and desktop applications**") &&
+    microsoftEntraGuide.includes("`http://localhost`") &&
+    microsoftEntraGuide.includes("Leave **Allow public client flows** at its default **No**") &&
+    ["`User.Read`", "`Mail.ReadWrite`", "`Mail.Send`"].every((permission) =>
+      microsoftEntraGuide.includes(permission),
+    ),
+  "Microsoft Entra guide no longer preserves the supported desktop redirect and delegated permissions.",
+);
+assert(
+  continuousIntegration.includes("fetch-depth: 0") &&
+    continuousIntegration.includes('git cat-file -t "refs/tags/$GITHUB_REF_NAME"') &&
+    continuousIntegration.includes('= tag'),
+  "CI no longer rejects lightweight release tags.",
 );
 assert(
   !readme.includes("\nnpm run setup") &&
@@ -140,6 +186,8 @@ for (const relative of [
   "CONTRIBUTING.md",
   "CODE_OF_CONDUCT.md",
   "CHANGELOG.md",
+  "docs/google-oauth.md",
+  "docs/microsoft-entra.md",
   ".mcp.json",
   ".codex-plugin/plugin.json",
   "dist/server.cjs",

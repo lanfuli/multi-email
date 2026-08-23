@@ -274,6 +274,175 @@ test("add-account rejects providers whose OAuth client is not configured", async
   }
 });
 
+test("setup preflight is non-interactive and reports a safe next command when config is missing", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-preflight-test-"));
+  const configPath = path.join(directory, "missing", "config.json");
+  const output = [];
+  let providerCalls = 0;
+
+  try {
+    await run(["setup"], {
+      configPath,
+      credentialStore: {
+        async get() {
+          throw new Error("setup must not read credentials");
+        },
+      },
+      output: (line) => output.push(line),
+      providerFactory: async () => {
+        providerCalls += 1;
+        throw new Error("setup must not instantiate providers");
+      },
+    });
+
+    const rendered = output.join("\n");
+    assert.match(rendered, new RegExp(`Version\\tready\\t${APP_VERSION.replaceAll(".", "\\.")}`));
+    assert.match(rendered, /Config\tmissing\tcustom/);
+    assert.match(rendered, /Google OAuth\tnot_configured\tclient required/);
+    assert.match(rendered, /Microsoft OAuth\tnot_configured\tclient required/);
+    assert.match(rendered, /Accounts\tnone\t0/);
+    assert.match(
+      rendered,
+      /Next: multi-email init --google-client-json <desktop-oauth\.json>/,
+    );
+    assert.match(
+      rendered,
+      /Alternative: multi-email init --microsoft-client-id <application-guid> --microsoft-tenant organizations/,
+    );
+    assert.match(
+      rendered,
+      /or node \.\/scripts\/multi-email init --google-client-json <desktop-oauth\.json> from a Git clone/,
+    );
+    assert.match(
+      rendered,
+      /or node \.\/scripts\/multi-email init --microsoft-client-id <application-guid> --microsoft-tenant organizations from a Git clone/,
+    );
+    assert.equal(providerCalls, 0);
+    await assert.rejects(stat(configPath), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("setup labels default and custom config locations without exposing their paths", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-preflight-path-test-"));
+  const sensitiveMarker = "private-user-name-and-secret-folder";
+  const customPath = path.join(directory, sensitiveMarker, "config.json");
+
+  try {
+    const defaultOutput = [];
+    await run(["setup"], {
+      env: { XDG_CONFIG_HOME: path.join(directory, "default-root") },
+      output: (line) => defaultOutput.push(line),
+    });
+    assert.match(defaultOutput.join("\n"), /Config\tmissing\tdefault/);
+
+    const customOutput = [];
+    await run(["setup"], {
+      env: { CODEX_MULTI_EMAIL_CONFIG: customPath },
+      credentialStore: {
+        async get() {
+          throw new Error("setup must not read credentials");
+        },
+      },
+      output: (line) => customOutput.push(line),
+      providerFactory: async () => {
+        throw new Error("setup must not instantiate providers");
+      },
+    });
+
+    const rendered = customOutput.join("\n");
+    assert.match(rendered, /Config\tmissing\tcustom/);
+    assert.doesNotMatch(rendered, new RegExp(sensitiveMarker));
+    assert.doesNotMatch(rendered, new RegExp(directory.replaceAll(".", "\\.")));
+    await assert.rejects(stat(customPath), { code: "ENOENT" });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("setup preflight reports provider readiness, account count, and remains read-only", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-preflight-ready-test-"));
+  const configPath = path.join(directory, "config.json");
+  const config = emptyConfig();
+  config.providers.google = {
+    clientId: "test.apps.googleusercontent.com",
+    clientSecret: "preflight-secret-must-not-be-printed",
+  };
+  config.accounts = [{ alias: "personal", email: "person@example.com", provider: "google" }];
+  const output = [];
+
+  try {
+    await saveConfig(config, configPath);
+    const before = await readFile(configPath, "utf8");
+    await run(["setup"], {
+      configPath,
+      output: (line) => output.push(line),
+      providerFactory: async () => {
+        throw new Error("setup must not instantiate providers");
+      },
+    });
+
+    const rendered = output.join("\n");
+    assert.match(rendered, /Config\tready\t/);
+    assert.match(rendered, /Google OAuth\tready\tclient configured/);
+    assert.match(rendered, /Microsoft OAuth\tnot_configured\tclient required/);
+    assert.match(rendered, /Accounts\tconfigured\t1/);
+    assert.match(rendered, /Next: multi-email doctor/);
+    assert.match(
+      rendered,
+      /or node \.\/scripts\/multi-email doctor from a Git clone/,
+    );
+    assert.doesNotMatch(rendered, /preflight-secret-must-not-be-printed/);
+    assert.equal(await readFile(configPath, "utf8"), before);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("setup and doctor expose the safe repair command for legacy Microsoft config", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-preflight-repair-test-"));
+  const configPath = path.join(directory, "config.json");
+  const config = emptyConfig();
+  config.providers.google = {
+    clientId: "test.apps.googleusercontent.com",
+    clientSecret: "legacy-secret-must-not-be-printed",
+  };
+  config.providers.microsoft = {
+    clientId: "legacy-invalid-client-id",
+    tenant: "legacy?invalid-tenant",
+  };
+  config.accounts = [{ alias: "personal", email: "person@example.com", provider: "google" }];
+  const serialized = `${JSON.stringify(config, null, 2)}\n`;
+
+  try {
+    await writeFile(configPath, serialized);
+    for (const args of [["setup"], ["doctor"], ["doctor", "--json"]]) {
+      const output = [];
+      await run(args, {
+        configPath,
+        output: (line) => output.push(line),
+        providerFactory: async () => {
+          throw new Error("repair preflight must not instantiate providers");
+        },
+      });
+      const rendered = output.join("\n");
+      assert.match(rendered, /microsoft_repair_required/);
+      assert.match(rendered, /multi-email set-microsoft-client <application-guid>/);
+      assert.match(
+        rendered,
+        /or node \.\/scripts\/multi-email set-microsoft-client <application-guid> from a Git clone/,
+      );
+      assert.doesNotMatch(rendered, /legacy-secret-must-not-be-printed/);
+      assert.doesNotMatch(rendered, /legacy-invalid-client-id/);
+      assert.doesNotMatch(rendered, /legacy\?invalid-tenant/);
+      assert.equal(await readFile(configPath, "utf8"), serialized);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("setup version flags and help work for installed and Git-clone entrypoints", async () => {
   for (const flag of ["--version", "-V"]) {
     const output = [];
@@ -284,9 +453,30 @@ test("setup version flags and help work for installed and Git-clone entrypoints"
   const output = [];
   await run(["--help"], { output: (line) => output.push(line) });
   const rendered = output.join("\n");
+  assert.match(rendered, /multi-email setup/);
   assert.match(rendered, /multi-email init/);
+  assert.match(rendered, /multi-email doctor \[alias\] \[--json\]/);
   assert.match(rendered, /node \.\/scripts\/multi-email/);
   assert.doesNotMatch(rendered, /npm run setup/);
+});
+
+test("setup and doctor reject extra positionals and command-specific options", async () => {
+  await assert.rejects(run(["setup", "unexpected"], { output: () => {} }), {
+    code: "INVALID_ARGUMENT",
+  });
+  await assert.rejects(run(["setup", "--json"], { output: () => {} }), (error) => {
+    assert.equal(error.code, "INVALID_ARGUMENT");
+    assert.match(error.message, /Option '--json' is not valid for 'setup'/);
+    return true;
+  });
+  await assert.rejects(run(["list", "--json"], { output: () => {} }), (error) => {
+    assert.equal(error.code, "INVALID_ARGUMENT");
+    assert.match(error.message, /Option '--json' is not valid for 'list'/);
+    return true;
+  });
+  await assert.rejects(run(["doctor", "one", "two"], { output: () => {} }), {
+    code: "INVALID_ARGUMENT",
+  });
 });
 
 test("safe setup runner redacts unknown errors but preserves MultiEmailError messages", async () => {
@@ -331,7 +521,7 @@ test("safe setup runner redacts unknown errors but preserves MultiEmailError mes
   }
 });
 
-test("doctor is read-only and renders explicit safe diagnostic fields", async () => {
+test("doctor defaults to a human-readable table with an explicit next step for every status", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-doctor-test-"));
   const configPath = path.join(directory, "config.json");
   const config = emptyConfig();
@@ -339,14 +529,28 @@ test("doctor is read-only and renders explicit safe diagnostic fields", async ()
     clientId: "test.apps.googleusercontent.com",
     clientSecret: "secret-not-for-output",
   };
-  config.accounts = [{ alias: "personal", email: "person@example.com", provider: "google" }];
+  const statusByAlias = {
+    ready: "ok",
+    new: "not_authorized",
+    corrupt: "invalid_credential",
+    stale: "reauthorization_required",
+    scopes: "insufficient_scopes",
+    wrong: "identity_mismatch",
+    offline: "provider_unavailable",
+    client: "configuration_error",
+  };
+  config.accounts = Object.keys(statusByAlias).map((alias) => ({
+    alias,
+    email: `${alias}@example.com`,
+    provider: "google",
+  }));
   const credentialStore = new MemoryCredentialStore({ sentinel: "unchanged" });
   const output = [];
   let diagnosticCalls = 0;
 
   try {
     await saveConfig(config, configPath);
-    await run(["doctor", "personal"], {
+    await run(["doctor"], {
       configPath,
       credentialStore,
       output: (line) => output.push(line),
@@ -354,30 +558,204 @@ test("doctor is read-only and renders explicit safe diagnostic fields", async ()
         async diagnose(account) {
           diagnosticCalls += 1;
           return {
-            alias: account.alias,
-            provider: account.provider,
+            secret: "diagnostic-secret-must-not-be-printed",
             credential_present: true,
-            token_valid: true,
-            identity_verified: true,
-            scopes_valid: true,
-            status: "ok",
+            token_valid: account.alias === "ready" ? true : null,
+            identity_verified: account.alias === "ready" ? true : null,
+            scopes_valid: account.alias === "ready" ? true : null,
+            status: statusByAlias[account.alias],
           };
         },
       }),
     });
 
-    assert.equal(diagnosticCalls, 1);
+    assert.equal(diagnosticCalls, Object.keys(statusByAlias).length);
     assert.equal(await credentialStore.get("sentinel"), "unchanged");
+    assert.equal(
+      output[0],
+      "ALIAS\tPROVIDER\tSTATUS\tCREDENTIAL\tTOKEN\tIDENTITY\tSCOPES\tNEXT STEP",
+    );
+    const rendered = output.join("\n");
+    assert.match(rendered, /ready\tgoogle\tok\tyes\tyes\tyes\tyes\tnone \(ready\)/);
+    for (const alias of ["new", "corrupt", "stale", "scopes", "wrong"]) {
+      assert.match(rendered, new RegExp(`${alias}\\tgoogle\\t${statusByAlias[alias]}.*multi-email auth ${alias}`));
+    }
+    assert.match(
+      rendered,
+      /offline\tgoogle\tprovider_unavailable.*multi-email doctor offline/,
+    );
+    assert.match(
+      rendered,
+      /client\tgoogle\tconfiguration_error.*multi-email init --google-client-json <desktop-oauth\.json>/,
+    );
+    assert.doesNotMatch(rendered, /secret-not-for-output/);
+    assert.doesNotMatch(rendered, /diagnostic-secret-must-not-be-printed/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor --json emits stable allowlisted JSON Lines and redacts provider details", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-doctor-json-test-"));
+  const configPath = path.join(directory, "config.json");
+  const config = emptyConfig();
+  config.providers.google = {
+    clientId: "test.apps.googleusercontent.com",
+    clientSecret: "json-secret-not-for-output",
+  };
+  config.accounts = [
+    { alias: "personal", email: "person@example.com", provider: "google" },
+    { alias: "work", email: "work@example.com", provider: "google" },
+  ];
+  const output = [];
+  const credentialStore = new MemoryCredentialStore({ sentinel: "unchanged" });
+
+  try {
+    await saveConfig(config, configPath);
+    await run(["doctor", "--json"], {
+      configPath,
+      credentialStore,
+      output: (line) => output.push(line),
+      providerFactory: async () => ({
+        async diagnose(account) {
+          if (account.alias === "work") {
+            const error = new Error("provider-token-must-not-be-printed");
+            error.code = "unsafe provider token";
+            throw error;
+          }
+          return {
+            alias: "spoofed-alias",
+            provider: "spoofed-provider",
+            expected_email: "spoofed@example.com",
+            credential_present: true,
+            token_valid: false,
+            identity_verified: null,
+            scopes_valid: null,
+            credential_source: "legacy",
+            legacy_migration_pending: true,
+            status: "reauthorization_required",
+            error_code: "REAUTHENTICATION_REQUIRED",
+            access_token: "provider-token-must-not-be-printed",
+          };
+        },
+      }),
+    });
+
+    assert.equal(output.length, 2);
     assert.deepEqual(JSON.parse(output[0]), {
+      type: "account",
       alias: "personal",
       provider: "google",
+      expected_email: "person@example.com",
       credential_present: true,
-      token_valid: true,
-      identity_verified: true,
-      scopes_valid: true,
-      status: "ok",
+      token_valid: false,
+      identity_verified: null,
+      scopes_valid: null,
+      credential_source: "legacy",
+      legacy_migration_pending: true,
+      status: "reauthorization_required",
+      error_code: "REAUTHENTICATION_REQUIRED",
+      next_step:
+        "multi-email auth personal (or node ./scripts/multi-email auth personal from a Git clone)",
     });
-    assert.doesNotMatch(output.join("\n"), /secret-not-for-output/);
+    assert.deepEqual(JSON.parse(output[1]), {
+      type: "account",
+      alias: "work",
+      provider: "google",
+      expected_email: "work@example.com",
+      credential_present: null,
+      token_valid: null,
+      identity_verified: null,
+      scopes_valid: null,
+      credential_source: null,
+      legacy_migration_pending: false,
+      status: "provider_unavailable",
+      error_code: "PROVIDER_DIAGNOSIS_FAILED",
+      next_step:
+        "multi-email doctor work (or node ./scripts/multi-email doctor work from a Git clone)",
+    });
+    assert.equal(await credentialStore.get("sentinel"), "unchanged");
+    assert.doesNotMatch(output.join("\n"), /json-secret-not-for-output/);
+    assert.doesNotMatch(output.join("\n"), /provider-token-must-not-be-printed/);
+    assert.doesNotMatch(output.join("\n"), /spoofed/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor reports missing config, empty accounts, and unconfigured providers without auth", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-doctor-state-test-"));
+  const missingPath = path.join(directory, "missing.json");
+  const emptyPath = path.join(directory, "empty.json");
+  const unconfiguredPath = path.join(directory, "unconfigured.json");
+  let providerCalls = 0;
+  const dependencies = (configPath, output) => ({
+    configPath,
+    output: (line) => output.push(line),
+    credentialStore: {
+      async get() {
+        throw new Error("state-only doctor must not read credentials");
+      },
+    },
+    providerFactory: async () => {
+      providerCalls += 1;
+      throw new Error("state-only doctor must not instantiate providers");
+    },
+  });
+
+  try {
+    const missingOutput = [];
+    await run(["doctor", "--json"], dependencies(missingPath, missingOutput));
+    assert.deepEqual(JSON.parse(missingOutput[0]), {
+      type: "summary",
+      alias: null,
+      provider: null,
+      expected_email: null,
+      credential_present: null,
+      token_valid: null,
+      identity_verified: null,
+      scopes_valid: null,
+      credential_source: null,
+      legacy_migration_pending: false,
+      status: "not_configured",
+      error_code: null,
+      next_step:
+        "multi-email setup (or node ./scripts/multi-email setup from a Git clone)",
+    });
+
+    const noAccountsConfig = emptyConfig();
+    noAccountsConfig.providers.microsoft = {
+      clientId: "11111111-2222-3333-4444-555555555555",
+      tenant: "organizations",
+    };
+    await saveConfig(noAccountsConfig, emptyPath);
+    const emptyOutput = [];
+    await run(["doctor"], dependencies(emptyPath, emptyOutput));
+    assert.match(emptyOutput.join("\n"), /no_accounts/);
+    assert.match(
+      emptyOutput.join("\n"),
+      /multi-email add-account <alias> <email> microsoft/,
+    );
+    assert.match(
+      emptyOutput.join("\n"),
+      /or node \.\/scripts\/multi-email add-account <alias> <email> microsoft from a Git clone/,
+    );
+
+    const unconfigured = emptyConfig();
+    unconfigured.accounts = [
+      { alias: "m365", email: "person@example.com", provider: "microsoft" },
+    ];
+    await saveConfig(unconfigured, unconfiguredPath);
+    const unconfiguredOutput = [];
+    await run(["doctor", "m365", "--json"], dependencies(unconfiguredPath, unconfiguredOutput));
+    const record = JSON.parse(unconfiguredOutput[0]);
+    assert.equal(record.status, "configuration_error");
+    assert.equal(record.error_code, "MICROSOFT_CLIENT_NOT_CONFIGURED");
+    assert.equal(
+      record.next_step,
+      "multi-email set-microsoft-client <application-guid> (or node ./scripts/multi-email set-microsoft-client <application-guid> from a Git clone)",
+    );
+    assert.equal(providerCalls, 0);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

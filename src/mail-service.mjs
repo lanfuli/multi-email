@@ -12,6 +12,77 @@ import {
 } from "./send-approval.mjs";
 
 const MAX_BODY_BYTES = 1024 * 1024;
+const PUBLIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
+const PRE_SEND_TRANSPORT_CODES = new Set([
+  "ABORT_ERR",
+  "AbortError",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ESOCKETTIMEDOUT",
+  "GOOGLE_NETWORK_ERROR",
+  "GOOGLE_REQUEST_TIMEOUT",
+  "MICROSOFT_NETWORK_ERROR",
+  "MICROSOFT_REQUEST_ABORTED",
+  "MICROSOFT_TIMEOUT",
+  "OPERATION_DEADLINE_EXCEEDED",
+  "TimeoutError",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+]);
+
+function safePublicErrorCode(value, fallback = "PROVIDER_ERROR") {
+  const code = typeof value === "string" ? value.trim() : "";
+  return PUBLIC_ERROR_CODE.test(code) ? code : fallback;
+}
+
+function diagnosticErrorFallback(provider) {
+  if (provider === "google") return "GOOGLE_PROFILE_FAILED";
+  if (provider === "microsoft") return "MICROSOFT_PROFILE_FAILED";
+  return "PROVIDER_DIAGNOSIS_FAILED";
+}
+
+function sanitizeDiagnostic(account, diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object") {
+    throw new MultiEmailError(
+      "The provider returned an invalid diagnostic result.",
+      "INVALID_PROVIDER_RESPONSE",
+    );
+  }
+  if (!Object.hasOwn(diagnostic, "error_code") || diagnostic.error_code === null) {
+    return diagnostic;
+  }
+  return {
+    ...diagnostic,
+    error_code: safePublicErrorCode(
+      diagnostic.error_code,
+      diagnosticErrorFallback(account.provider),
+    ),
+  };
+}
+
+function isKnownPreSendTransportFailure(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    if (
+      PRE_SEND_TRANSPORT_CODES.has(String(current.code || "")) ||
+      PRE_SEND_TRANSPORT_CODES.has(String(current.name || ""))
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
 
 function boundedSafety(config) {
   const configured = config.safety || {};
@@ -300,7 +371,7 @@ export class MailService {
             "UNSUPPORTED_OPERATION",
           );
         }
-        return provider.diagnose(account);
+        return sanitizeDiagnostic(account, await provider.diagnose(account));
       }),
     );
   }
@@ -547,6 +618,13 @@ export class MailService {
       } catch {
         // Preserve the provider/review failure that caused this approval to be spent.
       }
+      if (isKnownPreSendTransportFailure(error)) {
+        throw new MultiEmailError(
+          "The approved draft could not be rechecked before sending. Nothing was sent.",
+          "SEND_VERIFICATION_FAILED",
+          { account: account.alias, draftId: normalizedDraftId },
+        );
+      }
       throw error;
     }
     this.approvals.consumeApproved(requestId, canonical);
@@ -557,8 +635,8 @@ export class MailService {
         throw error;
       }
       console.error(
-        `[multi-email] send outcome unknown for ${account.alias}/${normalizedDraftId}: ` +
-          String(error?.code || error?.name || "provider_error"),
+        `[multi-email] send outcome unknown for ${account.alias}: ` +
+          safePublicErrorCode(error?.code || error?.name),
       );
       throw new MultiEmailError(
         "The send request did not complete cleanly, so delivery status is unknown. Do not retry automatically; check Sent first.",
