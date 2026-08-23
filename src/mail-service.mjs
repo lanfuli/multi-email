@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  diagnosticRecord,
+  unexpectedDiagnosticRecord,
+} from "./connection-diagnostic.mjs";
 import { GmailProvider } from "./providers/gmail.mjs";
 import { MicrosoftProvider } from "./providers/microsoft.mjs";
 import { findAccount } from "./config.mjs";
@@ -41,31 +45,6 @@ const PRE_SEND_TRANSPORT_CODES = new Set([
 function safePublicErrorCode(value, fallback = "PROVIDER_ERROR") {
   const code = typeof value === "string" ? value.trim() : "";
   return PUBLIC_ERROR_CODE.test(code) ? code : fallback;
-}
-
-function diagnosticErrorFallback(provider) {
-  if (provider === "google") return "GOOGLE_PROFILE_FAILED";
-  if (provider === "microsoft") return "MICROSOFT_PROFILE_FAILED";
-  return "PROVIDER_DIAGNOSIS_FAILED";
-}
-
-function sanitizeDiagnostic(account, diagnostic) {
-  if (!diagnostic || typeof diagnostic !== "object") {
-    throw new MultiEmailError(
-      "The provider returned an invalid diagnostic result.",
-      "INVALID_PROVIDER_RESPONSE",
-    );
-  }
-  if (!Object.hasOwn(diagnostic, "error_code") || diagnostic.error_code === null) {
-    return diagnostic;
-  }
-  return {
-    ...diagnostic,
-    error_code: safePublicErrorCode(
-      diagnostic.error_code,
-      diagnosticErrorFallback(account.provider),
-    ),
-  };
 }
 
 function isKnownPreSendTransportFailure(error) {
@@ -364,14 +343,18 @@ export class MailService {
     const accounts = alias === undefined ? this.config.accounts : [this.account(alias)];
     return Promise.all(
       accounts.map(async (account) => {
-        const provider = this.provider(account);
-        if (typeof provider.diagnose !== "function") {
-          throw new MultiEmailError(
-            `Diagnostics are not supported for provider '${account.provider}'.`,
-            "UNSUPPORTED_OPERATION",
-          );
+        try {
+          const provider = this.provider(account);
+          if (typeof provider.diagnose !== "function") {
+            throw new MultiEmailError(
+              `Diagnostics are not supported for provider '${account.provider}'.`,
+              "UNSUPPORTED_OPERATION",
+            );
+          }
+          return diagnosticRecord(account, await provider.diagnose(account));
+        } catch (error) {
+          return unexpectedDiagnosticRecord(account, error);
         }
-        return sanitizeDiagnostic(account, await provider.diagnose(account));
       }),
     );
   }

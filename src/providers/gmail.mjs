@@ -1,12 +1,13 @@
 import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
-import { spawn } from "node:child_process";
 import { auth as googleAuth, gmail as createGmailClient } from "@googleapis/gmail";
 import { decodeWords } from "postal-mime";
 import { GOOGLE_SCOPES, HARD_SAFETY_LIMITS } from "../constants.mjs";
+import { replaceCredentialVerified } from "../credential-transaction.mjs";
 import { MultiEmailError } from "../errors.mjs";
 import { credentialAccountKey, legacyCredentialAccountKey } from "../keychain.mjs";
 import { operationRequestBudget } from "../operation-deadline.mjs";
+import { openOAuthBrowser } from "../oauth-browser.mjs";
 import {
   buildRawMessage,
   extractGmailBody,
@@ -59,6 +60,19 @@ const GOOGLE_NETWORK_CODES = new Set([
   "EAI_AGAIN",
 ]);
 const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
+const GOOGLE_REAUTH_ERROR_CODES = new Set(["invalid_grant"]);
+const GOOGLE_TRANSIENT_OAUTH_ERROR_CODES = new Set([
+  "rate_limit_exceeded",
+  "server_error",
+  "temporarily_unavailable",
+]);
+const GOOGLE_POLICY_ERROR_CODES = new Set([
+  "access_blocked",
+  "admin_policy_enforced",
+  "disallowed_useragent",
+  "org_internal",
+  "restricted_client",
+]);
 const UNSUPPORTED_MATERIAL_HEADERS = new Set([
   "apparently-to",
   "bounces-to",
@@ -503,6 +517,17 @@ function hasRequiredScopes(scopes) {
   return normalizedScopes(scopes).has(REQUIRED_GMAIL_SCOPE);
 }
 
+function assertGoogleTokenAudience(provider, tokenInfo) {
+  const expectedClientId = String(provider?.clientId || "").trim();
+  const tokenAudience = String(tokenInfo?.aud || "").trim();
+  if (!expectedClientId || tokenAudience !== expectedClientId) {
+    throw new MultiEmailError(
+      "The Google credential was not issued to the configured OAuth client. Reauthorize this alias with the configured Google Desktop client. No credential was changed.",
+      "GOOGLE_OAUTH_CLIENT_MISMATCH",
+    );
+  }
+}
+
 function assertProfileMatches(account, profile) {
   const actualEmail = String(profile?.data?.emailAddress || profile?.emailAddress || "")
     .trim()
@@ -514,20 +539,6 @@ function assertProfileMatches(account, profile) {
     );
   }
   return actualEmail;
-}
-
-function openBrowser(url) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/open", [url], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
 }
 
 function escapeHtml(value) {
@@ -653,6 +664,138 @@ function isGoogleResponseTooLarge(error) {
     current = current.cause || current.error;
   }
   return false;
+}
+
+function errorChain(error) {
+  const values = [];
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 6 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    values.push(current);
+    current = current.cause || current.error;
+  }
+  return values;
+}
+
+function googleOAuthErrorCodes(error) {
+  const codes = new Set();
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    const normalized = value.trim().toLowerCase();
+    if (/^[a-z0-9_.-]{1,80}$/u.test(normalized)) codes.add(normalized);
+  };
+  for (const current of errorChain(error)) {
+    add(current.code);
+    add(current.errorCode);
+    add(current.response?.data?.error);
+    add(current.response?.data?.error?.code);
+  }
+  return codes;
+}
+
+function hasGoogleOAuthError(error, allowed) {
+  return [...googleOAuthErrorCodes(error)].some((code) => allowed.has(code));
+}
+
+function googleProviderUnavailable(error) {
+  if (
+    hasGoogleOAuthError(error, GOOGLE_TRANSIENT_OAUTH_ERROR_CODES) ||
+    isGoogleRequestTimeout(error) ||
+    isGoogleNetworkError(error) ||
+    isGoogleRedirectError(error) ||
+    isGoogleResponseTooLarge(error)
+  ) {
+    return true;
+  }
+  return errorChain(error).some((current) => {
+    const status = current.response?.status ?? current.response?.statusCode;
+    return status === 408 || status === 429 || (Number.isInteger(status) && status >= 500);
+  });
+}
+
+function classifyGoogleAuthorizationError(error) {
+  if (error instanceof MultiEmailError) return error;
+  if (hasGoogleOAuthError(error, GOOGLE_REAUTH_ERROR_CODES)) {
+    return new MultiEmailError(
+      "Google rejected the authorization grant. Start a fresh authorization for this alias.",
+      "REAUTHENTICATION_REQUIRED",
+    );
+  }
+  if (hasGoogleOAuthError(error, GOOGLE_POLICY_ERROR_CODES)) {
+    return new MultiEmailError(
+      "Google policy blocked this OAuth application or account. Browser changes will not bypass the policy.",
+      "OAUTH_PROVIDER_POLICY_BLOCKED",
+    );
+  }
+  if (googleProviderUnavailable(error)) {
+    return new MultiEmailError(
+      "Google OAuth is temporarily unavailable. The existing credential was preserved.",
+      "GOOGLE_OAUTH_UNAVAILABLE",
+    );
+  }
+  if (error instanceof TypeError) {
+    return new MultiEmailError(
+      "The local Google OAuth runtime failed before authorization completed. Reinstall or run self-test; do not reauthorize yet.",
+      "OAUTH_RUNTIME_ERROR",
+    );
+  }
+  return new MultiEmailError(
+    "Google OAuth could not be completed. The existing credential was preserved.",
+    "GOOGLE_OAUTH_FAILED",
+  );
+}
+
+function googleDiagnosticFailure(error) {
+  if (error?.code === "INVALID_CREDENTIAL") {
+    return { status: "invalid_credential", errorCode: "INVALID_CREDENTIAL", tokenValid: false };
+  }
+  if (error?.code === "GOOGLE_OAUTH_CLIENT_MISMATCH") {
+    return {
+      status: "reauthorization_required",
+      errorCode: "GOOGLE_OAUTH_CLIENT_MISMATCH",
+      tokenValid: false,
+    };
+  }
+  if (
+    error?.code === "REAUTHENTICATION_REQUIRED" ||
+    hasGoogleOAuthError(error, GOOGLE_REAUTH_ERROR_CODES)
+  ) {
+    return {
+      status: "reauthorization_required",
+      errorCode: "REAUTHENTICATION_REQUIRED",
+      tokenValid: false,
+    };
+  }
+  if (
+    error?.code === "OAUTH_PROVIDER_POLICY_BLOCKED" ||
+    hasGoogleOAuthError(error, GOOGLE_POLICY_ERROR_CODES)
+  ) {
+    return {
+      status: "provider_policy_blocked",
+      errorCode: "OAUTH_PROVIDER_POLICY_BLOCKED",
+      tokenValid: null,
+    };
+  }
+  if (
+    error?.code === "OAUTH_RUNTIME_ERROR" ||
+    error?.code === "KEYCHAIN_READ_FAILED" ||
+    error instanceof TypeError
+  ) {
+    return {
+      status: "runtime_error",
+      errorCode: safeDiagnosticErrorCode(error?.code, "OAUTH_RUNTIME_ERROR"),
+      tokenValid: null,
+    };
+  }
+  if (googleProviderUnavailable(error) || error instanceof MultiEmailError) {
+    return {
+      status: "provider_unavailable",
+      errorCode: safeDiagnosticErrorCode(error?.code, "GOOGLE_PROVIDER_UNAVAILABLE"),
+      tokenValid: null,
+    };
+  }
+  return { status: "runtime_error", errorCode: "OAUTH_RUNTIME_ERROR", tokenValid: null };
 }
 
 async function abandonGoogleResponse(error) {
@@ -795,7 +938,7 @@ function createGoogleOAuthClient(provider, redirectUri) {
 }
 
 export class GmailProvider {
-  constructor({ config, credentialStore, browserOpener = openBrowser }) {
+  constructor({ config, credentialStore, browserOpener = openOAuthBrowser }) {
     this.config = config;
     this.credentialStore = credentialStore;
     this.browserOpener = browserOpener;
@@ -828,10 +971,14 @@ export class GmailProvider {
     return legacy === null ? null : { key, legacyKey, raw: legacy, source: "legacy" };
   }
 
-  async authorize(account, { onInstruction = console.log, timeoutMs = 5 * 60_000 } = {}) {
+  async authorize(
+    account,
+    { browser = "default", onInstruction = console.log, timeoutMs = 5 * 60_000 } = {},
+  ) {
     const provider = this.providerConfig();
     const state = randomBytes(32).toString("base64url");
     let settle;
+    let callbackResponse;
     const callback = new Promise((resolve, reject) => {
       settle = { resolve, reject };
     });
@@ -854,20 +1001,42 @@ export class GmailProvider {
           const safeOauthError = /^[a-z0-9_.-]{1,80}$/i.test(oauthError || "")
             ? oauthError
             : undefined;
-          htmlResponse(res, 400, "Google did not return an authorization code.");
+          const policyBlocked = safeOauthError
+            ? GOOGLE_POLICY_ERROR_CODES.has(safeOauthError.toLowerCase())
+            : false;
+          const providerUnavailable = safeOauthError
+            ? GOOGLE_TRANSIENT_OAUTH_ERROR_CODES.has(safeOauthError.toLowerCase())
+            : false;
+          htmlResponse(
+            res,
+            400,
+            policyBlocked
+              ? "Google policy blocked this authorization. Return to the terminal for the safe next step."
+              : providerUnavailable
+                ? "Google OAuth is temporarily unavailable. Return to the terminal and retry later."
+                : "Google did not return an authorization code.",
+          );
           settle.reject(
             new MultiEmailError(
-              `Google OAuth was not completed${safeOauthError ? `: ${safeOauthError}` : "."}`,
-              "OAUTH_DENIED",
+              policyBlocked
+                ? "Google policy blocked this OAuth application or account. Browser changes will not bypass the policy."
+                : providerUnavailable
+                  ? "Google OAuth is temporarily unavailable. The existing credential was not changed."
+                  : `Google OAuth was not completed${safeOauthError ? `: ${safeOauthError}` : "."}`,
+              policyBlocked
+                ? "OAUTH_PROVIDER_POLICY_BLOCKED"
+                : providerUnavailable
+                  ? "GOOGLE_OAUTH_UNAVAILABLE"
+                  : "OAUTH_DENIED",
             ),
           );
           return;
         }
-        htmlResponse(
-          res,
-          200,
-          "Authorization code received. Return to the terminal while identity and scope checks finish.",
-        );
+        if (callbackResponse) {
+          htmlResponse(res, 409, "An authorization response is already being verified.");
+          return;
+        }
+        callbackResponse = res;
         settle.resolve(code);
       } catch (error) {
         settle.reject(error);
@@ -879,18 +1048,22 @@ export class GmailProvider {
       const port = await listen(server);
       const redirectUri = `http://127.0.0.1:${port}/oauth/google/callback`;
       const oauth = createGoogleOAuthClient(provider, redirectUri);
+      const { codeVerifier, codeChallenge } = await oauth.generateCodeVerifierAsync();
       const authorizationUrl = oauth.generateAuthUrl({
         access_type: "offline",
-        prompt: "consent",
-        include_granted_scopes: true,
+        prompt: "select_account consent",
         scope: GOOGLE_SCOPES,
         state,
         login_hint: account.email,
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
       });
 
-      onInstruction(`Opening Google authorization for ${account.alias} (${account.email})...`);
+      onInstruction(
+        `Opening Google authorization in ${browser} for ${account.alias} (${account.email})...`,
+      );
       try {
-        await this.browserOpener(authorizationUrl);
+        await this.browserOpener(authorizationUrl, browser);
       } catch {
         throw new MultiEmailError(
           "Unable to open the Google authorization page. No OAuth URL was printed; check browser permissions and try again.",
@@ -907,7 +1080,7 @@ export class GmailProvider {
           );
         }),
       ]);
-      const exchange = await oauth.getToken(code);
+      const exchange = await oauth.getToken({ code, codeVerifier });
       let tokens = exchange.tokens;
       if (!tokens.refresh_token) {
         throw new MultiEmailError(
@@ -919,21 +1092,48 @@ export class GmailProvider {
       const preparedTokens = await prepareGoogleApiCredentials(oauth);
       tokens = { ...tokens, ...preparedTokens };
       oauth.setCredentials(tokens);
+      const tokenInfo = await oauth.getTokenInfo(tokens.access_token);
+      assertGoogleTokenAudience(provider, tokenInfo);
+      if (!hasRequiredScopes(tokenInfo?.scopes)) {
+        throw new MultiEmailError(
+          "Google did not grant the required Gmail modify scope. Nothing was saved.",
+          "INSUFFICIENT_SCOPES",
+        );
+      }
       const gmail = createGmailClient({ version: "v1", auth: oauth });
       const profile = await gmail.users.getProfile(
         { userId: "me" },
         googleRequestOptions(),
       );
       const actualEmail = assertProfileMatches(account, profile);
-      if (tokens.scope && !hasRequiredScopes(tokens.scope)) {
-        throw new MultiEmailError(
-          "Google did not grant the required Gmail modify scope. Nothing was saved.",
-          "INSUFFICIENT_SCOPES",
+      const serialized = JSON.stringify(tokens);
+      await replaceCredentialVerified(
+        this.credentialStore,
+        credentialKey(this.config, account),
+        serialized,
+      );
+      this.verifiedAliases.add(account.alias);
+      if (callbackResponse && !callbackResponse.writableEnded && !callbackResponse.destroyed) {
+        htmlResponse(
+          callbackResponse,
+          200,
+          `Authorization complete. '${account.alias}' was verified as ${actualEmail}, required scopes were granted, and the credential was stored in macOS Keychain.`,
         );
       }
-      await this.credentialStore.set(credentialKey(this.config, account), JSON.stringify(tokens));
-      this.verifiedAliases.add(account.alias);
       return { alias: account.alias, email: actualEmail, provider: "google" };
+    } catch (error) {
+      if (callbackResponse && !callbackResponse.writableEnded && !callbackResponse.destroyed) {
+        try {
+          htmlResponse(
+            callbackResponse,
+            500,
+            "Authorization could not be fully verified. Return to the terminal and inspect doctor before retrying.",
+          );
+        } catch {
+          // Preserve the classified OAuth failure when the browser disconnected.
+        }
+      }
+      throw classifyGoogleAuthorizationError(error);
     } finally {
       clearTimeout(timer);
       await closeHttpServer(server);
@@ -1025,7 +1225,7 @@ export class GmailProvider {
     };
 
     try {
-      this.providerConfig();
+      const provider = this.providerConfig();
       const record = await this.credentialRecord(account);
       if (!record) return diagnostic;
       diagnostic.credential_present = true;
@@ -1036,9 +1236,10 @@ export class GmailProvider {
       try {
         session = await this.oauthSession(account, { persistUpdates: false });
       } catch (error) {
-        diagnostic.token_valid = false;
-        diagnostic.status = "invalid_credential";
-        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "INVALID_CREDENTIAL");
+        const failure = googleDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
 
@@ -1049,16 +1250,13 @@ export class GmailProvider {
         accessToken = typeof access === "string" ? access : access?.token;
         if (!accessToken) throw new Error("missing access token");
         tokenInfo = await session.oauth.getTokenInfo(accessToken);
+        assertGoogleTokenAudience(provider, tokenInfo);
         diagnostic.token_valid = true;
       } catch (error) {
-        if (error?.code === "GOOGLE_REQUEST_TIMEOUT") {
-          diagnostic.status = "provider_unavailable";
-          diagnostic.error_code = "GOOGLE_REQUEST_TIMEOUT";
-          return diagnostic;
-        }
-        diagnostic.token_valid = false;
-        diagnostic.status = "reauthorization_required";
-        diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
+        const failure = googleDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
 
@@ -1080,17 +1278,32 @@ export class GmailProvider {
         diagnostic.status = "ok";
       } catch (error) {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
-        diagnostic.status =
-          diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "GOOGLE_PROFILE_FAILED");
+        if (diagnostic.identity_verified === false) {
+          diagnostic.status = "identity_mismatch";
+          diagnostic.error_code = "ACCOUNT_MISMATCH";
+        } else {
+          const failure = googleDiagnosticFailure(error);
+          diagnostic.status = failure.status;
+          diagnostic.error_code =
+            failure.status === "provider_unavailable"
+              ? safeDiagnosticErrorCode(error?.code, "GOOGLE_PROFILE_FAILED")
+              : failure.errorCode;
+        }
       }
       return diagnostic;
     } catch (error) {
-      diagnostic.status = "configuration_error";
-      diagnostic.error_code = safeDiagnosticErrorCode(
-        error?.code,
-        "GOOGLE_CLIENT_NOT_CONFIGURED",
-      );
+      if (["GOOGLE_CLIENT_NOT_CONFIGURED", "INVALID_CONFIG"].includes(error?.code)) {
+        diagnostic.status = "configuration_error";
+        diagnostic.error_code = safeDiagnosticErrorCode(
+          error?.code,
+          "GOOGLE_CLIENT_NOT_CONFIGURED",
+        );
+      } else {
+        const failure = googleDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
+      }
       return diagnostic;
     }
   }

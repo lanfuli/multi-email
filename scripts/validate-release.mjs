@@ -3,11 +3,14 @@
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { APP_VERSION } from "../src/constants.mjs";
 import {
   artifactFiles,
+  assertVersionContract,
   buildInputFiles,
   digestFile,
   digestFiles,
+  validateAssistedOnboardingSurface,
 } from "./release-integrity.mjs";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,10 +20,10 @@ const packageJson = await readJson("package.json");
 const plugin = await readJson(".codex-plugin/plugin.json");
 const marketplace = await readJson(".agents/plugins/marketplace.json");
 const build = await readJson("dist/build-manifest.json");
+const distPackage = await readJson("dist/package.json");
 const skill = await readFile(path.join(pluginRoot, "skills/multi-email/SKILL.md"), "utf8");
 const readme = await readFile(path.join(pluginRoot, "README.md"), "utf8");
 const changelog = await readFile(path.join(pluginRoot, "CHANGELOG.md"), "utf8");
-const constants = await readFile(path.join(pluginRoot, "src/constants.mjs"), "utf8");
 const googleOAuthGuide = await readFile(path.join(pluginRoot, "docs/google-oauth.md"), "utf8");
 const microsoftEntraGuide = await readFile(
   path.join(pluginRoot, "docs/microsoft-entra.md"),
@@ -43,6 +46,18 @@ const publishedInstructions = (
     instructionFiles.map((relative) => readFile(path.join(pluginRoot, relative), "utf8")),
   )
 ).join("\n");
+
+await validateAssistedOnboardingSurface(pluginRoot, { label: "Release tree" });
+assertVersionContract(
+  {
+    packageVersion: packageJson.version,
+    pluginVersion: plugin.version,
+    skillSource: skill,
+    runtimeVersion: APP_VERSION,
+    buildVersion: build.appVersion,
+  },
+  { label: "Release tree" },
+);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -69,7 +84,6 @@ assert(
 );
 
 assert(plugin.name === "multi-email", "Unexpected Codex plugin name.");
-assert(plugin.version === packageJson.version, "Plugin and package versions differ.");
 assert(plugin.author?.name === "Vincent_Lan", "Plugin author is incorrect.");
 assert(plugin.license === "MIT", "Plugin manifest must declare MIT.");
 assert(plugin.mcpServers === "./.mcp.json", "Plugin MCP manifest path is incorrect.");
@@ -78,10 +92,6 @@ assert(
   plugin.interface?.composerIcon === "./assets/plugin-icon.png" &&
     plugin.interface?.logo === "./assets/plugin-icon.png",
   "Plugin icon metadata is incomplete.",
-);
-assert(
-  constants.includes(`APP_VERSION = "${packageJson.version}"`),
-  "Runtime and package versions differ.",
 );
 assert(
   readme.includes(`Release status: \`${packageJson.version}\``),
@@ -99,12 +109,22 @@ assert(
 );
 assert(
   readme.includes("does not place the setup CLI on your shell `PATH`") &&
-    skill.includes("do not assume a marketplace install placed the setup CLI on `PATH`"),
+    /do not assume a marketplace install placed the setup CLI on `PATH`/i.test(skill),
   "Marketplace setup guidance incorrectly assumes that the CLI binary is installed.",
 );
 assert(
   readme.includes("docs/google-oauth.md") && readme.includes("docs/microsoft-entra.md"),
   "README does not link both provider OAuth guides.",
+);
+assert(
+  readme.includes("Developer Preview") &&
+    readme.includes("no shared Google OAuth client") &&
+    readme.includes("One Multi Email config has one Google OAuth client") &&
+    readme.includes("expire seven days after consent") &&
+    readme.includes("--google-client-json") &&
+    readme.includes("--confirm") &&
+    readme.includes("--force"),
+  "README no longer preserves the BYO Google OAuth release and migration warnings.",
 );
 assert(
   googleOAuthGuide.includes("https://developers.google.com/workspace/gmail/api/auth/scopes") &&
@@ -115,7 +135,10 @@ assert(
   googleOAuthGuide.includes("**Desktop app**") &&
     googleOAuthGuide.includes("`openid`") &&
     googleOAuthGuide.includes("`email`") &&
-    googleOAuthGuide.includes("`https://www.googleapis.com/auth/gmail.modify`"),
+    googleOAuthGuide.includes("`https://www.googleapis.com/auth/gmail.modify`") &&
+    googleOAuthGuide.includes("expire seven days after consent") &&
+    googleOAuthGuide.includes("--confirm") &&
+    googleOAuthGuide.includes("--force"),
   "Google OAuth guide no longer preserves the supported desktop client and exact scopes.",
 );
 assert(
@@ -154,12 +177,16 @@ assert(
 assert(/^---\nname: multi-email\n/.test(skill), "Skill frontmatter is invalid.");
 assert(
   skill.includes("server-enforced localhost review window") ||
-    skill.includes("server opens a `127.0.0.1` review window"),
+    skill.includes("server opens a `127.0.0.1` review window") ||
+    skill.includes("server's separate localhost review and approval"),
   "Skill lacks the out-of-band send requirement.",
 );
 
 assert(build.entry === "server.cjs", "Unexpected bundled entry.");
-assert(build.appVersion === packageJson.version, "Bundled app version is stale.");
+assert(
+  distPackage.type === "commonjs" && Object.keys(distPackage).length === 1,
+  "dist must define a CommonJS package boundary for ncc dynamic chunks.",
+);
 assert(build.ncc === packageJson.devDependencies?.["@vercel/ncc"], "ncc versions differ.");
 assert(build.keyring === packageJson.dependencies?.["@napi-rs/keyring"], "Keyring versions differ.");
 assert(
@@ -198,6 +225,7 @@ for (const relative of [
   "assets/plugin-icon.png",
   ".mcp.json",
   ".codex-plugin/plugin.json",
+  "dist/package.json",
   "dist/server.cjs",
   "dist/keyring.darwin-arm64.node",
   "dist/keyring.darwin-x64.node",

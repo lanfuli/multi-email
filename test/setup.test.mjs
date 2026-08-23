@@ -174,6 +174,115 @@ test("init requires a provider option and reports preserved provider configurati
   }
 });
 
+test("init requires explicit confirmation before replacing a Google OAuth client", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-google-client-replace-"));
+  const sameClientPath = path.join(directory, "same-client.json");
+  const replacementClientPath = path.join(directory, "replacement-client.json");
+  const configPath = path.join(directory, "config.json");
+  const existingClientId = "existing-client.apps.googleusercontent.com";
+  const replacementClientId = "replacement-client.apps.googleusercontent.com";
+  const microsoft = {
+    clientId: "11111111-2222-3333-4444-555555555555",
+    tenant: "organizations",
+  };
+  const config = emptyConfig();
+  config.providers.google = {
+    clientId: existingClientId,
+    clientSecret: "existing-secret-must-not-be-printed",
+  };
+  config.providers.microsoft = { ...microsoft };
+  config.accounts = [
+    { alias: "personal", email: "personal@example.com", provider: "google" },
+    { alias: "sales", email: "sales@example.com", provider: "google" },
+    { alias: "work", email: "work@example.com", provider: "microsoft" },
+  ];
+
+  try {
+    await saveConfig(config, configPath);
+    await writeFile(
+      sameClientPath,
+      JSON.stringify({
+        installed: {
+          client_id: `  ${existingClientId}  `,
+          client_secret: "rotated-secret-for-the-same-client",
+        },
+      }),
+    );
+    await writeFile(
+      replacementClientPath,
+      JSON.stringify({
+        installed: {
+          client_id: replacementClientId,
+          client_secret: "replacement-secret-must-not-be-printed",
+        },
+      }),
+    );
+
+    // Re-importing the same normalized client is safe and does not require confirmation.
+    await run(["init", "--google-client-json", sameClientPath], {
+      configPath,
+      output: () => {},
+    });
+    const afterSameClient = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(afterSameClient.providers.google.clientId, existingClientId);
+    assert.equal(
+      afterSameClient.providers.google.clientSecret,
+      "rotated-secret-for-the-same-client",
+    );
+    assert.deepEqual(afterSameClient.providers.microsoft, microsoft);
+    assert.deepEqual(afterSameClient.accounts, config.accounts);
+
+    const beforeRefusal = await readFile(configPath, "utf8");
+    const refusalOutput = [];
+    await assert.rejects(
+      run(["init", "--google-client-json", replacementClientPath], {
+        configPath,
+        output: (line) => refusalOutput.push(line),
+      }),
+      (error) => {
+        assert.equal(error.code, "GOOGLE_CLIENT_REPLACEMENT_CONFIRMATION_REQUIRED");
+        assert.match(error.message, /without --confirm/u);
+        assert.match(error.message, /all 2 affected Google aliases/u);
+        assert.match(error.message, /multi-email auth <alias> --force/u);
+        assert.match(error.message, /multi-email doctor <alias> --json/u);
+        return true;
+      },
+    );
+    assert.equal(await readFile(configPath, "utf8"), beforeRefusal);
+    const refused = refusalOutput.join("\n");
+    assert.match(refused, /affects 2 configured Google aliases/u);
+    assert.match(refused, /multi-email auth personal --force/u);
+    assert.match(refused, /multi-email auth sales --force/u);
+    assert.match(refused, /multi-email doctor personal --json/u);
+    assert.match(refused, /multi-email doctor sales --json/u);
+    assert.doesNotMatch(refused, /multi-email auth work --force/u);
+    assert.doesNotMatch(refused, /multi-email doctor work --json/u);
+    assert.doesNotMatch(refused, /replacement-client|replacement-secret|rotated-secret/u);
+
+    const confirmationOutput = [];
+    await run(["init", "--google-client-json", replacementClientPath, "--confirm"], {
+      configPath,
+      output: (line) => confirmationOutput.push(line),
+    });
+    const replaced = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(replaced.providers.google.clientId, replacementClientId);
+    assert.deepEqual(replaced.providers.microsoft, microsoft);
+    assert.deepEqual(replaced.accounts, config.accounts);
+    const confirmed = confirmationOutput.join("\n");
+    assert.match(confirmed, /replacement confirmed and saved/u);
+    assert.match(confirmed, /affects 2 configured Google aliases/u);
+    assert.match(confirmed, /multi-email auth personal --force/u);
+    assert.match(confirmed, /multi-email auth sales --force/u);
+    assert.match(confirmed, /multi-email doctor personal --json/u);
+    assert.match(confirmed, /multi-email doctor sales --json/u);
+    assert.doesNotMatch(confirmed, /multi-email auth work --force/u);
+    assert.doesNotMatch(confirmed, /multi-email doctor work --json/u);
+    assert.doesNotMatch(confirmed, /replacement-client|replacement-secret|rotated-secret/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("setup repairs Microsoft values that v0.1.1 allowed without weakening other config checks", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-repair-test-"));
   const setConfigPath = path.join(directory, "set-config.json");
@@ -454,7 +563,7 @@ test("setup version flags and help work for installed and Git-clone entrypoints"
   await run(["--help"], { output: (line) => output.push(line) });
   const rendered = output.join("\n");
   assert.match(rendered, /multi-email setup/);
-  assert.match(rendered, /multi-email init/);
+  assert.match(rendered, /multi-email init .*\[--confirm\]/u);
   assert.match(rendered, /multi-email doctor \[alias\] \[--json\]/);
   assert.match(rendered, /node \.\/scripts\/multi-email/);
   assert.doesNotMatch(rendered, /npm run setup/);
@@ -536,6 +645,7 @@ test("doctor defaults to a human-readable table with an explicit next step for e
     stale: "reauthorization_required",
     scopes: "insufficient_scopes",
     wrong: "identity_mismatch",
+    policy: "provider_policy_blocked",
     offline: "provider_unavailable",
     client: "configuration_error",
   };
@@ -573,20 +683,36 @@ test("doctor defaults to a human-readable table with an explicit next step for e
     assert.equal(await credentialStore.get("sentinel"), "unchanged");
     assert.equal(
       output[0],
-      "ALIAS\tPROVIDER\tSTATUS\tCREDENTIAL\tTOKEN\tIDENTITY\tSCOPES\tNEXT STEP",
+      "ALIAS\tEXPECTED EMAIL\tVERIFIED EMAIL\tPROVIDER\tSTATUS\tCREDENTIAL\tTOKEN\tIDENTITY\tSCOPES\tNEXT STEP",
     );
     const rendered = output.join("\n");
-    assert.match(rendered, /ready\tgoogle\tok\tyes\tyes\tyes\tyes\tnone \(ready\)/);
+    assert.match(
+      rendered,
+      /ready\tready@example\.com\tready@example\.com\tgoogle\tok\tyes\tyes\tyes\tyes\tnone \(ready\)/,
+    );
     for (const alias of ["new", "corrupt", "stale", "scopes", "wrong"]) {
-      assert.match(rendered, new RegExp(`${alias}\\tgoogle\\t${statusByAlias[alias]}.*multi-email auth ${alias}`));
+      assert.match(
+        rendered,
+        new RegExp(
+          `${alias}\\t${alias}@example\\.com\\t-\\tgoogle\\t${statusByAlias[alias]}.*multi-email auth ${alias}`,
+        ),
+      );
     }
     assert.match(
       rendered,
-      /offline\tgoogle\tprovider_unavailable.*multi-email doctor offline/,
+      /offline\toffline@example\.com\t-\tgoogle\tprovider_unavailable.*multi-email doctor offline/,
     );
     assert.match(
       rendered,
-      /client\tgoogle\tconfiguration_error.*multi-email init --google-client-json <desktop-oauth\.json>/,
+      /policy\tpolicy@example\.com\t-\tgoogle\tprovider_policy_blocked.*Review the Google OAuth app access and test-user policy.*multi-email setup/,
+    );
+    assert.doesNotMatch(
+      rendered,
+      /policy\tpolicy@example\.com\t-\tgoogle\tprovider_policy_blocked.*multi-email (?:auth|doctor) policy/,
+    );
+    assert.match(
+      rendered,
+      /client\tclient@example\.com\t-\tgoogle\tconfiguration_error.*multi-email init --google-client-json <desktop-oauth\.json>/,
     );
     assert.doesNotMatch(rendered, /secret-not-for-output/);
     assert.doesNotMatch(rendered, /diagnostic-secret-must-not-be-printed/);
@@ -619,7 +745,7 @@ test("doctor --json emits stable allowlisted JSON Lines and redacts provider det
       providerFactory: async () => ({
         async diagnose(account) {
           if (account.alias === "work") {
-            const error = new Error("provider-token-must-not-be-printed");
+            const error = new TypeError("provider-token-must-not-be-printed");
             error.code = "unsafe provider token";
             throw error;
           }
@@ -647,6 +773,7 @@ test("doctor --json emits stable allowlisted JSON Lines and redacts provider det
       alias: "personal",
       provider: "google",
       expected_email: "person@example.com",
+      verified_email: null,
       credential_present: true,
       token_valid: false,
       identity_verified: null,
@@ -663,21 +790,66 @@ test("doctor --json emits stable allowlisted JSON Lines and redacts provider det
       alias: "work",
       provider: "google",
       expected_email: "work@example.com",
+      verified_email: null,
       credential_present: null,
       token_valid: null,
       identity_verified: null,
       scopes_valid: null,
       credential_source: null,
       legacy_migration_pending: false,
-      status: "provider_unavailable",
-      error_code: "PROVIDER_DIAGNOSIS_FAILED",
+      status: "runtime_error",
+      error_code: "PROVIDER_DIAGNOSTIC_RUNTIME_ERROR",
       next_step:
-        "multi-email doctor work (or node ./scripts/multi-email doctor work from a Git clone)",
+        "multi-email self-test (or node ./scripts/multi-email self-test from a Git clone)",
     });
     assert.equal(await credentialStore.get("sentinel"), "unchanged");
     assert.doesNotMatch(output.join("\n"), /json-secret-not-for-output/);
     assert.doesNotMatch(output.join("\n"), /provider-token-must-not-be-printed/);
     assert.doesNotMatch(output.join("\n"), /spoofed/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("doctor policy-blocked next steps review provider policy without auth or doctor loops", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-doctor-policy-test-"));
+  const configPath = path.join(directory, "config.json");
+  const config = emptyConfig();
+  config.providers.google = {
+    clientId: "test.apps.googleusercontent.com",
+    clientSecret: "secret-not-for-output",
+  };
+  config.providers.microsoft = {
+    clientId: "11111111-2222-3333-4444-555555555555",
+    tenant: "organizations",
+  };
+  config.accounts = [
+    { alias: "google-policy", email: "google@example.com", provider: "google" },
+    { alias: "entra-policy", email: "entra@example.com", provider: "microsoft" },
+  ];
+  const output = [];
+
+  try {
+    await saveConfig(config, configPath);
+    await run(["doctor", "--json"], {
+      configPath,
+      output: (line) => output.push(line),
+      credentialStore: new MemoryCredentialStore(),
+      providerFactory: async () => ({
+        async diagnose() {
+          return { status: "provider_policy_blocked" };
+        },
+      }),
+    });
+
+    const [googleRecord, microsoftRecord] = output.map((line) => JSON.parse(line));
+    assert.match(googleRecord.next_step, /Review the Google OAuth app access and test-user policy/iu);
+    assert.match(microsoftRecord.next_step, /Review Microsoft Entra consent and Conditional Access policy/iu);
+    for (const record of [googleRecord, microsoftRecord]) {
+      assert.match(record.next_step, /multi-email setup/u);
+      assert.doesNotMatch(record.next_step, /multi-email (?:auth|doctor)/u);
+      assert.doesNotMatch(record.next_step, new RegExp(record.alias, "u"));
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -711,6 +883,7 @@ test("doctor reports missing config, empty accounts, and unconfigured providers 
       alias: null,
       provider: null,
       expected_email: null,
+      verified_email: null,
       credential_present: null,
       token_valid: null,
       identity_verified: null,
@@ -756,6 +929,106 @@ test("doctor reports missing config, empty accounts, and unconfigured providers 
       "multi-email set-microsoft-client <application-guid> (or node ./scripts/multi-email set-microsoft-client <application-guid> from a Git clone)",
     );
     assert.equal(providerCalls, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("auth shows a bounded preflight, skips healthy aliases, and requires --force", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-auth-preflight-"));
+  const configPath = path.join(directory, "config.json");
+  const config = emptyConfig();
+  config.providers.google = {
+    clientId: "test.apps.googleusercontent.com",
+    clientSecret: "secret-not-for-output",
+  };
+  config.accounts = [
+    { alias: "personal", email: "person@example.com", provider: "google" },
+  ];
+  const output = [];
+  const authorizations = [];
+  const fakeProvider = {
+    async diagnose() {
+      return {
+        status: "ok",
+        credential_present: true,
+        token_valid: true,
+        identity_verified: true,
+        scopes_valid: true,
+      };
+    },
+    async authorize(account, options) {
+      authorizations.push({ account, options });
+      return { alias: account.alias, email: account.email, provider: account.provider };
+    },
+  };
+
+  try {
+    await saveConfig(config, configPath);
+    const dependencies = {
+      configPath,
+      output: (line) => output.push(line),
+      credentialStore: new MemoryCredentialStore(),
+      providerFactory: async () => fakeProvider,
+    };
+    await run(["auth", "personal", "--browser", "safari"], dependencies);
+    assert.equal(authorizations.length, 0);
+    assert.match(output.join("\n"), /Alias: personal/u);
+    assert.match(output.join("\n"), /Expected email: person@example\.com/u);
+    assert.match(output.join("\n"), /Provider: google/u);
+    assert.match(output.join("\n"), /Browser: safari/u);
+    assert.match(output.join("\n"), /gmail\.modify/u);
+    assert.match(output.join("\n"), /Existing health: ok/u);
+    assert.match(output.join("\n"), /already healthy/u);
+
+    await run(["auth", "personal", "--browser", "chrome", "--force"], dependencies);
+    assert.equal(authorizations.length, 1);
+    assert.equal(authorizations[0].options.browser, "chrome");
+    assert.doesNotMatch(output.join("\n"), /secret-not-for-output/u);
+
+    await assert.rejects(
+      run(["auth", "personal", "--browser", "firefox"], dependencies),
+      { code: "INVALID_BROWSER" },
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("auth preflight never bypasses runtime, provider, or policy failures", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "multi-email-auth-blocked-"));
+  const configPath = path.join(directory, "config.json");
+  const config = emptyConfig();
+  config.providers.google = {
+    clientId: "test.apps.googleusercontent.com",
+    clientSecret: "secret-not-for-output",
+  };
+  config.accounts = [
+    { alias: "personal", email: "person@example.com", provider: "google" },
+  ];
+
+  try {
+    await saveConfig(config, configPath);
+    for (const status of ["runtime_error", "provider_unavailable", "provider_policy_blocked"]) {
+      let authorizeCalls = 0;
+      await assert.rejects(
+        run(["auth", "personal", "--force"], {
+          configPath,
+          output: () => {},
+          credentialStore: new MemoryCredentialStore(),
+          providerFactory: async () => ({
+            async diagnose() {
+              return { status };
+            },
+            async authorize() {
+              authorizeCalls += 1;
+            },
+          }),
+        }),
+        { code: "AUTH_PREFLIGHT_BLOCKED" },
+      );
+      assert.equal(authorizeCalls, 0);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

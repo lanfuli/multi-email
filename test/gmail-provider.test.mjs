@@ -394,7 +394,10 @@ test("Gmail diagnostics redact a provider-controlled error code", async () => {
     if (path === "/tokeninfo") {
       return {
         config: options,
-        data: { scope: "https://www.googleapis.com/auth/gmail.modify" },
+        data: {
+          aud: "test-client-id",
+          scope: "https://www.googleapis.com/auth/gmail.modify",
+        },
         headers: new Headers(),
         status: 200,
         statusText: "OK",

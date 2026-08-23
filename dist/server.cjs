@@ -39313,7 +39313,7 @@ function _requestToken2() {
 /***/ 1266:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const { startServer } = __nccwpck_require__(3196);
+const { startServer } = __nccwpck_require__(9008);
 const { formatSetupError, runSetupCli } = __nccwpck_require__(8902);
 
 module.exports = { formatSetupError, runSetupCli, startServer };
@@ -39644,6 +39644,174 @@ function findAccount(config, alias) {
 
 /***/ }),
 
+/***/ 7005:
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+"use strict";
+/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
+/* harmony export */   KQ: () => (/* binding */ unexpectedDiagnosticRecord),
+/* harmony export */   Sd: () => (/* binding */ executableCommand),
+/* harmony export */   i$: () => (/* binding */ providerSetupCommand),
+/* harmony export */   lH: () => (/* binding */ diagnosticRecord),
+/* harmony export */   lr: () => (/* binding */ doctorSummaryRecord)
+/* harmony export */ });
+const DIAGNOSTIC_STATUSES = new Set([
+  "ok",
+  "not_authorized",
+  "invalid_credential",
+  "reauthorization_required",
+  "insufficient_scopes",
+  "identity_mismatch",
+  "provider_policy_blocked",
+  "provider_unavailable",
+  "runtime_error",
+  "configuration_error",
+]);
+const DIAGNOSTIC_RUNTIME_CODES = new Set([
+  "INVALID_PROVIDER_RESPONSE",
+  "KEYCHAIN_READ_FAILED",
+  "OAUTH_RUNTIME_ERROR",
+  "RUNTIME_INTEGRITY_ERROR",
+  "UNSUPPORTED_OPERATION",
+]);
+
+function triState(value) {
+  return value === true ? true : value === false ? false : null;
+}
+
+function safeErrorCode(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const code = String(value);
+  return /^[A-Z0-9][A-Z0-9_-]{0,63}$/u.test(code) ? code : fallback;
+}
+
+function diagnosticErrorFallback(provider) {
+  if (provider === "google") return "GOOGLE_PROFILE_FAILED";
+  if (provider === "microsoft") return "MICROSOFT_PROFILE_FAILED";
+  return "PROVIDER_DIAGNOSIS_FAILED";
+}
+
+function executableCommand(command) {
+  const prefix = "multi-email ";
+  if (!command.startsWith(prefix)) return command;
+  return `${command} (or node ./scripts/multi-email ${command.slice(prefix.length)} from a Git clone)`;
+}
+
+function providerSetupCommand(provider, { configExists = true } = {}) {
+  if (provider === "microsoft") {
+    return executableCommand(
+      configExists
+        ? "multi-email set-microsoft-client <application-guid>"
+        : "multi-email init --microsoft-client-id <application-guid> --microsoft-tenant organizations",
+    );
+  }
+  return executableCommand("multi-email init --google-client-json <desktop-oauth.json>");
+}
+
+function diagnosticNextStep(account, status) {
+  switch (status) {
+    case "ok":
+      return "none (ready)";
+    case "not_authorized":
+    case "invalid_credential":
+    case "reauthorization_required":
+    case "insufficient_scopes":
+    case "identity_mismatch":
+      return executableCommand(`multi-email auth ${account.alias}`);
+    case "runtime_error":
+      return executableCommand("multi-email self-test");
+    case "provider_policy_blocked":
+      return account.provider === "google"
+        ? `Review the Google OAuth app access and test-user policy; then run ${executableCommand("multi-email setup")}`
+        : `Review Microsoft Entra consent and Conditional Access policy; then run ${executableCommand("multi-email setup")}`;
+    case "configuration_error":
+      return providerSetupCommand(account.provider);
+    case "provider_unavailable":
+    default:
+      return executableCommand(`multi-email doctor ${account.alias}`);
+  }
+}
+
+function diagnosticRecord(account, input = {}) {
+  const claimedStatus = DIAGNOSTIC_STATUSES.has(input?.status)
+    ? input.status
+    : "provider_unavailable";
+  const credentialPresent = triState(input?.credential_present);
+  const tokenValid = triState(input?.token_valid);
+  const identityVerified = triState(input?.identity_verified);
+  const scopesValid = triState(input?.scopes_valid);
+  const healthVerified =
+    credentialPresent === true &&
+    tokenValid === true &&
+    identityVerified === true &&
+    scopesValid === true;
+  const inconsistentReady =
+    claimedStatus === "ok" &&
+    (!healthVerified || ![null, undefined, ""].includes(input?.error_code));
+  const status = inconsistentReady ? "runtime_error" : claimedStatus;
+  const credentialSource = ["profile", "legacy"].includes(input?.credential_source)
+    ? input.credential_source
+    : null;
+  const verifiedEmail =
+    status === "ok" && healthVerified ? account.email : null;
+  const errorFallback =
+    input?.error_code === null || input?.error_code === undefined || input?.error_code === ""
+      ? null
+      : diagnosticErrorFallback(account.provider);
+
+  return {
+    type: "account",
+    alias: account.alias,
+    provider: account.provider,
+    expected_email: account.email,
+    verified_email: verifiedEmail,
+    credential_present: credentialPresent,
+    token_valid: tokenValid,
+    identity_verified: identityVerified,
+    scopes_valid: scopesValid,
+    credential_source: credentialSource,
+    legacy_migration_pending: input?.legacy_migration_pending === true,
+    status,
+    error_code: inconsistentReady
+      ? "INVALID_PROVIDER_DIAGNOSTIC"
+      : safeErrorCode(input?.error_code, errorFallback),
+    next_step: diagnosticNextStep(account, status),
+  };
+}
+
+function unexpectedDiagnosticRecord(account, error) {
+  const runtimeFailure =
+    error instanceof TypeError || DIAGNOSTIC_RUNTIME_CODES.has(String(error?.code || ""));
+  return diagnosticRecord(account, {
+    status: runtimeFailure ? "runtime_error" : "provider_unavailable",
+    error_code: runtimeFailure
+      ? "PROVIDER_DIAGNOSTIC_RUNTIME_ERROR"
+      : "PROVIDER_DIAGNOSIS_FAILED",
+  });
+}
+
+function doctorSummaryRecord(status, nextStep) {
+  return {
+    type: "summary",
+    alias: null,
+    provider: null,
+    expected_email: null,
+    verified_email: null,
+    credential_present: null,
+    token_valid: null,
+    identity_verified: null,
+    scopes_valid: null,
+    credential_source: null,
+    legacy_migration_pending: false,
+    status,
+    error_code: null,
+    next_step: nextStep,
+  };
+}
+
+
+/***/ }),
+
 /***/ 1102:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
@@ -39656,11 +39824,11 @@ function findAccount(config, alias) {
 /* harmony export */   dv: () => (/* binding */ LEGACY_KEYCHAIN_SERVICE),
 /* harmony export */   e8: () => (/* binding */ CONFIG_VERSION),
 /* harmony export */   hl: () => (/* binding */ APP_VERSION),
+/* harmony export */   nx: () => (/* binding */ MICROSOFT_SCOPES),
 /* harmony export */   sO: () => (/* binding */ GOOGLE_SCOPES)
 /* harmony export */ });
-/* unused harmony export MICROSOFT_SCOPES */
 const APP_NAME = "codex-multi-email";
-const APP_VERSION = "0.1.4";
+const APP_VERSION = "0.1.5";
 const CONFIG_VERSION = 2;
 const KEYCHAIN_SERVICE = "io.github.lanfuli.multi-email";
 const LEGACY_KEYCHAIN_SERVICE = "com.openai.codex.multi-email";
@@ -39671,11 +39839,11 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
 ];
 
-const MICROSOFT_SCOPES = (/* unused pure expression or super */ null && ([
+const MICROSOFT_SCOPES = [
   "User.Read",
   "Mail.ReadWrite",
   "Mail.Send",
-]));
+];
 
 const DEFAULT_SAFETY = Object.freeze({
   maxSearchResults: 25,
@@ -39694,6 +39862,60 @@ const HARD_SAFETY_LIMITS = Object.freeze({
   sendApprovalTtlSeconds: 300,
   maxLabelChanges: 25,
 });
+
+
+/***/ }),
+
+/***/ 9827:
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+"use strict";
+/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
+/* harmony export */   C: () => (/* binding */ replaceCredentialVerified)
+/* harmony export */ });
+/* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(178);
+
+
+function rollbackFailed() {
+  return new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G(
+    "The OAuth credential update failed and the previous macOS Keychain state could not be restored or verified. Stop and inspect the account before retrying.",
+    "CREDENTIAL_ROLLBACK_FAILED",
+  );
+}
+
+async function replaceCredentialVerified(credentialStore, key, nextValue) {
+  // Read before mutation so a failed authorization cannot destroy a credential
+  // already stored for this exact profile/account key.
+  const previousValue = await credentialStore.get(key);
+
+  try {
+    await credentialStore.set(key, nextValue);
+    if ((await credentialStore.get(key)) !== nextValue) {
+      throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G(
+        "The OAuth credential update could not be verified in macOS Keychain.",
+        "KEYCHAIN_WRITE_FAILED",
+      );
+    }
+  } catch {
+    try {
+      if (previousValue === null) {
+        await credentialStore.delete(key);
+      } else {
+        await credentialStore.set(key, previousValue);
+      }
+      if ((await credentialStore.get(key)) !== previousValue) throw rollbackFailed();
+    } catch {
+      throw rollbackFailed();
+    }
+
+    throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_0__/* .MultiEmailError */ .G(
+      previousValue === null
+        ? "The OAuth credential update failed. No new credential was retained."
+        : "The OAuth credential update failed. The previous credential was restored.",
+      "KEYCHAIN_WRITE_FAILED",
+    );
+  }
+}
 
 
 /***/ }),
@@ -40127,6 +40349,56 @@ function splitAddressHeader(value = "") {
 
 /***/ }),
 
+/***/ 7423:
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+"use strict";
+/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
+/* harmony export */   Df: () => (/* binding */ normalizeOAuthBrowser),
+/* harmony export */   ay: () => (/* binding */ openOAuthBrowser)
+/* harmony export */ });
+/* unused harmony export OAUTH_BROWSERS */
+/* harmony import */ var node_child_process__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(1421);
+/* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(178);
+
+
+
+const OAUTH_BROWSERS = Object.freeze(["default", "safari", "chrome"]);
+
+function normalizeOAuthBrowser(value = "default") {
+  const browser = String(value || "default").trim().toLowerCase();
+  if (!OAUTH_BROWSERS.includes(browser)) {
+    throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_1__/* .MultiEmailError */ .G(
+      `Unsupported OAuth browser '${browser}'. Use default, safari, or chrome.`,
+      "INVALID_BROWSER",
+    );
+  }
+  return browser;
+}
+
+function browserArguments(browser, url) {
+  if (browser === "safari") return ["-a", "Safari", url];
+  if (browser === "chrome") return ["-a", "Google Chrome", url];
+  return [url];
+}
+
+function openOAuthBrowser(url, browserValue = "default", { spawnImpl = node_child_process__WEBPACK_IMPORTED_MODULE_0__.spawn } = {}) {
+  const browser = normalizeOAuthBrowser(browserValue);
+  return new Promise((resolve, reject) => {
+    const child = spawnImpl("/usr/bin/open", browserArguments(browser, url), {
+      stdio: "ignore",
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error("The selected browser could not be opened."));
+    });
+  });
+}
+
+
+/***/ }),
+
 /***/ 6378:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
@@ -40262,8 +40534,6 @@ __nccwpck_require__.d(__webpack_exports__, {
 var external_node_crypto_ = __nccwpck_require__(7598);
 // EXTERNAL MODULE: external "node:http"
 var external_node_http_ = __nccwpck_require__(7067);
-// EXTERNAL MODULE: external "node:child_process"
-var external_node_child_process_ = __nccwpck_require__(1421);
 // EXTERNAL MODULE: ./node_modules/@googleapis/gmail/build/index.js
 var build = __nccwpck_require__(204);
 ;// CONCATENATED MODULE: ./node_modules/postal-mime/src/decode-strings.js
@@ -45134,17 +45404,22 @@ class PostalMime {
 
 // EXTERNAL MODULE: ./src/constants.mjs
 var constants = __nccwpck_require__(1102);
+// EXTERNAL MODULE: ./src/credential-transaction.mjs
+var credential_transaction = __nccwpck_require__(9827);
 // EXTERNAL MODULE: ./src/errors.mjs
 var errors = __nccwpck_require__(178);
 // EXTERNAL MODULE: ./src/keychain.mjs
 var keychain = __nccwpck_require__(9055);
 // EXTERNAL MODULE: ./src/operation-deadline.mjs + 1 modules
 var operation_deadline = __nccwpck_require__(6378);
+// EXTERNAL MODULE: ./src/oauth-browser.mjs
+var oauth_browser = __nccwpck_require__(7423);
 // EXTERNAL MODULE: ./src/mime.mjs
 var mime = __nccwpck_require__(7123);
 // EXTERNAL MODULE: ./src/send-approval.mjs
 var send_approval = __nccwpck_require__(2443);
 ;// CONCATENATED MODULE: ./src/providers/gmail.mjs
+
 
 
 
@@ -45198,6 +45473,19 @@ const GOOGLE_NETWORK_CODES = new Set([
   "EAI_AGAIN",
 ]);
 const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
+const GOOGLE_REAUTH_ERROR_CODES = new Set(["invalid_grant"]);
+const GOOGLE_TRANSIENT_OAUTH_ERROR_CODES = new Set([
+  "rate_limit_exceeded",
+  "server_error",
+  "temporarily_unavailable",
+]);
+const GOOGLE_POLICY_ERROR_CODES = new Set([
+  "access_blocked",
+  "admin_policy_enforced",
+  "disallowed_useragent",
+  "org_internal",
+  "restricted_client",
+]);
 const UNSUPPORTED_MATERIAL_HEADERS = new Set([
   "apparently-to",
   "bounces-to",
@@ -45642,6 +45930,17 @@ function hasRequiredScopes(scopes) {
   return normalizedScopes(scopes).has(REQUIRED_GMAIL_SCOPE);
 }
 
+function assertGoogleTokenAudience(provider, tokenInfo) {
+  const expectedClientId = String(provider?.clientId || "").trim();
+  const tokenAudience = String(tokenInfo?.aud || "").trim();
+  if (!expectedClientId || tokenAudience !== expectedClientId) {
+    throw new errors/* MultiEmailError */.G(
+      "The Google credential was not issued to the configured OAuth client. Reauthorize this alias with the configured Google Desktop client. No credential was changed.",
+      "GOOGLE_OAUTH_CLIENT_MISMATCH",
+    );
+  }
+}
+
 function assertProfileMatches(account, profile) {
   const actualEmail = String(profile?.data?.emailAddress || profile?.emailAddress || "")
     .trim()
@@ -45653,20 +45952,6 @@ function assertProfileMatches(account, profile) {
     );
   }
   return actualEmail;
-}
-
-function openBrowser(url) {
-  return new Promise((resolve, reject) => {
-    const child = (0,external_node_child_process_.spawn)("/usr/bin/open", [url], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
 }
 
 function gmail_escapeHtml(value) {
@@ -45792,6 +46077,138 @@ function isGoogleResponseTooLarge(error) {
     current = current.cause || current.error;
   }
   return false;
+}
+
+function errorChain(error) {
+  const values = [];
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 6 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    values.push(current);
+    current = current.cause || current.error;
+  }
+  return values;
+}
+
+function googleOAuthErrorCodes(error) {
+  const codes = new Set();
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    const normalized = value.trim().toLowerCase();
+    if (/^[a-z0-9_.-]{1,80}$/u.test(normalized)) codes.add(normalized);
+  };
+  for (const current of errorChain(error)) {
+    add(current.code);
+    add(current.errorCode);
+    add(current.response?.data?.error);
+    add(current.response?.data?.error?.code);
+  }
+  return codes;
+}
+
+function hasGoogleOAuthError(error, allowed) {
+  return [...googleOAuthErrorCodes(error)].some((code) => allowed.has(code));
+}
+
+function googleProviderUnavailable(error) {
+  if (
+    hasGoogleOAuthError(error, GOOGLE_TRANSIENT_OAUTH_ERROR_CODES) ||
+    isGoogleRequestTimeout(error) ||
+    isGoogleNetworkError(error) ||
+    isGoogleRedirectError(error) ||
+    isGoogleResponseTooLarge(error)
+  ) {
+    return true;
+  }
+  return errorChain(error).some((current) => {
+    const status = current.response?.status ?? current.response?.statusCode;
+    return status === 408 || status === 429 || (Number.isInteger(status) && status >= 500);
+  });
+}
+
+function classifyGoogleAuthorizationError(error) {
+  if (error instanceof errors/* MultiEmailError */.G) return error;
+  if (hasGoogleOAuthError(error, GOOGLE_REAUTH_ERROR_CODES)) {
+    return new errors/* MultiEmailError */.G(
+      "Google rejected the authorization grant. Start a fresh authorization for this alias.",
+      "REAUTHENTICATION_REQUIRED",
+    );
+  }
+  if (hasGoogleOAuthError(error, GOOGLE_POLICY_ERROR_CODES)) {
+    return new errors/* MultiEmailError */.G(
+      "Google policy blocked this OAuth application or account. Browser changes will not bypass the policy.",
+      "OAUTH_PROVIDER_POLICY_BLOCKED",
+    );
+  }
+  if (googleProviderUnavailable(error)) {
+    return new errors/* MultiEmailError */.G(
+      "Google OAuth is temporarily unavailable. The existing credential was preserved.",
+      "GOOGLE_OAUTH_UNAVAILABLE",
+    );
+  }
+  if (error instanceof TypeError) {
+    return new errors/* MultiEmailError */.G(
+      "The local Google OAuth runtime failed before authorization completed. Reinstall or run self-test; do not reauthorize yet.",
+      "OAUTH_RUNTIME_ERROR",
+    );
+  }
+  return new errors/* MultiEmailError */.G(
+    "Google OAuth could not be completed. The existing credential was preserved.",
+    "GOOGLE_OAUTH_FAILED",
+  );
+}
+
+function googleDiagnosticFailure(error) {
+  if (error?.code === "INVALID_CREDENTIAL") {
+    return { status: "invalid_credential", errorCode: "INVALID_CREDENTIAL", tokenValid: false };
+  }
+  if (error?.code === "GOOGLE_OAUTH_CLIENT_MISMATCH") {
+    return {
+      status: "reauthorization_required",
+      errorCode: "GOOGLE_OAUTH_CLIENT_MISMATCH",
+      tokenValid: false,
+    };
+  }
+  if (
+    error?.code === "REAUTHENTICATION_REQUIRED" ||
+    hasGoogleOAuthError(error, GOOGLE_REAUTH_ERROR_CODES)
+  ) {
+    return {
+      status: "reauthorization_required",
+      errorCode: "REAUTHENTICATION_REQUIRED",
+      tokenValid: false,
+    };
+  }
+  if (
+    error?.code === "OAUTH_PROVIDER_POLICY_BLOCKED" ||
+    hasGoogleOAuthError(error, GOOGLE_POLICY_ERROR_CODES)
+  ) {
+    return {
+      status: "provider_policy_blocked",
+      errorCode: "OAUTH_PROVIDER_POLICY_BLOCKED",
+      tokenValid: null,
+    };
+  }
+  if (
+    error?.code === "OAUTH_RUNTIME_ERROR" ||
+    error?.code === "KEYCHAIN_READ_FAILED" ||
+    error instanceof TypeError
+  ) {
+    return {
+      status: "runtime_error",
+      errorCode: safeDiagnosticErrorCode(error?.code, "OAUTH_RUNTIME_ERROR"),
+      tokenValid: null,
+    };
+  }
+  if (googleProviderUnavailable(error) || error instanceof errors/* MultiEmailError */.G) {
+    return {
+      status: "provider_unavailable",
+      errorCode: safeDiagnosticErrorCode(error?.code, "GOOGLE_PROVIDER_UNAVAILABLE"),
+      tokenValid: null,
+    };
+  }
+  return { status: "runtime_error", errorCode: "OAUTH_RUNTIME_ERROR", tokenValid: null };
 }
 
 async function abandonGoogleResponse(error) {
@@ -45934,7 +46351,7 @@ function createGoogleOAuthClient(provider, redirectUri) {
 }
 
 class GmailProvider {
-  constructor({ config, credentialStore, browserOpener = openBrowser }) {
+  constructor({ config, credentialStore, browserOpener = oauth_browser/* openOAuthBrowser */.ay }) {
     this.config = config;
     this.credentialStore = credentialStore;
     this.browserOpener = browserOpener;
@@ -45967,10 +46384,14 @@ class GmailProvider {
     return legacy === null ? null : { key, legacyKey, raw: legacy, source: "legacy" };
   }
 
-  async authorize(account, { onInstruction = console.log, timeoutMs = 5 * 60_000 } = {}) {
+  async authorize(
+    account,
+    { browser = "default", onInstruction = console.log, timeoutMs = 5 * 60_000 } = {},
+  ) {
     const provider = this.providerConfig();
     const state = (0,external_node_crypto_.randomBytes)(32).toString("base64url");
     let settle;
+    let callbackResponse;
     const callback = new Promise((resolve, reject) => {
       settle = { resolve, reject };
     });
@@ -45993,20 +46414,42 @@ class GmailProvider {
           const safeOauthError = /^[a-z0-9_.-]{1,80}$/i.test(oauthError || "")
             ? oauthError
             : undefined;
-          htmlResponse(res, 400, "Google did not return an authorization code.");
+          const policyBlocked = safeOauthError
+            ? GOOGLE_POLICY_ERROR_CODES.has(safeOauthError.toLowerCase())
+            : false;
+          const providerUnavailable = safeOauthError
+            ? GOOGLE_TRANSIENT_OAUTH_ERROR_CODES.has(safeOauthError.toLowerCase())
+            : false;
+          htmlResponse(
+            res,
+            400,
+            policyBlocked
+              ? "Google policy blocked this authorization. Return to the terminal for the safe next step."
+              : providerUnavailable
+                ? "Google OAuth is temporarily unavailable. Return to the terminal and retry later."
+                : "Google did not return an authorization code.",
+          );
           settle.reject(
             new errors/* MultiEmailError */.G(
-              `Google OAuth was not completed${safeOauthError ? `: ${safeOauthError}` : "."}`,
-              "OAUTH_DENIED",
+              policyBlocked
+                ? "Google policy blocked this OAuth application or account. Browser changes will not bypass the policy."
+                : providerUnavailable
+                  ? "Google OAuth is temporarily unavailable. The existing credential was not changed."
+                  : `Google OAuth was not completed${safeOauthError ? `: ${safeOauthError}` : "."}`,
+              policyBlocked
+                ? "OAUTH_PROVIDER_POLICY_BLOCKED"
+                : providerUnavailable
+                  ? "GOOGLE_OAUTH_UNAVAILABLE"
+                  : "OAUTH_DENIED",
             ),
           );
           return;
         }
-        htmlResponse(
-          res,
-          200,
-          "Authorization code received. Return to the terminal while identity and scope checks finish.",
-        );
+        if (callbackResponse) {
+          htmlResponse(res, 409, "An authorization response is already being verified.");
+          return;
+        }
+        callbackResponse = res;
         settle.resolve(code);
       } catch (error) {
         settle.reject(error);
@@ -46018,18 +46461,22 @@ class GmailProvider {
       const port = await listen(server);
       const redirectUri = `http://127.0.0.1:${port}/oauth/google/callback`;
       const oauth = createGoogleOAuthClient(provider, redirectUri);
+      const { codeVerifier, codeChallenge } = await oauth.generateCodeVerifierAsync();
       const authorizationUrl = oauth.generateAuthUrl({
         access_type: "offline",
-        prompt: "consent",
-        include_granted_scopes: true,
+        prompt: "select_account consent",
         scope: constants/* GOOGLE_SCOPES */.sO,
         state,
         login_hint: account.email,
+        code_challenge: codeChallenge,
+        code_challenge_method: "S256",
       });
 
-      onInstruction(`Opening Google authorization for ${account.alias} (${account.email})...`);
+      onInstruction(
+        `Opening Google authorization in ${browser} for ${account.alias} (${account.email})...`,
+      );
       try {
-        await this.browserOpener(authorizationUrl);
+        await this.browserOpener(authorizationUrl, browser);
       } catch {
         throw new errors/* MultiEmailError */.G(
           "Unable to open the Google authorization page. No OAuth URL was printed; check browser permissions and try again.",
@@ -46046,7 +46493,7 @@ class GmailProvider {
           );
         }),
       ]);
-      const exchange = await oauth.getToken(code);
+      const exchange = await oauth.getToken({ code, codeVerifier });
       let tokens = exchange.tokens;
       if (!tokens.refresh_token) {
         throw new errors/* MultiEmailError */.G(
@@ -46058,21 +46505,48 @@ class GmailProvider {
       const preparedTokens = await prepareGoogleApiCredentials(oauth);
       tokens = { ...tokens, ...preparedTokens };
       oauth.setCredentials(tokens);
+      const tokenInfo = await oauth.getTokenInfo(tokens.access_token);
+      assertGoogleTokenAudience(provider, tokenInfo);
+      if (!hasRequiredScopes(tokenInfo?.scopes)) {
+        throw new errors/* MultiEmailError */.G(
+          "Google did not grant the required Gmail modify scope. Nothing was saved.",
+          "INSUFFICIENT_SCOPES",
+        );
+      }
       const gmail = (0,build/* gmail */.tc)({ version: "v1", auth: oauth });
       const profile = await gmail.users.getProfile(
         { userId: "me" },
         googleRequestOptions(),
       );
       const actualEmail = assertProfileMatches(account, profile);
-      if (tokens.scope && !hasRequiredScopes(tokens.scope)) {
-        throw new errors/* MultiEmailError */.G(
-          "Google did not grant the required Gmail modify scope. Nothing was saved.",
-          "INSUFFICIENT_SCOPES",
+      const serialized = JSON.stringify(tokens);
+      await (0,credential_transaction/* replaceCredentialVerified */.C)(
+        this.credentialStore,
+        credentialKey(this.config, account),
+        serialized,
+      );
+      this.verifiedAliases.add(account.alias);
+      if (callbackResponse && !callbackResponse.writableEnded && !callbackResponse.destroyed) {
+        htmlResponse(
+          callbackResponse,
+          200,
+          `Authorization complete. '${account.alias}' was verified as ${actualEmail}, required scopes were granted, and the credential was stored in macOS Keychain.`,
         );
       }
-      await this.credentialStore.set(credentialKey(this.config, account), JSON.stringify(tokens));
-      this.verifiedAliases.add(account.alias);
       return { alias: account.alias, email: actualEmail, provider: "google" };
+    } catch (error) {
+      if (callbackResponse && !callbackResponse.writableEnded && !callbackResponse.destroyed) {
+        try {
+          htmlResponse(
+            callbackResponse,
+            500,
+            "Authorization could not be fully verified. Return to the terminal and inspect doctor before retrying.",
+          );
+        } catch {
+          // Preserve the classified OAuth failure when the browser disconnected.
+        }
+      }
+      throw classifyGoogleAuthorizationError(error);
     } finally {
       clearTimeout(timer);
       await closeHttpServer(server);
@@ -46164,7 +46638,7 @@ class GmailProvider {
     };
 
     try {
-      this.providerConfig();
+      const provider = this.providerConfig();
       const record = await this.credentialRecord(account);
       if (!record) return diagnostic;
       diagnostic.credential_present = true;
@@ -46175,9 +46649,10 @@ class GmailProvider {
       try {
         session = await this.oauthSession(account, { persistUpdates: false });
       } catch (error) {
-        diagnostic.token_valid = false;
-        diagnostic.status = "invalid_credential";
-        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "INVALID_CREDENTIAL");
+        const failure = googleDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
 
@@ -46188,16 +46663,13 @@ class GmailProvider {
         accessToken = typeof access === "string" ? access : access?.token;
         if (!accessToken) throw new Error("missing access token");
         tokenInfo = await session.oauth.getTokenInfo(accessToken);
+        assertGoogleTokenAudience(provider, tokenInfo);
         diagnostic.token_valid = true;
       } catch (error) {
-        if (error?.code === "GOOGLE_REQUEST_TIMEOUT") {
-          diagnostic.status = "provider_unavailable";
-          diagnostic.error_code = "GOOGLE_REQUEST_TIMEOUT";
-          return diagnostic;
-        }
-        diagnostic.token_valid = false;
-        diagnostic.status = "reauthorization_required";
-        diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
+        const failure = googleDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
 
@@ -46219,17 +46691,32 @@ class GmailProvider {
         diagnostic.status = "ok";
       } catch (error) {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
-        diagnostic.status =
-          diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "GOOGLE_PROFILE_FAILED");
+        if (diagnostic.identity_verified === false) {
+          diagnostic.status = "identity_mismatch";
+          diagnostic.error_code = "ACCOUNT_MISMATCH";
+        } else {
+          const failure = googleDiagnosticFailure(error);
+          diagnostic.status = failure.status;
+          diagnostic.error_code =
+            failure.status === "provider_unavailable"
+              ? safeDiagnosticErrorCode(error?.code, "GOOGLE_PROFILE_FAILED")
+              : failure.errorCode;
+        }
       }
       return diagnostic;
     } catch (error) {
-      diagnostic.status = "configuration_error";
-      diagnostic.error_code = safeDiagnosticErrorCode(
-        error?.code,
-        "GOOGLE_CLIENT_NOT_CONFIGURED",
-      );
+      if (["GOOGLE_CLIENT_NOT_CONFIGURED", "INVALID_CONFIG"].includes(error?.code)) {
+        diagnostic.status = "configuration_error";
+        diagnostic.error_code = safeDiagnosticErrorCode(
+          error?.code,
+          "GOOGLE_CLIENT_NOT_CONFIGURED",
+        );
+      } else {
+        const failure = googleDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
+      }
       return diagnostic;
     }
   }
@@ -46782,8 +47269,6 @@ __nccwpck_require__.d(__webpack_exports__, {
   MicrosoftProvider: () => (/* binding */ MicrosoftProvider)
 });
 
-// EXTERNAL MODULE: external "node:child_process"
-var external_node_child_process_ = __nccwpck_require__(1421);
 // EXTERNAL MODULE: external "node:crypto"
 var external_node_crypto_ = __nccwpck_require__(7598);
 ;// CONCATENATED MODULE: ./node_modules/@azure/msal-common/dist/utils/Constants.mjs
@@ -61596,6 +62081,8 @@ const dist_ResponseMode = ResponseMode;
 
 //# sourceMappingURL=index.mjs.map
 
+// EXTERNAL MODULE: ./src/credential-transaction.mjs
+var credential_transaction = __nccwpck_require__(9827);
 // EXTERNAL MODULE: ./src/errors.mjs
 var errors = __nccwpck_require__(178);
 // EXTERNAL MODULE: ./src/keychain.mjs
@@ -61604,9 +62091,12 @@ var keychain = __nccwpck_require__(9055);
 var mime = __nccwpck_require__(7123);
 // EXTERNAL MODULE: ./src/operation-deadline.mjs + 1 modules
 var operation_deadline = __nccwpck_require__(6378);
+// EXTERNAL MODULE: ./src/oauth-browser.mjs
+var oauth_browser = __nccwpck_require__(7423);
 // EXTERNAL MODULE: ./src/validation.mjs
 var validation = __nccwpck_require__(6918);
 ;// CONCATENATED MODULE: ./src/providers/microsoft.mjs
+
 
 
 
@@ -61629,6 +62119,24 @@ const GRAPH_ERROR_BODY_LIMIT = 64 * 1024;
 const MICROSOFT_IDENTITY_BODY_LIMIT = 2 * 1024 * 1024;
 const MICROSOFT_IDENTITY_ORIGIN = "https://login.microsoftonline.com";
 const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
+const MICROSOFT_REAUTH_ERROR_CODES = new Set([
+  "consent_required",
+  "interaction_required",
+  "invalid_grant",
+  "login_required",
+  "no_tokens_found",
+  "token_refresh_required",
+]);
+const MICROSOFT_POLICY_ERROR_CODES = new Set([
+  "access_blocked",
+  "admin_consent_required",
+  "authorization_request_denied",
+  "conditional_access_blocked",
+  "unauthorized_client",
+  "user_not_assigned",
+  "aadsts50105",
+  "aadsts53003",
+]);
 
 function credentialKey(config, account) {
   return (0,keychain/* credentialAccountKey */.kq)(config, account, ":msal-cache");
@@ -61636,20 +62144,6 @@ function credentialKey(config, account) {
 
 function legacyCredentialKey(account) {
   return (0,keychain/* legacyCredentialAccountKey */.Nu)(account, ":msal-cache");
-}
-
-function openBrowser(url) {
-  return new Promise((resolve, reject) => {
-    const child = (0,external_node_child_process_.spawn)("/usr/bin/open", [url], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
 }
 
 function cachePlugin(credentialStore, key, { serialized = null, persist = true } = {}) {
@@ -62243,6 +62737,163 @@ function safeDiagnosticErrorCode(value, fallback) {
   return DIAGNOSTIC_ERROR_CODE.test(code) ? code : fallback;
 }
 
+function microsoftErrorChain(error) {
+  const values = [];
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 6 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    values.push(current);
+    current = current.cause || current.error;
+  }
+  return values;
+}
+
+function microsoftOAuthErrorCodes(error) {
+  const codes = new Set();
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    const normalized = value.trim().toLowerCase();
+    if (/^[a-z0-9_.-]{1,80}$/u.test(normalized)) codes.add(normalized);
+  };
+  for (const current of microsoftErrorChain(error)) {
+    add(current.code);
+    add(current.errorCode);
+    add(current.subError);
+    add(current.response?.data?.error);
+    add(current.response?.data?.error?.code);
+  }
+  return codes;
+}
+
+function hasMicrosoftOAuthError(error, allowed) {
+  return [...microsoftOAuthErrorCodes(error)].some((code) => allowed.has(code));
+}
+
+function microsoftProviderUnavailable(error) {
+  if (
+    [
+      "MICROSOFT_NETWORK_ERROR",
+      "MICROSOFT_REQUEST_ABORTED",
+      "MICROSOFT_TIMEOUT",
+      "OPERATION_DEADLINE_EXCEEDED",
+    ].includes(error?.code)
+  ) {
+    return true;
+  }
+  return microsoftErrorChain(error).some((current) => {
+    const status = current.response?.status ?? current.response?.statusCode;
+    return status === 408 || status === 429 || (Number.isInteger(status) && status >= 500);
+  });
+}
+
+function classifyMicrosoftAuthorizationError(error) {
+  if (error instanceof errors/* MultiEmailError */.G) return error;
+  if (hasMicrosoftOAuthError(error, MICROSOFT_REAUTH_ERROR_CODES)) {
+    return new errors/* MultiEmailError */.G(
+      "Microsoft rejected the authorization grant. Start a fresh authorization for this alias.",
+      "REAUTHENTICATION_REQUIRED",
+    );
+  }
+  if (hasMicrosoftOAuthError(error, MICROSOFT_POLICY_ERROR_CODES)) {
+    return new errors/* MultiEmailError */.G(
+      "Microsoft tenant or account policy blocked this OAuth application. Browser changes will not bypass the policy.",
+      "OAUTH_PROVIDER_POLICY_BLOCKED",
+    );
+  }
+  if (microsoftProviderUnavailable(error)) {
+    return new errors/* MultiEmailError */.G(
+      "Microsoft OAuth is temporarily unavailable. The existing credential was preserved.",
+      "MICROSOFT_OAUTH_UNAVAILABLE",
+    );
+  }
+  if (error instanceof TypeError) {
+    return new errors/* MultiEmailError */.G(
+      "The local Microsoft OAuth runtime failed before authorization completed. Reinstall or run self-test; do not reauthorize yet.",
+      "OAUTH_RUNTIME_ERROR",
+    );
+  }
+  return new errors/* MultiEmailError */.G(
+    "Microsoft authorization was not completed. Check the account selection and consent policy, then try again.",
+    "MICROSOFT_AUTH_FAILED",
+    { providerCode: safeDetailCode(error?.errorCode || error?.code) },
+  );
+}
+
+function microsoftDiagnosticFailure(error) {
+  if (error?.code === "INVALID_CREDENTIAL") {
+    return { status: "invalid_credential", errorCode: "INVALID_CREDENTIAL", tokenValid: false };
+  }
+  if (
+    error?.code === "REAUTHENTICATION_REQUIRED" ||
+    hasMicrosoftOAuthError(error, MICROSOFT_REAUTH_ERROR_CODES)
+  ) {
+    return {
+      status: "reauthorization_required",
+      errorCode: "REAUTHENTICATION_REQUIRED",
+      tokenValid: false,
+    };
+  }
+  if (
+    error?.code === "OAUTH_PROVIDER_POLICY_BLOCKED" ||
+    hasMicrosoftOAuthError(error, MICROSOFT_POLICY_ERROR_CODES)
+  ) {
+    return {
+      status: "provider_policy_blocked",
+      errorCode: "OAUTH_PROVIDER_POLICY_BLOCKED",
+      tokenValid: null,
+    };
+  }
+  if (
+    error?.code === "OAUTH_RUNTIME_ERROR" ||
+    error?.code === "KEYCHAIN_READ_FAILED" ||
+    error instanceof TypeError
+  ) {
+    return {
+      status: "runtime_error",
+      errorCode: safeDiagnosticErrorCode(error?.code, "OAUTH_RUNTIME_ERROR"),
+      tokenValid: null,
+    };
+  }
+  if (microsoftProviderUnavailable(error) || error instanceof errors/* MultiEmailError */.G) {
+    return {
+      status: "provider_unavailable",
+      errorCode: safeDiagnosticErrorCode(error?.code, "MICROSOFT_PROVIDER_UNAVAILABLE"),
+      tokenValid: null,
+    };
+  }
+  return { status: "runtime_error", errorCode: "OAUTH_RUNTIME_ERROR", tokenValid: null };
+}
+
+function microsoftSilentTokenError(account, error) {
+  const failure = microsoftDiagnosticFailure(error);
+  if (failure.status === "reauthorization_required") {
+    return new errors/* MultiEmailError */.G(
+      `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
+      failure.errorCode,
+      { providerCode: safeDetailCode(error?.errorCode || error?.code) },
+    );
+  }
+  if (failure.status === "provider_policy_blocked") {
+    return new errors/* MultiEmailError */.G(
+      "Microsoft tenant or account policy blocked this OAuth application. Browser changes will not bypass the policy.",
+      failure.errorCode,
+    );
+  }
+  if (failure.status === "runtime_error") {
+    return new errors/* MultiEmailError */.G(
+      "The local Microsoft OAuth runtime failed. Reinstall or run self-test; do not reauthorize yet.",
+      failure.errorCode,
+    );
+  }
+  return error instanceof errors/* MultiEmailError */.G
+    ? error
+    : new errors/* MultiEmailError */.G(
+        "Microsoft token validation could not reach the provider.",
+        failure.errorCode,
+      );
+}
+
 function safeRetryAfter(value) {
   const retryAfter = typeof value === "string" ? value.trim() : "";
   return /^\d{1,10}$/u.test(retryAfter) ? retryAfter : null;
@@ -62338,7 +62989,7 @@ class MicrosoftProvider {
   constructor({
     config,
     credentialStore,
-    browserOpener = openBrowser,
+    browserOpener = oauth_browser/* openOAuthBrowser */.ay,
     fetchImpl = globalThis.fetch,
     graphRequestTimeoutMs = GRAPH_REQUEST_TIMEOUT_MS,
   }) {
@@ -62438,11 +63089,13 @@ class MicrosoftProvider {
     return (await this.credentialRecord(account)) !== null;
   }
 
-  async authorize(account, { onInstruction = console.log } = {}) {
+  async authorize(account, { browser = "default", onInstruction = console.log } = {}) {
     const application = this.createApplication(account, { persist: false });
-    onInstruction(`Opening Microsoft authorization for ${account.alias} (${account.email})...`);
     onInstruction(
-      "If Microsoft says admin approval is required, a GoDaddy/Microsoft 365 Global Admin must grant consent.",
+      `Opening Microsoft authorization in ${browser} for ${account.alias} (${account.email})...`,
+    );
+    onInstruction(
+      "If Microsoft says admin approval is required, an administrator for the selected tenant must review the delegated permissions.",
     );
 
     let result;
@@ -62451,24 +63104,20 @@ class MicrosoftProvider {
         scopes: [...DELEGATED_SCOPES],
         loginHint: account.email,
         prompt: "select_account",
-        openBrowser: this.browserOpener,
+        openBrowser: (url) => this.browserOpener(url, browser),
         successTemplate:
-          "<!doctype html><meta charset=utf-8><title>Multi Email</title><h1>Authorization complete</h1><p>You may close this window.</p>",
+          "<!doctype html><meta charset=utf-8><title>Multi Email</title><h1>Microsoft sign-in response received</h1><p>Authorization is not complete until Multi Email verifies the scopes, mailbox identity, and macOS Keychain storage in the terminal.</p>",
         errorTemplate:
           "<!doctype html><meta charset=utf-8><title>Multi Email</title><h1>Authorization failed</h1><p>Return to the terminal for details.</p>",
       });
     } catch (error) {
-      throw new errors/* MultiEmailError */.G(
-        "Microsoft authorization was not completed. Check the account selection and consent policy, then try again.",
-        "MICROSOFT_AUTH_FAILED",
-        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
-      );
+      throw classifyMicrosoftAuthorizationError(error);
     }
 
     if (!result?.accessToken) {
       throw new errors/* MultiEmailError */.G("Microsoft returned no access token.", "MISSING_ACCESS_TOKEN");
     }
-    if (result.scopes && !hasRequiredScopes(result.scopes)) {
+    if (!hasRequiredScopes(result.scopes)) {
       throw new errors/* MultiEmailError */.G(
         "Microsoft did not grant all required mail scopes. Nothing was saved.",
         "INSUFFICIENT_SCOPES",
@@ -62478,10 +63127,9 @@ class MicrosoftProvider {
     // Persist only after /me proves that the chosen identity belongs to this configured alias.
     const profile = await this.graphRequestWithToken(result.accessToken, "me?$select=id,displayName,mail,userPrincipalName");
     assertProfileMatches(account, profile);
-    await this.credentialStore.set(
-      credentialKey(this.config, account),
-      application.getTokenCache().serialize(),
-    );
+    const key = credentialKey(this.config, account);
+    const serialized = application.getTokenCache().serialize();
+    await (0,credential_transaction/* replaceCredentialVerified */.C)(this.credentialStore, key, serialized);
     this.applications.delete(account.alias);
     this.verifiedAliases.delete(account.alias);
 
@@ -62511,6 +63159,12 @@ class MicrosoftProvider {
       checkDeadline();
     } catch (error) {
       if (error instanceof errors/* MultiEmailError */.G) throw error;
+      if (error instanceof TypeError) {
+        throw new errors/* MultiEmailError */.G(
+          "The local Microsoft OAuth runtime failed. Reinstall or run self-test; do not reauthorize yet.",
+          "OAUTH_RUNTIME_ERROR",
+        );
+      }
       throw new errors/* MultiEmailError */.G(
         `Unable to load the Microsoft credential for '${account.alias}'. Reauthorize this account.`,
         "INVALID_CREDENTIAL",
@@ -62549,18 +63203,14 @@ class MicrosoftProvider {
       ) {
         throw error;
       }
-      throw new errors/* MultiEmailError */.G(
-        `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
-        "REAUTHENTICATION_REQUIRED",
-        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
-      );
+      throw microsoftSilentTokenError(account, error);
     }
 
     if (!result?.accessToken) {
       throw new errors/* MultiEmailError */.G("Microsoft returned no access token.", "MISSING_ACCESS_TOKEN");
     }
 
-    if (result.scopes && !hasRequiredScopes(result.scopes)) {
+    if (!hasRequiredScopes(result.scopes)) {
       throw new errors/* MultiEmailError */.G(
         `Microsoft authorization for '${account.alias}' is missing required mail scopes. Reauthorize it.`,
         "INSUFFICIENT_SCOPES",
@@ -62619,10 +63269,11 @@ class MicrosoftProvider {
       let accounts;
       try {
         accounts = await application.getAllAccounts();
-      } catch {
-        diagnostic.token_valid = false;
-        diagnostic.status = "invalid_credential";
-        diagnostic.error_code = "INVALID_CREDENTIAL";
+      } catch (error) {
+        const failure = microsoftDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
       if (!accounts.length) {
@@ -62666,9 +63317,10 @@ class MicrosoftProvider {
         ) {
           throw error;
         }
-        diagnostic.token_valid = false;
-        diagnostic.status = "reauthorization_required";
-        diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
+        const failure = microsoftDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
 
@@ -62689,20 +63341,29 @@ class MicrosoftProvider {
         diagnostic.status = "ok";
       } catch (error) {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
-        diagnostic.status =
-          diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = safeDiagnosticErrorCode(
-          error?.code,
-          "MICROSOFT_PROFILE_FAILED",
-        );
+        if (diagnostic.identity_verified === false) {
+          diagnostic.status = "identity_mismatch";
+          diagnostic.error_code = "ACCOUNT_MISMATCH";
+        } else {
+          const failure = microsoftDiagnosticFailure(error);
+          diagnostic.status = failure.status;
+          diagnostic.error_code = failure.errorCode;
+        }
       }
       return diagnostic;
     } catch (error) {
-      diagnostic.status = "configuration_error";
-      diagnostic.error_code = safeDiagnosticErrorCode(
-        error?.code,
-        "MICROSOFT_CLIENT_NOT_CONFIGURED",
-      );
+      if (["MICROSOFT_CLIENT_NOT_CONFIGURED", "INVALID_CONFIG"].includes(error?.code)) {
+        diagnostic.status = "configuration_error";
+        diagnostic.error_code = safeDiagnosticErrorCode(
+          error?.code,
+          "MICROSOFT_CLIENT_NOT_CONFIGURED",
+        );
+      } else {
+        const failure = microsoftDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
+      }
       return diagnostic;
     }
   }
@@ -63733,7 +64394,7 @@ class SendApprovalStore {
 
 /***/ }),
 
-/***/ 3196:
+/***/ 9008:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
 "use strict";
@@ -83684,6 +84345,8 @@ var errors = __nccwpck_require__(178);
 var keychain = __nccwpck_require__(9055);
 // EXTERNAL MODULE: external "node:crypto"
 var external_node_crypto_ = __nccwpck_require__(7598);
+// EXTERNAL MODULE: ./src/connection-diagnostic.mjs
+var connection_diagnostic = __nccwpck_require__(7005);
 // EXTERNAL MODULE: ./src/providers/gmail.mjs + 9 modules
 var gmail = __nccwpck_require__(63);
 // EXTERNAL MODULE: ./src/providers/microsoft.mjs + 113 modules
@@ -83693,6 +84356,7 @@ var mime = __nccwpck_require__(7123);
 // EXTERNAL MODULE: ./src/send-approval.mjs
 var send_approval = __nccwpck_require__(2443);
 ;// CONCATENATED MODULE: ./src/mail-service.mjs
+
 
 
 
@@ -83732,31 +84396,6 @@ const PRE_SEND_TRANSPORT_CODES = new Set([
 function safePublicErrorCode(value, fallback = "PROVIDER_ERROR") {
   const code = typeof value === "string" ? value.trim() : "";
   return PUBLIC_ERROR_CODE.test(code) ? code : fallback;
-}
-
-function diagnosticErrorFallback(provider) {
-  if (provider === "google") return "GOOGLE_PROFILE_FAILED";
-  if (provider === "microsoft") return "MICROSOFT_PROFILE_FAILED";
-  return "PROVIDER_DIAGNOSIS_FAILED";
-}
-
-function sanitizeDiagnostic(account, diagnostic) {
-  if (!diagnostic || typeof diagnostic !== "object") {
-    throw new errors/* MultiEmailError */.G(
-      "The provider returned an invalid diagnostic result.",
-      "INVALID_PROVIDER_RESPONSE",
-    );
-  }
-  if (!Object.hasOwn(diagnostic, "error_code") || diagnostic.error_code === null) {
-    return diagnostic;
-  }
-  return {
-    ...diagnostic,
-    error_code: safePublicErrorCode(
-      diagnostic.error_code,
-      diagnosticErrorFallback(account.provider),
-    ),
-  };
 }
 
 function isKnownPreSendTransportFailure(error) {
@@ -84055,14 +84694,18 @@ class MailService {
     const accounts = alias === undefined ? this.config.accounts : [this.account(alias)];
     return Promise.all(
       accounts.map(async (account) => {
-        const provider = this.provider(account);
-        if (typeof provider.diagnose !== "function") {
-          throw new errors/* MultiEmailError */.G(
-            `Diagnostics are not supported for provider '${account.provider}'.`,
-            "UNSUPPORTED_OPERATION",
-          );
+        try {
+          const provider = this.provider(account);
+          if (typeof provider.diagnose !== "function") {
+            throw new errors/* MultiEmailError */.G(
+              `Diagnostics are not supported for provider '${account.provider}'.`,
+              "UNSUPPORTED_OPERATION",
+            );
+          }
+          return (0,connection_diagnostic/* diagnosticRecord */.lH)(account, await provider.diagnose(account));
+        } catch (error) {
+          return (0,connection_diagnostic/* unexpectedDiagnosticRecord */.KQ)(account, error);
         }
-        return sanitizeDiagnostic(account, await provider.diagnose(account));
       }),
     );
   }
@@ -84340,6 +84983,308 @@ class MailService {
 
 // EXTERNAL MODULE: ./src/operation-deadline.mjs + 1 modules
 var operation_deadline = __nccwpck_require__(6378);
+// EXTERNAL MODULE: external "node:fs/promises"
+var promises_ = __nccwpck_require__(1455);
+// EXTERNAL MODULE: external "node:module"
+var external_node_module_ = __nccwpck_require__(8995);
+// EXTERNAL MODULE: external "node:path"
+var external_node_path_ = __nccwpck_require__(6760);
+;// CONCATENATED MODULE: ./src/runtime-integrity.mjs
+
+
+
+
+
+
+const RUNTIME_INFO_SYMBOL = Symbol.for("io.github.lanfuli.multi-email.runtime-info");
+const HASH_PATTERN = /^[a-f0-9]{64}$/u;
+const CHUNK_PATTERN = /\.index\.cjs\.js$/u;
+const SAFE_FAILURE_REASONS = new Set([
+  "ARTIFACT_HASH_MISMATCH",
+  "ARTIFACT_MISSING",
+  "ARTIFACT_NOT_REGULAR",
+  "ARTIFACT_SET_MISMATCH",
+  "BUILD_MANIFEST_INVALID",
+  "BUNDLE_ENTRY_INVALID",
+  "BUNDLE_LOAD_FAILED",
+  "BUNDLE_START_FAILED",
+  "DIST_MISSING",
+  "LAZY_CHUNK_INVALID",
+  "LAZY_CHUNK_LOAD_FAILED",
+  "LAZY_CHUNK_MISSING",
+  "NATIVE_RUNTIME_UNAVAILABLE",
+  "PACKAGE_BOUNDARY_INVALID",
+  "PACKAGE_METADATA_INVALID",
+  "VERIFIED_RUNTIME_INFO_INVALID",
+]);
+const INSTALL_CHANNELS = new Set([
+  "codex_plugin_cache",
+  "git_checkout",
+  "local_package",
+  "npm_install",
+]);
+
+class RuntimeIntegrityError extends Error {
+  constructor(reason) {
+    super("Multi Email runtime integrity verification failed.");
+    this.name = "RuntimeIntegrityError";
+    this.code = "RUNTIME_INTEGRITY_ERROR";
+    this.reason = reason;
+  }
+}
+
+function fail(reason) {
+  throw new RuntimeIntegrityError(reason);
+}
+
+async function readJson(absolutePath, reason) {
+  try {
+    const value = JSON.parse(await readFile(absolutePath, "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) fail(reason);
+    return value;
+  } catch (error) {
+    if (error instanceof RuntimeIntegrityError) throw error;
+    fail(reason);
+  }
+}
+
+function portable(relativePath) {
+  return relativePath.split(path.sep).join("/");
+}
+
+async function artifactFiles(directory, root = directory) {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    fail("DIST_MISSING");
+  }
+
+  const files = [];
+  for (const entry of entries) {
+    const absolute = path.join(directory, entry.name);
+    const relative = portable(path.relative(root, absolute));
+    if (entry.isSymbolicLink()) fail("ARTIFACT_NOT_REGULAR");
+    if (entry.isDirectory()) {
+      files.push(...(await artifactFiles(absolute, root)));
+    } else if (entry.isFile()) {
+      if (relative !== "build-manifest.json") files.push(relative);
+    } else {
+      fail("ARTIFACT_NOT_REGULAR");
+    }
+  }
+  return files.sort();
+}
+
+function validArtifactName(relative) {
+  return (
+    typeof relative === "string" &&
+    relative.length > 0 &&
+    relative === portable(relative) &&
+    path.posix.normalize(relative) === relative &&
+    !relative.startsWith("../") &&
+    !path.posix.isAbsolute(relative)
+  );
+}
+
+async function digestFile(absolutePath) {
+  try {
+    const metadata = await lstat(absolutePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) fail("ARTIFACT_NOT_REGULAR");
+    return createHash("sha256").update(await readFile(absolutePath)).digest("hex");
+  } catch (error) {
+    if (error instanceof RuntimeIntegrityError) throw error;
+    fail("ARTIFACT_MISSING");
+  }
+}
+
+async function installChannel(pluginRoot) {
+  const portableRoot = portable(path.resolve(pluginRoot));
+  if (portableRoot.includes("/.codex/plugins/cache/")) return "codex_plugin_cache";
+  if (portableRoot.includes("/node_modules/")) return "npm_install";
+  try {
+    await lstat(path.join(pluginRoot, ".git"));
+    return "git_checkout";
+  } catch {
+    return "local_package";
+  }
+}
+
+function publicInfo(value) {
+  return {
+    ok: true,
+    appVersion: value.appVersion,
+    buildId: value.buildId,
+    integrity: "verified",
+    artifactsVerified: value.artifactsVerified,
+    lazyChunksVerified: value.lazyChunksVerified,
+    nativeRuntime: "verified",
+    architecture: process.arch,
+    installChannel: value.installChannel,
+  };
+}
+
+async function verifyRuntimeBundle(
+  pluginRoot,
+  { nativeLoader = undefined } = {},
+) {
+  const root = path.resolve(pluginRoot);
+  const dist = path.join(root, "dist");
+  const moduleLoader = createRequire(path.join(root, "package.json"));
+  const packageJson = await readJson(path.join(root, "package.json"), "PACKAGE_METADATA_INVALID");
+  const manifest = await readJson(
+    path.join(dist, "build-manifest.json"),
+    "BUILD_MANIFEST_INVALID",
+  );
+  const distPackage = await readJson(
+    path.join(dist, "package.json"),
+    "PACKAGE_BOUNDARY_INVALID",
+  );
+
+  if (
+    distPackage.type !== "commonjs" ||
+    Object.keys(distPackage).length !== 1
+  ) {
+    fail("PACKAGE_BOUNDARY_INVALID");
+  }
+  if (
+    packageJson.version !== APP_VERSION ||
+    manifest.appVersion !== APP_VERSION ||
+    manifest.entry !== "server.cjs" ||
+    !HASH_PATTERN.test(String(manifest.sourceSha256 || "")) ||
+    !manifest.artifacts ||
+    typeof manifest.artifacts !== "object" ||
+    Array.isArray(manifest.artifacts)
+  ) {
+    fail("BUILD_MANIFEST_INVALID");
+  }
+
+  const recordedFiles = Object.keys(manifest.artifacts).sort();
+  if (
+    recordedFiles.length === 0 ||
+    recordedFiles.some((relative) => !validArtifactName(relative))
+  ) {
+    fail("BUILD_MANIFEST_INVALID");
+  }
+  const currentFiles = await artifactFiles(dist);
+  if (JSON.stringify(recordedFiles) !== JSON.stringify(currentFiles)) {
+    fail("ARTIFACT_SET_MISMATCH");
+  }
+  for (const relative of recordedFiles) {
+    const expected = manifest.artifacts[relative];
+    if (!HASH_PATTERN.test(String(expected || ""))) fail("BUILD_MANIFEST_INVALID");
+    if ((await digestFile(path.join(dist, relative))) !== expected) {
+      fail("ARTIFACT_HASH_MISMATCH");
+    }
+  }
+
+  const chunkFiles = recordedFiles.filter((relative) => CHUNK_PATTERN.test(relative));
+  if (chunkFiles.length === 0) fail("LAZY_CHUNK_MISSING");
+  for (const relative of chunkFiles) {
+    let chunk;
+    try {
+      chunk = moduleLoader(path.join(dist, relative));
+    } catch {
+      fail("LAZY_CHUNK_LOAD_FAILED");
+    }
+    if (
+      !Array.isArray(chunk?.ids) ||
+      chunk.ids.length === 0 ||
+      !chunk.modules ||
+      typeof chunk.modules !== "object" ||
+      Object.keys(chunk.modules).length === 0
+    ) {
+      fail("LAZY_CHUNK_INVALID");
+    }
+  }
+
+  const nativeFile = `keyring.darwin-${process.arch}.node`;
+  if (
+    process.platform !== "darwin" ||
+    !Array.isArray(manifest.nativeAssets) ||
+    !manifest.nativeAssets.includes(nativeFile) ||
+    !recordedFiles.includes(nativeFile)
+  ) {
+    fail("NATIVE_RUNTIME_UNAVAILABLE");
+  }
+  let nativeRuntime;
+  try {
+    nativeRuntime = (nativeLoader || moduleLoader)(path.join(dist, nativeFile));
+  } catch {
+    fail("NATIVE_RUNTIME_UNAVAILABLE");
+  }
+  if (typeof nativeRuntime?.Entry !== "function") {
+    fail("NATIVE_RUNTIME_UNAVAILABLE");
+  }
+
+  return publicInfo({
+    appVersion: APP_VERSION,
+    buildId: manifest.sourceSha256,
+    artifactsVerified: recordedFiles.length,
+    lazyChunksVerified: chunkFiles.length,
+    installChannel: await installChannel(root),
+  });
+}
+
+function installVerifiedRuntimeInfo(info) {
+  if (
+    !info ||
+    info.ok !== true ||
+    info.appVersion !== APP_VERSION ||
+    info.integrity !== "verified" ||
+    !HASH_PATTERN.test(String(info.buildId || "")) ||
+    !Number.isSafeInteger(info.artifactsVerified) ||
+    info.artifactsVerified < 1 ||
+    !Number.isSafeInteger(info.lazyChunksVerified) ||
+    info.lazyChunksVerified < 1 ||
+    info.nativeRuntime !== "verified" ||
+    info.architecture !== process.arch ||
+    !INSTALL_CHANNELS.has(info.installChannel)
+  ) {
+    fail("VERIFIED_RUNTIME_INFO_INVALID");
+  }
+  globalThis[RUNTIME_INFO_SYMBOL] = Object.freeze({
+    ok: true,
+    appVersion: APP_VERSION,
+    buildId: info.buildId,
+    integrity: "verified",
+    artifactsVerified: info.artifactsVerified,
+    lazyChunksVerified: info.lazyChunksVerified,
+    nativeRuntime: "verified",
+    architecture: process.arch,
+    installChannel: info.installChannel,
+  });
+}
+
+function currentRuntimeInfo() {
+  const verified = globalThis[RUNTIME_INFO_SYMBOL];
+  if (verified) return { ...verified };
+  return {
+    ok: true,
+    appVersion: constants/* APP_VERSION */.hl,
+    buildId: null,
+    integrity: "unverified",
+    artifactsVerified: 0,
+    lazyChunksVerified: 0,
+    nativeRuntime: "unverified",
+    architecture: process.arch,
+    installChannel: "development_source",
+  };
+}
+
+function safeRuntimeFailure(error) {
+  const reason =
+    error instanceof RuntimeIntegrityError && SAFE_FAILURE_REASONS.has(error.reason)
+      ? error.reason
+      : "RUNTIME_CHECK_FAILED";
+  return {
+    ok: false,
+    code: "RUNTIME_INTEGRITY_ERROR",
+    reason,
+    requiredAction: "reinstall_or_rebuild",
+  };
+}
+
 // EXTERNAL MODULE: external "node:child_process"
 var external_node_child_process_ = __nccwpck_require__(1421);
 // EXTERNAL MODULE: external "node:http"
@@ -84812,6 +85757,7 @@ class LocalSendApprovalUi {
 
 
 
+
 const server = new McpServer({
   name: constants/* APP_NAME */.C3,
   version: constants/* APP_VERSION */.hl,
@@ -84887,6 +85833,17 @@ const reversibleWriteAnnotations = {
 };
 
 server.registerTool(
+  "mail_get_runtime_info",
+  {
+    title: "Inspect the Multi Email runtime",
+    description:
+      "Return the active plugin version, build identity, integrity status, architecture, and install channel without reading configuration, credentials, provider state, or mailbox content.",
+    annotations: { ...readAnnotations, openWorldHint: false },
+  },
+  () => safeMcpOperation(async () => currentRuntimeInfo()),
+);
+
+server.registerTool(
   "mail_list_accounts",
   {
     title: "List configured email accounts",
@@ -84902,7 +85859,7 @@ server.registerTool(
   {
     title: "Diagnose email account connections",
     description:
-      "Check credential presence, token validity, required scopes, and provider identity for one alias or every configured account. Does not read messages or change credentials.",
+      "Return a safe per-alias connection record with the expected identity, verified identity when healthy, credential/token/scope checks, status, and one next step. A failure for one alias does not hide the others. Does not read messages or change credentials.",
     inputSchema: { account_alias: accountAlias.optional() },
     annotations: readAnnotations,
   },
@@ -85151,10 +86108,14 @@ __nccwpck_require__.r(__webpack_exports__);
 /* harmony import */ var node_url__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(3136);
 /* harmony import */ var node_util__WEBPACK_IMPORTED_MODULE_3__ = __nccwpck_require__(7975);
 /* harmony import */ var _config_mjs__WEBPACK_IMPORTED_MODULE_4__ = __nccwpck_require__(9539);
-/* harmony import */ var _constants_mjs__WEBPACK_IMPORTED_MODULE_5__ = __nccwpck_require__(1102);
-/* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_6__ = __nccwpck_require__(178);
-/* harmony import */ var _keychain_mjs__WEBPACK_IMPORTED_MODULE_7__ = __nccwpck_require__(9055);
-/* harmony import */ var _validation_mjs__WEBPACK_IMPORTED_MODULE_8__ = __nccwpck_require__(6918);
+/* harmony import */ var _connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__ = __nccwpck_require__(7005);
+/* harmony import */ var _constants_mjs__WEBPACK_IMPORTED_MODULE_6__ = __nccwpck_require__(1102);
+/* harmony import */ var _errors_mjs__WEBPACK_IMPORTED_MODULE_7__ = __nccwpck_require__(178);
+/* harmony import */ var _keychain_mjs__WEBPACK_IMPORTED_MODULE_8__ = __nccwpck_require__(9055);
+/* harmony import */ var _oauth_browser_mjs__WEBPACK_IMPORTED_MODULE_9__ = __nccwpck_require__(7423);
+/* harmony import */ var _validation_mjs__WEBPACK_IMPORTED_MODULE_10__ = __nccwpck_require__(6918);
+
+
 
 
 
@@ -85170,12 +86131,13 @@ const HELP = `Multi Email setup
 
 Usage:
   multi-email setup
-  multi-email init --google-client-json <desktop-oauth.json> [--microsoft-client-id <guid>] [--microsoft-tenant <tenant>]
+  multi-email init --google-client-json <desktop-oauth.json> [--microsoft-client-id <guid>] [--microsoft-tenant <tenant>] [--confirm]
   multi-email init --microsoft-client-id <guid> [--microsoft-tenant <tenant>]
   multi-email add-account <alias> <email> <google|microsoft>
   multi-email set-microsoft-client <guid> [--microsoft-tenant <tenant>]
-  multi-email auth <alias>
+  multi-email auth <alias> [--browser <default|safari|chrome>] [--force]
   multi-email doctor [alias] [--json]
+  multi-email self-test [--json]
   multi-email logout <alias> --confirm
   multi-email revoke <alias> --confirm
   multi-email list
@@ -85190,34 +86152,24 @@ Notes:
   - setup is a non-interactive, read-only preflight and never reads credentials.
   - doctor may contact the provider but never writes or migrates credentials.
   - doctor --json emits one stable JSON object per line.
+  - self-test does not read config, Keychain, providers, or mailbox data.
   - logout removes local credentials. revoke also removes the provider grant where supported.
 `;
 
 const COMMAND_OPTIONS = Object.freeze({
   setup: new Set(),
-  init: new Set(["google-client-json", "microsoft-client-id", "microsoft-tenant"]),
+  init: new Set(["google-client-json", "microsoft-client-id", "microsoft-tenant", "confirm"]),
   "add-account": new Set(),
   "set-microsoft-client": new Set(["microsoft-tenant"]),
-  auth: new Set(),
+  auth: new Set(["browser", "force"]),
   doctor: new Set(["json"]),
   logout: new Set(["confirm"]),
   revoke: new Set(["confirm"]),
   list: new Set(),
 });
 
-const DIAGNOSTIC_STATUSES = new Set([
-  "ok",
-  "not_authorized",
-  "invalid_credential",
-  "reauthorization_required",
-  "insufficient_scopes",
-  "identity_mismatch",
-  "provider_unavailable",
-  "configuration_error",
-]);
-
 function fail(message, code = "INVALID_ARGUMENT") {
-  throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_6__/* .MultiEmailError */ .G(message, code);
+  throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_7__/* .MultiEmailError */ .G(message, code);
 }
 
 function requireNoExtraPositionals(positionals, expected) {
@@ -85256,36 +86208,17 @@ async function inspectConfiguration(configPath) {
 
 function providerReady(config, provider) {
   return provider === "google"
-    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .googleProviderConfigured */ .jS)(config.providers.google)
-    : (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .microsoftProviderConfigured */ .CH)(config.providers.microsoft);
-}
-
-function executableCommand(command) {
-  const prefix = "multi-email ";
-  if (!command.startsWith(prefix)) return command;
-  return `${command} (or node ./scripts/multi-email ${command.slice(prefix.length)} from a Git clone)`;
-}
-
-function providerSetupCommand(provider, { configExists = true } = {}) {
-  if (provider === "microsoft") {
-    return executableCommand(
-      configExists
-        ? "multi-email set-microsoft-client <application-guid>"
-        : "multi-email init --microsoft-client-id <application-guid> --microsoft-tenant organizations",
-    );
-  }
-  return executableCommand(
-    "multi-email init --google-client-json <desktop-oauth.json>",
-  );
+    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .googleProviderConfigured */ .jS)(config.providers.google)
+    : (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .microsoftProviderConfigured */ .CH)(config.providers.microsoft);
 }
 
 function nextAddAccountCommand(provider) {
-  return executableCommand(`multi-email add-account <alias> <email> ${provider}`);
+  return (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .executableCommand */ .Sd)(`multi-email add-account <alias> <email> ${provider}`);
 }
 
 function setupNextCommands({ config, status }) {
   if (status === "microsoft_repair_required") {
-    return [providerSetupCommand("microsoft")];
+    return [(0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .providerSetupCommand */ .i$)("microsoft")];
   }
 
   const missingAccountProviders = [];
@@ -85298,10 +86231,10 @@ function setupNextCommands({ config, status }) {
     }
   }
   if (missingAccountProviders.length) {
-    return missingAccountProviders.map((provider) => providerSetupCommand(provider));
+    return missingAccountProviders.map((provider) => (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .providerSetupCommand */ .i$)(provider));
   }
 
-  if (config.accounts.length) return [executableCommand("multi-email doctor")];
+  if (config.accounts.length) return [(0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .executableCommand */ .Sd)("multi-email doctor")];
 
   const configuredProviders = ["google", "microsoft"].filter((provider) =>
     providerReady(config, provider),
@@ -85311,8 +86244,8 @@ function setupNextCommands({ config, status }) {
   }
 
   return [
-    providerSetupCommand("google", { configExists: status !== "missing" }),
-    providerSetupCommand("microsoft", { configExists: status !== "missing" }),
+    (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .providerSetupCommand */ .i$)("google", { configExists: status !== "missing" }),
+    (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .providerSetupCommand */ .i$)("microsoft", { configExists: status !== "missing" }),
   ];
 }
 
@@ -85340,7 +86273,7 @@ async function setupCommand({ positionals, configPath, configLocation, output })
 
   output("Multi Email setup status");
   output("ITEM\tSTATUS\tDETAIL");
-  output(`Version\tready\t${safeCell(_constants_mjs__WEBPACK_IMPORTED_MODULE_5__/* .APP_VERSION */ .hl)}`);
+  output(`Version\tready\t${safeCell(_constants_mjs__WEBPACK_IMPORTED_MODULE_6__/* .APP_VERSION */ .hl)}`);
   output(`Config\t${safeCell(state.status)}\t${configLocation}`);
   output(
     `Google OAuth\t${googleReady ? "ready" : "not_configured"}\t${
@@ -85380,7 +86313,13 @@ async function readGoogleDesktopClient(filePath) {
   }
 
   const installed = parsed?.installed;
-  if (!installed?.client_id || !installed?.client_secret) {
+  const clientId = typeof installed?.client_id === "string"
+    ? installed.client_id.trim()
+    : "";
+  const clientSecret = typeof installed?.client_secret === "string"
+    ? installed.client_secret.trim()
+    : "";
+  if (!clientId || !clientSecret) {
     fail(
       "The Google file must be a Desktop app OAuth client JSON (the 'installed' client type).",
       "INVALID_GOOGLE_CLIENT",
@@ -85388,9 +86327,35 @@ async function readGoogleDesktopClient(filePath) {
   }
 
   return {
-    clientId: String(installed.client_id),
-    clientSecret: String(installed.client_secret),
+    clientId,
+    clientSecret,
   };
+}
+
+function googleAliases(config) {
+  return config.accounts
+    .filter((account) => account.provider === "google")
+    .map((account) => account.alias);
+}
+
+function isGoogleClientReplacement(config, google) {
+  const existingClientId = String(config.providers.google?.clientId || "").trim();
+  return Boolean(existingClientId && existingClientId !== google.clientId);
+}
+
+function outputGoogleClientReplacementImpact(output, aliases) {
+  output(
+    `Google OAuth client replacement affects ${aliases.length} configured Google alias${aliases.length === 1 ? "" : "es"}.`,
+  );
+  if (!aliases.length) {
+    output("No Google aliases currently require reauthorization.");
+    return;
+  }
+  output("Every affected Google alias must be authorized again and then diagnosed:");
+  for (const alias of aliases) {
+    output(`  ${(0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .executableCommand */ .Sd)(`multi-email auth ${alias} --force`)}`);
+    output(`  ${(0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .executableCommand */ .Sd)(`multi-email doctor ${alias} --json`)}`);
+  }
 }
 
 async function instantiateProvider(provider, config, credentialStore) {
@@ -85422,14 +86387,26 @@ async function initCommand({ values, positionals, configPath, output }) {
     ? await readGoogleDesktopClient(googleClientPath)
     : undefined;
   const microsoftClientId = microsoftClientIdValue
-    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftClientId */ .U)(microsoftClientIdValue)
+    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .normalizeMicrosoftClientId */ .U)(microsoftClientIdValue)
     : undefined;
   const microsoftTenant = microsoftClientId
-    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftTenant */ .Cw)(values["microsoft-tenant"] || "organizations")
+    ? (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .normalizeMicrosoftTenant */ .Cw)(values["microsoft-tenant"] || "organizations")
     : undefined;
   const config = await loadConfigOrEmpty(configPath, {
     repairMicrosoft: Boolean(microsoftClientId),
   });
+  const replacingGoogleClient = Boolean(google && isGoogleClientReplacement(config, google));
+  const affectedGoogleAliases = replacingGoogleClient ? googleAliases(config) : [];
+  if (replacingGoogleClient && !values.confirm) {
+    outputGoogleClientReplacementImpact(output, affectedGoogleAliases);
+    const reauthorizationImpact = affectedGoogleAliases.length
+      ? `After replacement, all ${affectedGoogleAliases.length} affected Google aliases require 'multi-email auth <alias> --force' followed by 'multi-email doctor <alias> --json'.`
+      : "This replacement affects 0 configured Google aliases, so none currently require reauthorization.";
+    fail(
+      `Refusing to replace the configured Google OAuth client without --confirm. ${reauthorizationImpact} Re-run the same init command with --confirm only after reviewing this impact.`,
+      "GOOGLE_CLIENT_REPLACEMENT_CONFIRMATION_REQUIRED",
+    );
+  }
   if (google) config.providers.google = google;
 
   if (microsoftClientId) {
@@ -85441,14 +86418,18 @@ async function initCommand({ values, positionals, configPath, output }) {
 
   const saved = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .saveConfig */ .ql)(config, configPath);
   output(`Initialized Multi Email configuration at ${configPath}.`);
-  const googleConfigured = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .googleProviderConfigured */ .jS)(saved.providers.google);
-  const microsoftConfigured = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .microsoftProviderConfigured */ .CH)(saved.providers.microsoft);
+  const googleConfigured = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .googleProviderConfigured */ .jS)(saved.providers.google);
+  const microsoftConfigured = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .microsoftProviderConfigured */ .CH)(saved.providers.microsoft);
   if (googleConfigured && microsoftConfigured) {
     output("Google and Microsoft OAuth clients are configured.");
   } else if (googleConfigured) {
     output("Google OAuth is configured. Microsoft can be added later with set-microsoft-client.");
   } else if (microsoftConfigured) {
     output("Microsoft OAuth is configured. Google can be added later with init --google-client-json.");
+  }
+  if (replacingGoogleClient) {
+    output("Google OAuth client replacement confirmed and saved.");
+    outputGoogleClientReplacementImpact(output, affectedGoogleAliases);
   }
 }
 
@@ -85460,7 +86441,7 @@ async function addAccountCommand({ positionals, configPath, output }) {
     fail("Account provider must be 'google' or 'microsoft'.");
   }
   const config = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath);
-  if (provider === "google" && !(0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .googleProviderConfigured */ .jS)(config.providers.google)) {
+  if (provider === "google" && !(0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .googleProviderConfigured */ .jS)(config.providers.google)) {
     fail(
       "Google OAuth is not configured. Run 'multi-email init --google-client-json <desktop-oauth.json>' (or use 'node ./scripts/multi-email init ...' from a Git clone) before adding a Google account.",
       "PROVIDER_NOT_CONFIGURED",
@@ -85468,7 +86449,7 @@ async function addAccountCommand({ positionals, configPath, output }) {
   }
   if (
     provider === "microsoft" &&
-    !(0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .microsoftProviderConfigured */ .CH)(config.providers.microsoft)
+    !(0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .microsoftProviderConfigured */ .CH)(config.providers.microsoft)
   ) {
     fail(
       "Microsoft OAuth is not configured. Run 'multi-email set-microsoft-client <application-guid>' (or use 'node ./scripts/multi-email set-microsoft-client ...' from a Git clone) before adding a Microsoft account.",
@@ -85486,12 +86467,12 @@ async function addAccountCommand({ positionals, configPath, output }) {
 
 async function setMicrosoftClientCommand({ values, positionals, configPath, output }) {
   requireNoExtraPositionals(positionals, 1);
-  const clientId = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftClientId */ .U)(positionals[0]);
+  const clientId = (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .normalizeMicrosoftClientId */ .U)(positionals[0]);
 
   const config = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfigForMicrosoftRepair */ .Vp)(configPath);
   config.providers.microsoft = {
     clientId,
-    tenant: (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_8__/* .normalizeMicrosoftTenant */ .Cw)(
+    tenant: (0,_validation_mjs__WEBPACK_IMPORTED_MODULE_10__/* .normalizeMicrosoftTenant */ .Cw)(
       values["microsoft-tenant"] || config.providers.microsoft?.tenant || "organizations",
     ),
   };
@@ -85499,83 +86480,81 @@ async function setMicrosoftClientCommand({ values, positionals, configPath, outp
   output("Microsoft OAuth client configuration updated.");
 }
 
-async function authCommand({ positionals, configPath, output, credentialStore, providerFactory }) {
+function authorizationScopes(provider) {
+  return provider === "google" ? _constants_mjs__WEBPACK_IMPORTED_MODULE_6__/* .GOOGLE_SCOPES */ .sO : _constants_mjs__WEBPACK_IMPORTED_MODULE_6__/* .MICROSOFT_SCOPES */ .nx;
+}
+
+function diagnosticIsHealthy(diagnostic) {
+  return (
+    diagnostic?.status === "ok" &&
+    diagnostic?.credential_present === true &&
+    diagnostic?.token_valid === true &&
+    diagnostic?.identity_verified === true &&
+    diagnostic?.scopes_valid === true
+  );
+}
+
+const AUTHORIZABLE_HEALTH_STATUSES = new Set([
+  "identity_mismatch",
+  "insufficient_scopes",
+  "invalid_credential",
+  "not_authorized",
+  "reauthorization_required",
+]);
+
+async function authCommand({
+  values,
+  positionals,
+  configPath,
+  output,
+  credentialStore,
+  providerFactory,
+}) {
   requireNoExtraPositionals(positionals, 1);
   const config = await (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .loadConfig */ .Z9)(configPath);
   const account = (0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .findAccount */ .vF)(config, positionals[0]);
+  const browser = (0,_oauth_browser_mjs__WEBPACK_IMPORTED_MODULE_9__/* .normalizeOAuthBrowser */ .Df)(values.browser || "default");
   const provider = await providerFactory(account.provider, config, credentialStore);
-  const result = await provider.authorize(account, { onInstruction: output });
-  output(`Authorized '${result.alias}' as ${result.email} with ${result.provider}.`);
-}
-
-function triState(value) {
-  return value === true ? true : value === false ? false : null;
-}
-
-function safeErrorCode(value, fallback = null) {
-  if (value === null || value === undefined || value === "") return fallback;
-  const code = String(value);
-  return /^[A-Z0-9][A-Z0-9_-]{0,63}$/u.test(code) ? code : fallback;
-}
-
-function diagnosticNextStep(account, status) {
-  switch (status) {
-    case "ok":
-      return "none (ready)";
-    case "not_authorized":
-    case "invalid_credential":
-    case "reauthorization_required":
-    case "insufficient_scopes":
-    case "identity_mismatch":
-      return executableCommand(`multi-email auth ${account.alias}`);
-    case "configuration_error":
-      return providerSetupCommand(account.provider);
-    case "provider_unavailable":
-    default:
-      return executableCommand(`multi-email doctor ${account.alias}`);
+  let diagnostic;
+  try {
+    diagnostic = await provider.diagnose(account);
+  } catch (error) {
+    if (error instanceof _errors_mjs__WEBPACK_IMPORTED_MODULE_7__/* .MultiEmailError */ .G) throw error;
+    throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_7__/* .MultiEmailError */ .G(
+      "Unable to verify the existing account health. Authorization did not start.",
+      "AUTH_PREFLIGHT_FAILED",
+    );
   }
-}
 
-function diagnosticRecord(account, input = {}) {
-  const status = DIAGNOSTIC_STATUSES.has(input?.status)
-    ? input.status
-    : "provider_unavailable";
-  const credentialSource = ["profile", "legacy"].includes(input?.credential_source)
-    ? input.credential_source
-    : null;
-  return {
-    type: "account",
-    alias: account.alias,
-    provider: account.provider,
-    expected_email: account.email,
-    credential_present: triState(input?.credential_present),
-    token_valid: triState(input?.token_valid),
-    identity_verified: triState(input?.identity_verified),
-    scopes_valid: triState(input?.scopes_valid),
-    credential_source: credentialSource,
-    legacy_migration_pending: input?.legacy_migration_pending === true,
-    status,
-    error_code: safeErrorCode(input?.error_code),
-    next_step: diagnosticNextStep(account, status),
-  };
-}
+  output("Authorization preflight");
+  output(`Alias: ${account.alias}`);
+  output(`Expected email: ${account.email}`);
+  output(`Provider: ${account.provider}`);
+  output(`Browser: ${browser}`);
+  output(`Scopes: ${authorizationScopes(account.provider).join(" ")}`);
+  output(`Existing health: ${safeCell(diagnostic?.status || "unknown")}`);
 
-function doctorSummaryRecord(status, nextStep) {
-  return {
-    type: "summary",
-    alias: null,
-    provider: null,
-    expected_email: null,
-    credential_present: null,
-    token_valid: null,
-    identity_verified: null,
-    scopes_valid: null,
-    credential_source: null,
-    legacy_migration_pending: false,
-    status,
-    error_code: null,
-    next_step: nextStep,
-  };
+  if (diagnosticIsHealthy(diagnostic) && !values.force) {
+    output(
+      `Skipped '${account.alias}': the credential, token, scopes, and identity are already healthy. Use --force to authorize it again.`,
+    );
+    return;
+  }
+  if (diagnosticIsHealthy(diagnostic) && values.force) {
+    output(`Force: reauthorizing the already healthy alias '${account.alias}'.`);
+  }
+  if (
+    !diagnosticIsHealthy(diagnostic) &&
+    !AUTHORIZABLE_HEALTH_STATUSES.has(diagnostic?.status)
+  ) {
+    throw new _errors_mjs__WEBPACK_IMPORTED_MODULE_7__/* .MultiEmailError */ .G(
+      `Authorization did not start because the existing health status is '${safeCell(diagnostic?.status || "unknown")}'. Resolve that condition and run doctor again; --force does not bypass runtime, provider, policy, or configuration failures.`,
+      "AUTH_PREFLIGHT_BLOCKED",
+    );
+  }
+
+  const result = await provider.authorize(account, { browser, onInstruction: output });
+  output(`Authorized and verified '${result.alias}' as ${result.email} with ${result.provider}.`);
 }
 
 function humanBoolean(value) {
@@ -85588,11 +86567,15 @@ function renderDoctorRecords(records, { json, output }) {
     return;
   }
 
-  output("ALIAS\tPROVIDER\tSTATUS\tCREDENTIAL\tTOKEN\tIDENTITY\tSCOPES\tNEXT STEP");
+  output(
+    "ALIAS\tEXPECTED EMAIL\tVERIFIED EMAIL\tPROVIDER\tSTATUS\tCREDENTIAL\tTOKEN\tIDENTITY\tSCOPES\tNEXT STEP",
+  );
   for (const record of records) {
     output(
       [
         safeCell(record.alias),
+        safeCell(record.expected_email),
+        safeCell(record.verified_email),
         safeCell(record.provider),
         safeCell(record.status),
         humanBoolean(record.credential_present),
@@ -85619,7 +86602,7 @@ async function doctorCommand({
   const state = await inspectConfiguration(configPath);
   if (state.status === "missing") {
     renderDoctorRecords(
-      [doctorSummaryRecord("not_configured", executableCommand("multi-email setup"))],
+      [(0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .doctorSummaryRecord */ .lr)("not_configured", (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .executableCommand */ .Sd)("multi-email setup"))],
       { json: values.json, output },
     );
     return;
@@ -85627,9 +86610,9 @@ async function doctorCommand({
   if (state.status === "microsoft_repair_required") {
     renderDoctorRecords(
       [
-        doctorSummaryRecord(
+        (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .doctorSummaryRecord */ .lr)(
           "microsoft_repair_required",
-          providerSetupCommand("microsoft"),
+          (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .providerSetupCommand */ .i$)("microsoft"),
         ),
       ],
       { json: values.json, output },
@@ -85641,7 +86624,7 @@ async function doctorCommand({
   const accounts = positionals.length ? [(0,_config_mjs__WEBPACK_IMPORTED_MODULE_4__/* .findAccount */ .vF)(config, positionals[0])] : config.accounts;
   if (accounts.length === 0) {
     renderDoctorRecords(
-      [doctorSummaryRecord("no_accounts", setupNextCommands(state)[0])],
+      [(0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .doctorSummaryRecord */ .lr)("no_accounts", setupNextCommands(state)[0])],
       { json: values.json, output },
     );
     return;
@@ -85651,7 +86634,7 @@ async function doctorCommand({
   for (const account of accounts) {
     if (!providerReady(config, account.provider)) {
       records.push(
-        diagnosticRecord(account, {
+        (0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .diagnosticRecord */ .lH)(account, {
           status: "configuration_error",
           error_code:
             account.provider === "google"
@@ -85664,14 +86647,9 @@ async function doctorCommand({
 
     try {
       const provider = await providerFactory(account.provider, config, credentialStore);
-      records.push(diagnosticRecord(account, await provider.diagnose(account)));
+      records.push((0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .diagnosticRecord */ .lH)(account, await provider.diagnose(account)));
     } catch (error) {
-      records.push(
-        diagnosticRecord(account, {
-          status: "provider_unavailable",
-          error_code: safeErrorCode(error?.code, "PROVIDER_DIAGNOSIS_FAILED"),
-        }),
-      );
+      records.push((0,_connection_diagnostic_mjs__WEBPACK_IMPORTED_MODULE_5__/* .unexpectedDiagnosticRecord */ .KQ)(account, error));
     }
   }
   renderDoctorRecords(records, { json: values.json, output });
@@ -85727,7 +86705,9 @@ function parseCliArgs(args) {
       "google-client-json": { type: "string" },
       "microsoft-client-id": { type: "string" },
       "microsoft-tenant": { type: "string" },
+      browser: { type: "string" },
       confirm: { type: "boolean" },
+      force: { type: "boolean" },
       json: { type: "boolean" },
       version: { type: "boolean", short: "V" },
     },
@@ -85741,7 +86721,7 @@ async function run(args = process.argv.slice(2), dependencies = {}) {
   const configLocation = dependencies.configPath || env.CODEX_MULTI_EMAIL_CONFIG
     ? "custom"
     : "default";
-  const credentialStore = dependencies.credentialStore || new _keychain_mjs__WEBPACK_IMPORTED_MODULE_7__/* .KeychainStore */ .kG();
+  const credentialStore = dependencies.credentialStore || new _keychain_mjs__WEBPACK_IMPORTED_MODULE_8__/* .KeychainStore */ .kG();
   const providerFactory = dependencies.providerFactory || instantiateProvider;
   let parsed;
   try {
@@ -85757,7 +86737,7 @@ async function run(args = process.argv.slice(2), dependencies = {}) {
   const [command, ...positionals] = parsed.positionals;
 
   if (parsed.values.version) {
-    output(_constants_mjs__WEBPACK_IMPORTED_MODULE_5__/* .APP_VERSION */ .hl);
+    output(_constants_mjs__WEBPACK_IMPORTED_MODULE_6__/* .APP_VERSION */ .hl);
     return;
   }
 
@@ -85804,7 +86784,7 @@ async function run(args = process.argv.slice(2), dependencies = {}) {
 }
 
 function formatSetupError(error) {
-  if (error instanceof _errors_mjs__WEBPACK_IMPORTED_MODULE_6__/* .MultiEmailError */ .G) {
+  if (error instanceof _errors_mjs__WEBPACK_IMPORTED_MODULE_7__/* .MultiEmailError */ .G) {
     const code = error.code ? ` [${error.code}]` : "";
     return `Setup failed${code}: ${error.message}`;
   }

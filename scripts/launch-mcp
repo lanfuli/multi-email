@@ -1,17 +1,44 @@
 #!/usr/bin/env node
 
-import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const bundledEntry = path.join(pluginRoot, "dist", "server.cjs");
-const sourceEntry = path.join(pluginRoot, "src", "server.mjs");
-const entry = existsSync(bundledEntry) ? bundledEntry : sourceEntry;
-const loaded = await import(pathToFileURL(entry).href);
-const startServer = loaded.startServer || loaded.default?.startServer;
+let runtimeModule;
 
-startServer().catch(() => {
-  console.error("[multi-email] MCP server failed to start.");
+try {
+  runtimeModule = await import(
+    new URL("../src/runtime-integrity.mjs", import.meta.url).href
+  );
+  const {
+    installVerifiedRuntimeInfo,
+    RuntimeIntegrityError,
+    verifyRuntimeBundle,
+  } = runtimeModule;
+  const runtimeInfo = await verifyRuntimeBundle(pluginRoot);
+  installVerifiedRuntimeInfo(runtimeInfo);
+  const loaded = await import(pathToFileURL(bundledEntry).href);
+  const startServer = loaded.startServer || loaded.default?.startServer;
+  if (typeof startServer !== "function") {
+    throw new RuntimeIntegrityError("BUNDLE_ENTRY_INVALID");
+  }
+  await startServer();
+} catch (error) {
+  const RuntimeIntegrityError = runtimeModule?.RuntimeIntegrityError;
+  const safe = runtimeModule?.safeRuntimeFailure(
+    RuntimeIntegrityError && error instanceof RuntimeIntegrityError
+      ? error
+      : RuntimeIntegrityError
+        ? new RuntimeIntegrityError("BUNDLE_START_FAILED")
+        : error,
+  ) || {
+    code: "RUNTIME_INTEGRITY_ERROR",
+    reason: "RUNTIME_CHECK_FAILED",
+    requiredAction: "reinstall_or_rebuild",
+  };
+  console.error(
+    `[multi-email] ${safe.code}: ${safe.reason}. ${safe.requiredAction}.`,
+  );
   process.exitCode = 1;
-});
+}

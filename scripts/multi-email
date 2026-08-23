@@ -1,30 +1,96 @@
 #!/usr/bin/env node
 
-import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const bundledEntry = path.join(pluginRoot, "dist", "server.cjs");
-const sourceEntry = path.join(pluginRoot, "src", "setup.mjs");
-const entry = existsSync(bundledEntry) ? bundledEntry : sourceEntry;
-let module;
-try {
-  module = await import(pathToFileURL(entry).href);
-} catch {
-  console.error("Multi Email setup could not be loaded. Reinstall or rebuild the package.");
-  process.exitCode = 1;
-}
-const runSetupCli = module?.runSetupCli || module?.default?.runSetupCli;
+const args = process.argv.slice(2);
+const selfTestRequested = args[0] === "self-test";
+const selfTestJson = selfTestRequested && args.slice(1).includes("--json");
+let runtimeModule;
 
-if (module && typeof runSetupCli !== "function") {
-  console.error("Multi Email setup entry is unavailable. Reinstall or rebuild the package.");
+function renderSelfTest(info) {
+  if (selfTestJson) {
+    console.log(JSON.stringify(info));
+    return;
+  }
+  if (!info.ok) {
+    console.error(`Multi Email runtime self-test failed [${info.reason}].`);
+    return;
+  }
+  console.log("Multi Email runtime self-test");
+  console.log("ITEM\tSTATUS\tDETAIL");
+  console.log(`Runtime\tverified\t${info.appVersion}`);
+  console.log(`Build\tverified\t${info.buildId}`);
+  console.log(`Artifacts\tverified\t${info.artifactsVerified}`);
+  console.log(`Lazy chunks\tverified\t${info.lazyChunksVerified}`);
+  console.log(`Native runtime\tverified\t${info.architecture}`);
+  console.log(`Install channel\tverified\t${info.installChannel}`);
+}
+
+if (selfTestRequested && args.slice(1).some((value) => value !== "--json")) {
+  const failure = {
+    ok: false,
+    code: "INVALID_ARGUMENT",
+    reason: "SELF_TEST_ACCEPTS_ONLY_JSON",
+    requiredAction: "run_self_test_without_extra_arguments",
+  };
+  renderSelfTest(failure);
   process.exitCode = 1;
-} else if (runSetupCli) {
+} else {
+  let runtimeInfo;
   try {
-    await runSetupCli(process.argv.slice(2));
-  } catch {
-    console.error("Setup failed: an unexpected local or provider error occurred.");
+    runtimeModule = await import(
+      new URL("../src/runtime-integrity.mjs", import.meta.url).href
+    );
+    const { installVerifiedRuntimeInfo, verifyRuntimeBundle } = runtimeModule;
+    runtimeInfo = await verifyRuntimeBundle(pluginRoot);
+    installVerifiedRuntimeInfo(runtimeInfo);
+  } catch (error) {
+    const failure = runtimeModule?.safeRuntimeFailure(error) || {
+      ok: false,
+      code: "RUNTIME_INTEGRITY_ERROR",
+      reason: "RUNTIME_CHECK_FAILED",
+      requiredAction: "reinstall_or_rebuild",
+    };
+    if (selfTestRequested) {
+      renderSelfTest(failure);
+    } else {
+      console.error(
+        `Multi Email setup could not be loaded [${failure.reason}]. Reinstall or rebuild the package.`,
+      );
+    }
     process.exitCode = 1;
+  }
+
+  if (runtimeInfo && selfTestRequested) {
+    renderSelfTest(runtimeInfo);
+  } else if (runtimeInfo) {
+    let module;
+    try {
+      module = await import(pathToFileURL(bundledEntry).href);
+    } catch {
+      const failure = runtimeModule.safeRuntimeFailure(
+        new runtimeModule.RuntimeIntegrityError("BUNDLE_LOAD_FAILED"),
+      );
+      console.error(
+        `Multi Email setup could not be loaded [${failure.reason}]. Reinstall or rebuild the package.`,
+      );
+      process.exitCode = 1;
+    }
+    const runSetupCli = module?.runSetupCli || module?.default?.runSetupCli;
+
+    if (module && typeof runSetupCli !== "function") {
+      console.error("Multi Email setup entry is unavailable. Reinstall or rebuild the package.");
+      process.exitCode = 1;
+    } else if (runSetupCli) {
+      try {
+        await runSetupCli(args);
+      } catch {
+        console.error("Setup failed: an unexpected local or provider error occurred.");
+        process.exitCode = 1;
+      }
+    }
   }
 }

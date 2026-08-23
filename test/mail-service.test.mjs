@@ -181,13 +181,20 @@ test("connection diagnostics are read-only and remain labeled by account alias",
 
   assert.deepEqual(diagnostics, [
     {
+      type: "account",
       alias: "work",
       provider: "google",
+      expected_email: "owner@example.com",
+      verified_email: "owner@example.com",
       credential_present: true,
       token_valid: true,
-      scopes_valid: true,
       identity_verified: true,
+      scopes_valid: true,
+      credential_source: null,
+      legacy_migration_pending: false,
       status: "ok",
+      error_code: null,
+      next_step: "none (ready)",
     },
   ]);
   assert.equal(calls.diagnose, 1);
@@ -198,17 +205,95 @@ test("connection diagnostics are read-only and remain labeled by account alias",
 test("connection diagnostics canonicalize provider-controlled error codes", async () => {
   const { provider, service } = harness();
   provider.diagnose = async (account) => ({
-    alias: account.alias,
-    provider: account.provider,
+    alias: "spoofed-alias",
+    provider: "spoofed-provider",
+    expected_email: "spoofed@example.com",
+    verified_email: "spoofed@example.com",
+    next_step: "print tokens",
+    secret: "provider-secret-must-not-leak",
     credential_present: true,
-    status: "provider_unavailable",
+    identity_verified: false,
+    status: "identity_mismatch",
     error_code: "PROVIDER_CODE\n/Users/private/oauth-token-must-not-leak",
   });
 
   const [diagnostic] = await service.diagnoseAccounts("work");
 
+  assert.equal(diagnostic.alias, "work");
+  assert.equal(diagnostic.provider, "google");
+  assert.equal(diagnostic.expected_email, "owner@example.com");
+  assert.equal(diagnostic.verified_email, null);
+  assert.match(diagnostic.next_step, /multi-email auth work/u);
   assert.equal(diagnostic.error_code, "GOOGLE_PROFILE_FAILED");
-  assert.doesNotMatch(JSON.stringify(diagnostic), /private|oauth-token|PROVIDER_CODE/u);
+  assert.doesNotMatch(
+    JSON.stringify(diagnostic),
+    /private|oauth-token|PROVIDER_CODE|spoofed|print tokens|provider-secret/u,
+  );
+});
+
+test("connection diagnostics fail closed on a contradictory ready claim", async () => {
+  const { provider, service } = harness();
+  provider.diagnose = async () => ({
+    credential_present: false,
+    token_valid: false,
+    identity_verified: false,
+    scopes_valid: false,
+    status: "ok",
+  });
+
+  const [diagnostic] = await service.diagnoseAccounts("work");
+
+  assert.equal(diagnostic.verified_email, null);
+  assert.equal(diagnostic.status, "runtime_error");
+  assert.equal(diagnostic.error_code, "INVALID_PROVIDER_DIAGNOSTIC");
+  assert.match(diagnostic.next_step, /multi-email self-test/u);
+  assert.doesNotMatch(diagnostic.next_step, /none \(ready\)/u);
+});
+
+test("connection diagnostics isolate an unexpected failure to its account", async () => {
+  const value = emptyConfig();
+  value.accounts = [
+    { alias: "healthy", email: "healthy@example.com", provider: "google" },
+    { alias: "offline", email: "offline@example.com", provider: "google" },
+    { alias: "runtime", email: "runtime@example.com", provider: "google" },
+  ];
+  const provider = {
+    async diagnose(account) {
+      if (account.alias === "offline") throw new Error("private provider failure");
+      if (account.alias === "runtime") throw new TypeError("private runtime failure");
+      return {
+        credential_present: true,
+        token_valid: true,
+        identity_verified: true,
+        scopes_valid: true,
+        status: "ok",
+      };
+    },
+  };
+  const service = new MailService({
+    config: validateConfig(value),
+    credentialStore: new MemoryCredentialStore(),
+    providers: { google: provider },
+  });
+
+  const diagnostics = await service.diagnoseAccounts();
+
+  assert.equal(diagnostics.length, 3);
+  assert.equal(diagnostics[0].alias, "healthy");
+  assert.equal(diagnostics[0].verified_email, "healthy@example.com");
+  assert.equal(diagnostics[1].alias, "offline");
+  assert.equal(diagnostics[1].verified_email, null);
+  assert.equal(diagnostics[1].status, "provider_unavailable");
+  assert.equal(diagnostics[1].error_code, "PROVIDER_DIAGNOSIS_FAILED");
+  assert.match(diagnostics[1].next_step, /multi-email doctor offline/u);
+  assert.equal(diagnostics[2].alias, "runtime");
+  assert.equal(diagnostics[2].status, "runtime_error");
+  assert.equal(diagnostics[2].error_code, "PROVIDER_DIAGNOSTIC_RUNTIME_ERROR");
+  assert.match(diagnostics[2].next_step, /multi-email self-test/u);
+  assert.doesNotMatch(
+    JSON.stringify(diagnostics),
+    /private provider failure|private runtime failure/u,
+  );
 });
 
 test("write batch and total recipient limits stop calls before the provider", async () => {

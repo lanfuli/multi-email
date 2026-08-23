@@ -7,6 +7,7 @@ import { publicError } from "./errors.mjs";
 import { KeychainStore } from "./keychain.mjs";
 import { MailService } from "./mail-service.mjs";
 import { runWithOperationDeadline } from "./operation-deadline.mjs";
+import { currentRuntimeInfo } from "./runtime-integrity.mjs";
 import { LocalSendApprovalUi } from "./send-approval-ui.mjs";
 import { SendApprovalStore } from "./send-approval.mjs";
 
@@ -86,6 +87,17 @@ const reversibleWriteAnnotations = {
 };
 
 server.registerTool(
+  "mail_get_runtime_info",
+  {
+    title: "Inspect the Multi Email runtime",
+    description:
+      "Return the active plugin version, build identity, integrity status, architecture, and install channel without reading configuration, credentials, provider state, or mailbox content.",
+    annotations: { ...readAnnotations, openWorldHint: false },
+  },
+  () => safeMcpOperation(async () => currentRuntimeInfo()),
+);
+
+server.registerTool(
   "mail_list_accounts",
   {
     title: "List configured email accounts",
@@ -101,7 +113,7 @@ server.registerTool(
   {
     title: "Diagnose email account connections",
     description:
-      "Check credential presence, token validity, required scopes, and provider identity for one alias or every configured account. Does not read messages or change credentials.",
+      "Return a safe per-alias connection record with the expected identity, verified identity when healthy, credential/token/scope checks, status, and one next step. A failure for one alias does not hide the others. Does not read messages or change credentials.",
     inputSchema: { account_alias: accountAlias.optional() },
     annotations: readAnnotations,
   },
