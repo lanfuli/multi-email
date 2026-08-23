@@ -2341,3 +2341,199 @@ test("Microsoft doctor is read-only and reports explicit diagnostic dimensions",
     null,
   );
 });
+
+test("Microsoft authorization keeps browser success neutral until identity and Keychain verification", async () => {
+  const mailConfig = config();
+  const credentialStore = new MemoryCredentialStore();
+  const events = [];
+  const serialized = JSON.stringify({ Account: { verified: true }, AccessToken: {} });
+  const originalSet = credentialStore.set.bind(credentialStore);
+  credentialStore.set = async (...args) => {
+    events.push("keychain-set");
+    await originalSet(...args);
+  };
+  let interactiveRequest;
+  let opened;
+  const mail = new MicrosoftProvider({
+    config: mailConfig,
+    credentialStore,
+    browserOpener: async (url, browser) => {
+      opened = { url, browser };
+    },
+  });
+  mail.createApplication = () => ({
+    async acquireTokenInteractive(request) {
+      interactiveRequest = request;
+      await request.openBrowser("https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize");
+      return {
+        accessToken: "not-a-real-token",
+        scopes: ["User.Read", "Mail.ReadWrite", "Mail.Send"],
+        tenantId: "tenant-id",
+        account: { homeAccountId: "home-account-id" },
+      };
+    },
+    getTokenCache() {
+      return { serialize: () => serialized };
+    },
+  });
+  mail.graphRequestWithToken = async () => {
+    events.push("identity-verified");
+    return {
+      id: "user-1",
+      displayName: "Sales",
+      mail: "sales@example.com",
+      userPrincipalName: "sales@example.com",
+    };
+  };
+
+  const result = await mail.authorize(account, {
+    browser: "safari",
+    onInstruction: () => {},
+  });
+
+  assert.equal(opened.browser, "safari");
+  assert.match(opened.url, /^https:\/\/login\.microsoftonline\.com\//u);
+  assert.equal(interactiveRequest.loginHint, account.email);
+  assert.equal(interactiveRequest.prompt, "select_account");
+  assert.deepEqual(interactiveRequest.scopes, ["User.Read", "Mail.ReadWrite", "Mail.Send"]);
+  assert.match(interactiveRequest.successTemplate, /authorization is not complete/iu);
+  assert.doesNotMatch(interactiveRequest.successTemplate, /authorization (?:is )?complete/iu);
+  assert.deepEqual(events, ["identity-verified", "keychain-set"]);
+  assert.equal(
+    await credentialStore.get(credentialAccountKey(mailConfig, account, ":msal-cache")),
+    serialized,
+  );
+  assert.equal(result.email, account.email);
+});
+
+test("failed Microsoft Keychain verification restores the previous healthy credential", async () => {
+  const mailConfig = config();
+  const key = credentialAccountKey(mailConfig, account, ":msal-cache");
+  const previousCredential = JSON.stringify({
+    Account: { previous: true },
+    AccessToken: { previous: true },
+  });
+  const replacementCredential = JSON.stringify({
+    Account: { replacement: true },
+    AccessToken: { replacement: true },
+  });
+  const credentialStore = new MemoryCredentialStore({ [key]: previousCredential });
+  const memoryGet = credentialStore.get.bind(credentialStore);
+  const memorySet = credentialStore.set.bind(credentialStore);
+  let failNewCredentialReadback = false;
+  credentialStore.set = async (storedKey, value) => {
+    await memorySet(storedKey, value);
+    if (storedKey === key && value !== previousCredential) failNewCredentialReadback = true;
+  };
+  credentialStore.get = async (storedKey) => {
+    if (storedKey === key && failNewCredentialReadback) {
+      failNewCredentialReadback = false;
+      throw new Error("simulated Keychain readback failure");
+    }
+    return memoryGet(storedKey);
+  };
+
+  const mail = new MicrosoftProvider({ config: mailConfig, credentialStore });
+  mail.createApplication = () => ({
+    async acquireTokenInteractive() {
+      return {
+        accessToken: "replacement-access-token",
+        scopes: ["User.Read", "Mail.ReadWrite", "Mail.Send"],
+      };
+    },
+    getTokenCache() {
+      return { serialize: () => replacementCredential };
+    },
+  });
+  mail.graphRequestWithToken = async () => ({
+    id: "user-1",
+    displayName: "Sales",
+    mail: account.email,
+    userPrincipalName: account.email,
+  });
+
+  await assert.rejects(
+    mail.authorize(account, { onInstruction: () => {} }),
+    { code: "KEYCHAIN_WRITE_FAILED" },
+  );
+  assert.equal(await credentialStore.get(key), previousCredential);
+
+  mail.createApplication = () => ({
+    async getAllAccounts() {
+      return [{ username: account.email }];
+    },
+    async acquireTokenSilent() {
+      return {
+        accessToken: "previous-access-token",
+        scopes: ["User.Read", "Mail.ReadWrite", "Mail.Send"],
+      };
+    },
+  });
+  const diagnostic = await mail.diagnose(account);
+  assert.equal(diagnostic.status, "ok");
+  assert.equal(diagnostic.credential_present, true);
+  assert.equal(diagnostic.token_valid, true);
+  assert.equal(diagnostic.scopes_valid, true);
+  assert.equal(diagnostic.identity_verified, true);
+});
+
+test("Microsoft doctor distinguishes runtime, reauthorization, provider, and policy failures", async (context) => {
+  const scenarios = [
+    {
+      name: "SDK TypeError is a runtime failure",
+      error: new TypeError("SDK method shape changed"),
+      status: "runtime_error",
+      errorCode: "OAUTH_RUNTIME_ERROR",
+      tokenValid: null,
+    },
+    {
+      name: "explicit invalid_grant requires reauthorization",
+      error: Object.assign(new Error("grant rejected"), { errorCode: "invalid_grant" }),
+      status: "reauthorization_required",
+      errorCode: "REAUTHENTICATION_REQUIRED",
+      tokenValid: false,
+    },
+    {
+      name: "network failure keeps the credential",
+      error: Object.assign(new Error("network unavailable"), { code: "MICROSOFT_NETWORK_ERROR" }),
+      status: "provider_unavailable",
+      errorCode: "MICROSOFT_NETWORK_ERROR",
+      tokenValid: null,
+    },
+    {
+      name: "tenant policy is not a reauthorization prompt",
+      error: Object.assign(new Error("admin consent required"), {
+        errorCode: "admin_consent_required",
+      }),
+      status: "provider_policy_blocked",
+      errorCode: "OAUTH_PROVIDER_POLICY_BLOCKED",
+      tokenValid: null,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await context.test(scenario.name, async () => {
+      const mailConfig = config();
+      const key = credentialAccountKey(mailConfig, account, ":msal-cache");
+      const credentialStore = new MemoryCredentialStore({
+        [key]: JSON.stringify({ Account: { present: true }, AccessToken: {} }),
+      });
+      const mail = new MicrosoftProvider({ config: mailConfig, credentialStore });
+      mail.createApplication = () => ({
+        async getAllAccounts() {
+          return [{ username: account.email }];
+        },
+        async acquireTokenSilent() {
+          throw scenario.error;
+        },
+      });
+
+      const diagnostic = await mail.diagnose(account);
+
+      assert.equal(diagnostic.status, scenario.status);
+      assert.equal(diagnostic.error_code, scenario.errorCode);
+      assert.equal(diagnostic.token_valid, scenario.tokenValid);
+      assert.equal(await credentialStore.get(key) !== null, true);
+    });
+  }
+});

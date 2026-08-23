@@ -1,6 +1,6 @@
 {
   "name": "multi-email",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Safely manage multiple Gmail and Microsoft 365 mailboxes through one local MCP server.",
   "author": {
     "name": "Vincent_Lan",
@@ -35,7 +35,8 @@
     "defaultPrompt": [
       "Review unread mail across my connected accounts without making changes.",
       "Create a draft reply in a specific account for my review.",
-      "Find messages that need my reply across named account aliases."
+      "Find messages that need my reply across named account aliases.",
+      "Set up my user-owned Google Cloud Desktop OAuth client with Computer Use if available, then connect my requested Gmail aliases one at a time using Multi Email's assisted-onboarding safeguards."
     ]
   }
 }

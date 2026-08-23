@@ -1,6 +1,6 @@
 {
   "name": "codex-multi-email",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "Alias-routed Gmail and Microsoft 365 MCP plugin for Codex.",
   "author": {

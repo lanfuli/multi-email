@@ -3,14 +3,20 @@
 import { spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  assertVersionContract,
+  validateAssistedOnboardingSurface,
+} from "./release-integrity.mjs";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "multi-email-cold-install-"));
+const require = createRequire(import.meta.url);
 
 function run(command, args, { capture = false, cwd = pluginRoot, env = process.env } = {}) {
   const result = spawnSync(command, args, {
@@ -44,30 +50,6 @@ function runExpectFailure(command, args, { cwd = pluginRoot, env = process.env }
   return `${result.stderr || ""}${result.stdout || ""}`;
 }
 
-async function writeEmptyConfig(directory) {
-  const configPath = path.join(directory, "config.json");
-  await writeFile(
-    configPath,
-    `${JSON.stringify(
-      {
-        version: 1,
-        safety: {
-          maxSearchResults: 25,
-          maxWriteBatch: 25,
-          maxRecipients: 20,
-          sendApprovalTtlSeconds: 300,
-        },
-        providers: { google: {}, microsoft: { tenant: "organizations" } },
-        accounts: [],
-      },
-      null,
-      2,
-    )}\n`,
-    { mode: 0o600 },
-  );
-  return configPath;
-}
-
 async function smokePackage(
   packageRoot,
   label,
@@ -76,9 +58,77 @@ async function smokePackage(
     args = [path.join(packageRoot, "scripts", "launch-mcp")],
   } = {},
 ) {
+  await validateAssistedOnboardingSurface(packageRoot, { label });
   const metadata = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
+  const plugin = JSON.parse(
+    await readFile(path.join(packageRoot, ".codex-plugin", "plugin.json"), "utf8"),
+  );
+  const skillSource = await readFile(
+    path.join(packageRoot, "skills", "multi-email", "SKILL.md"),
+    "utf8",
+  );
+  const build = JSON.parse(
+    await readFile(path.join(packageRoot, "dist", "build-manifest.json"), "utf8"),
+  );
+  const selfTest = JSON.parse(
+    run(
+      process.execPath,
+      [path.join(packageRoot, "scripts", "multi-email"), "self-test", "--json"],
+      { capture: true, cwd: packageRoot },
+    ).trim(),
+  );
+  assertVersionContract(
+    {
+      packageVersion: metadata.version,
+      pluginVersion: plugin.version,
+      skillSource,
+      runtimeVersion: selfTest.appVersion,
+      buildVersion: build.appVersion,
+    },
+    { label },
+  );
+  const expectedInstallChannel = {
+    "working-tree": "git_checkout",
+    "packed-tarball": "local_package",
+    "npm-install": "npm_install",
+  }[label];
+  if (
+    selfTest.ok !== true ||
+    selfTest.appVersion !== metadata.version ||
+    selfTest.integrity !== "verified" ||
+    !/^[a-f0-9]{64}$/u.test(selfTest.buildId || "") ||
+    selfTest.lazyChunksVerified < 1 ||
+    selfTest.nativeRuntime !== "verified" ||
+    selfTest.installChannel !== expectedInstallChannel
+  ) {
+    throw new Error(`${label} package failed its runtime self-test.`);
+  }
+  const distMetadata = JSON.parse(
+    await readFile(path.join(packageRoot, "dist", "package.json"), "utf8"),
+  );
+  if (distMetadata.type !== "commonjs") {
+    throw new Error(`${label} package does not give ncc chunks a CommonJS package boundary.`);
+  }
+  const chunkFiles = (await readdir(path.join(packageRoot, "dist")))
+    .filter((name) => name.endsWith(".index.cjs.js"))
+    .sort();
+  if (chunkFiles.length === 0) {
+    throw new Error(`${label} package contains no ncc dynamic chunks to verify.`);
+  }
+  for (const file of chunkFiles) {
+    const chunk = require(path.join(packageRoot, "dist", file));
+    if (
+      !Array.isArray(chunk.ids) ||
+      chunk.ids.length === 0 ||
+      !chunk.modules ||
+      typeof chunk.modules !== "object" ||
+      Object.keys(chunk.modules).length === 0
+    ) {
+      throw new Error(`${label} package cannot load bundled chunk ${file} as CommonJS.`);
+    }
+  }
   const configDirectory = await mkdtemp(path.join(temporaryRoot, `${label}-config-`));
-  const configPath = await writeEmptyConfig(configDirectory);
+  const configPath = path.join(configDirectory, "missing-config.json");
   const client = new Client({ name: `multi-email-${label}`, version: metadata.version });
   const transport = new StdioClientTransport({
     command,
@@ -101,11 +151,27 @@ async function smokePackage(
     }
     const { tools } = await client.listTools();
     if (
-      tools.length !== 14 ||
+      tools.length !== 15 ||
+      !tools.some(({ name }) => name === "mail_get_runtime_info") ||
       !tools.some(({ name }) => name === "mail_list_accounts") ||
       !tools.some(({ name }) => name === "mail_diagnose_accounts")
     ) {
       throw new Error(`${label} package advertised an unexpected MCP tool set.`);
+    }
+    const runtime = await client.callTool({
+      name: "mail_get_runtime_info",
+      arguments: {},
+    });
+    const info = runtime.structuredContent;
+    if (
+      runtime.isError ||
+      info?.ok !== true ||
+      info.appVersion !== metadata.version ||
+      info.buildId !== selfTest.buildId ||
+      info.integrity !== "verified" ||
+      info.installChannel !== expectedInstallChannel
+    ) {
+      throw new Error(`${label} MCP reported an unexpected runtime identity.`);
     }
   } finally {
     await client.close().catch(() => {});
@@ -127,6 +193,7 @@ try {
   run("/usr/bin/tar", ["-xzf", archivePath, "-C", extractDirectory]);
 
   const extractedPackage = path.join(extractDirectory, "package");
+  await access(path.join(extractedPackage, "dist", "package.json"));
   await access(path.join(extractedPackage, "dist", "server.cjs"));
   await access(path.join(extractedPackage, "dist", `keyring.darwin-${process.arch}.node`));
   await access(path.join(extractedPackage, "CONTRIBUTING.md"));

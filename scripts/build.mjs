@@ -16,8 +16,10 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { APP_VERSION } from "../src/constants.mjs";
 import {
   artifactFiles,
+  assertVersionContract,
   buildInputFiles,
   digestFile,
   digestFiles,
@@ -28,6 +30,22 @@ const distDirectory = path.join(pluginRoot, "dist");
 const nccCli = path.join(pluginRoot, "node_modules", "@vercel", "ncc", "dist", "ncc", "cli.js");
 const keyringVersion = "1.3.0";
 const packageJson = JSON.parse(await readFile(path.join(pluginRoot, "package.json"), "utf8"));
+const plugin = JSON.parse(
+  await readFile(path.join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
+);
+const skillSource = await readFile(
+  path.join(pluginRoot, "skills", "multi-email", "SKILL.md"),
+  "utf8",
+);
+assertVersionContract(
+  {
+    packageVersion: packageJson.version,
+    pluginVersion: plugin.version,
+    skillSource,
+    runtimeVersion: APP_VERSION,
+  },
+  { label: "Build source" },
+);
 const packageLock = JSON.parse(
   await readFile(path.join(pluginRoot, "package-lock.json"), "utf8"),
 );
@@ -141,6 +159,14 @@ try {
   ]);
 
   await rename(path.join(buildDirectory, "index.cjs"), path.join(buildDirectory, "server.cjs"));
+
+  // ncc emits dynamically loaded CommonJS chunks with a .js suffix. The
+  // package root is ESM, so give dist its own CommonJS package boundary or
+  // Node can classify those chunks as ESM and break their lazy loading.
+  await writeFile(
+    path.join(buildDirectory, "package.json"),
+    `${JSON.stringify({ type: "commonjs" }, null, 2)}\n`,
+  );
 
   for (const asset of nativeAssets) {
     await fetchNativeAsset(asset, buildDirectory);

@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { PublicClientApplication } from "@azure/msal-node";
+import { replaceCredentialVerified } from "../credential-transaction.mjs";
 import { MultiEmailError } from "../errors.mjs";
 import { credentialAccountKey, legacyCredentialAccountKey } from "../keychain.mjs";
 import { buildRawMessage } from "../mime.mjs";
@@ -9,6 +9,7 @@ import {
   raceWithOperationDeadline,
   remainingOperationTimeMs,
 } from "../operation-deadline.mjs";
+import { openOAuthBrowser } from "../oauth-browser.mjs";
 import {
   normalizeMailboxAddress,
   normalizeMicrosoftClientId,
@@ -28,6 +29,24 @@ const GRAPH_ERROR_BODY_LIMIT = 64 * 1024;
 const MICROSOFT_IDENTITY_BODY_LIMIT = 2 * 1024 * 1024;
 const MICROSOFT_IDENTITY_ORIGIN = "https://login.microsoftonline.com";
 const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
+const MICROSOFT_REAUTH_ERROR_CODES = new Set([
+  "consent_required",
+  "interaction_required",
+  "invalid_grant",
+  "login_required",
+  "no_tokens_found",
+  "token_refresh_required",
+]);
+const MICROSOFT_POLICY_ERROR_CODES = new Set([
+  "access_blocked",
+  "admin_consent_required",
+  "authorization_request_denied",
+  "conditional_access_blocked",
+  "unauthorized_client",
+  "user_not_assigned",
+  "aadsts50105",
+  "aadsts53003",
+]);
 
 function credentialKey(config, account) {
   return credentialAccountKey(config, account, ":msal-cache");
@@ -35,20 +54,6 @@ function credentialKey(config, account) {
 
 function legacyCredentialKey(account) {
   return legacyCredentialAccountKey(account, ":msal-cache");
-}
-
-function openBrowser(url) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/open", [url], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
 }
 
 function cachePlugin(credentialStore, key, { serialized = null, persist = true } = {}) {
@@ -642,6 +647,163 @@ function safeDiagnosticErrorCode(value, fallback) {
   return DIAGNOSTIC_ERROR_CODE.test(code) ? code : fallback;
 }
 
+function microsoftErrorChain(error) {
+  const values = [];
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 6 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    values.push(current);
+    current = current.cause || current.error;
+  }
+  return values;
+}
+
+function microsoftOAuthErrorCodes(error) {
+  const codes = new Set();
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    const normalized = value.trim().toLowerCase();
+    if (/^[a-z0-9_.-]{1,80}$/u.test(normalized)) codes.add(normalized);
+  };
+  for (const current of microsoftErrorChain(error)) {
+    add(current.code);
+    add(current.errorCode);
+    add(current.subError);
+    add(current.response?.data?.error);
+    add(current.response?.data?.error?.code);
+  }
+  return codes;
+}
+
+function hasMicrosoftOAuthError(error, allowed) {
+  return [...microsoftOAuthErrorCodes(error)].some((code) => allowed.has(code));
+}
+
+function microsoftProviderUnavailable(error) {
+  if (
+    [
+      "MICROSOFT_NETWORK_ERROR",
+      "MICROSOFT_REQUEST_ABORTED",
+      "MICROSOFT_TIMEOUT",
+      "OPERATION_DEADLINE_EXCEEDED",
+    ].includes(error?.code)
+  ) {
+    return true;
+  }
+  return microsoftErrorChain(error).some((current) => {
+    const status = current.response?.status ?? current.response?.statusCode;
+    return status === 408 || status === 429 || (Number.isInteger(status) && status >= 500);
+  });
+}
+
+function classifyMicrosoftAuthorizationError(error) {
+  if (error instanceof MultiEmailError) return error;
+  if (hasMicrosoftOAuthError(error, MICROSOFT_REAUTH_ERROR_CODES)) {
+    return new MultiEmailError(
+      "Microsoft rejected the authorization grant. Start a fresh authorization for this alias.",
+      "REAUTHENTICATION_REQUIRED",
+    );
+  }
+  if (hasMicrosoftOAuthError(error, MICROSOFT_POLICY_ERROR_CODES)) {
+    return new MultiEmailError(
+      "Microsoft tenant or account policy blocked this OAuth application. Browser changes will not bypass the policy.",
+      "OAUTH_PROVIDER_POLICY_BLOCKED",
+    );
+  }
+  if (microsoftProviderUnavailable(error)) {
+    return new MultiEmailError(
+      "Microsoft OAuth is temporarily unavailable. The existing credential was preserved.",
+      "MICROSOFT_OAUTH_UNAVAILABLE",
+    );
+  }
+  if (error instanceof TypeError) {
+    return new MultiEmailError(
+      "The local Microsoft OAuth runtime failed before authorization completed. Reinstall or run self-test; do not reauthorize yet.",
+      "OAUTH_RUNTIME_ERROR",
+    );
+  }
+  return new MultiEmailError(
+    "Microsoft authorization was not completed. Check the account selection and consent policy, then try again.",
+    "MICROSOFT_AUTH_FAILED",
+    { providerCode: safeDetailCode(error?.errorCode || error?.code) },
+  );
+}
+
+function microsoftDiagnosticFailure(error) {
+  if (error?.code === "INVALID_CREDENTIAL") {
+    return { status: "invalid_credential", errorCode: "INVALID_CREDENTIAL", tokenValid: false };
+  }
+  if (
+    error?.code === "REAUTHENTICATION_REQUIRED" ||
+    hasMicrosoftOAuthError(error, MICROSOFT_REAUTH_ERROR_CODES)
+  ) {
+    return {
+      status: "reauthorization_required",
+      errorCode: "REAUTHENTICATION_REQUIRED",
+      tokenValid: false,
+    };
+  }
+  if (
+    error?.code === "OAUTH_PROVIDER_POLICY_BLOCKED" ||
+    hasMicrosoftOAuthError(error, MICROSOFT_POLICY_ERROR_CODES)
+  ) {
+    return {
+      status: "provider_policy_blocked",
+      errorCode: "OAUTH_PROVIDER_POLICY_BLOCKED",
+      tokenValid: null,
+    };
+  }
+  if (
+    error?.code === "OAUTH_RUNTIME_ERROR" ||
+    error?.code === "KEYCHAIN_READ_FAILED" ||
+    error instanceof TypeError
+  ) {
+    return {
+      status: "runtime_error",
+      errorCode: safeDiagnosticErrorCode(error?.code, "OAUTH_RUNTIME_ERROR"),
+      tokenValid: null,
+    };
+  }
+  if (microsoftProviderUnavailable(error) || error instanceof MultiEmailError) {
+    return {
+      status: "provider_unavailable",
+      errorCode: safeDiagnosticErrorCode(error?.code, "MICROSOFT_PROVIDER_UNAVAILABLE"),
+      tokenValid: null,
+    };
+  }
+  return { status: "runtime_error", errorCode: "OAUTH_RUNTIME_ERROR", tokenValid: null };
+}
+
+function microsoftSilentTokenError(account, error) {
+  const failure = microsoftDiagnosticFailure(error);
+  if (failure.status === "reauthorization_required") {
+    return new MultiEmailError(
+      `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
+      failure.errorCode,
+      { providerCode: safeDetailCode(error?.errorCode || error?.code) },
+    );
+  }
+  if (failure.status === "provider_policy_blocked") {
+    return new MultiEmailError(
+      "Microsoft tenant or account policy blocked this OAuth application. Browser changes will not bypass the policy.",
+      failure.errorCode,
+    );
+  }
+  if (failure.status === "runtime_error") {
+    return new MultiEmailError(
+      "The local Microsoft OAuth runtime failed. Reinstall or run self-test; do not reauthorize yet.",
+      failure.errorCode,
+    );
+  }
+  return error instanceof MultiEmailError
+    ? error
+    : new MultiEmailError(
+        "Microsoft token validation could not reach the provider.",
+        failure.errorCode,
+      );
+}
+
 function safeRetryAfter(value) {
   const retryAfter = typeof value === "string" ? value.trim() : "";
   return /^\d{1,10}$/u.test(retryAfter) ? retryAfter : null;
@@ -737,7 +899,7 @@ export class MicrosoftProvider {
   constructor({
     config,
     credentialStore,
-    browserOpener = openBrowser,
+    browserOpener = openOAuthBrowser,
     fetchImpl = globalThis.fetch,
     graphRequestTimeoutMs = GRAPH_REQUEST_TIMEOUT_MS,
   }) {
@@ -837,11 +999,13 @@ export class MicrosoftProvider {
     return (await this.credentialRecord(account)) !== null;
   }
 
-  async authorize(account, { onInstruction = console.log } = {}) {
+  async authorize(account, { browser = "default", onInstruction = console.log } = {}) {
     const application = this.createApplication(account, { persist: false });
-    onInstruction(`Opening Microsoft authorization for ${account.alias} (${account.email})...`);
     onInstruction(
-      "If Microsoft says admin approval is required, a GoDaddy/Microsoft 365 Global Admin must grant consent.",
+      `Opening Microsoft authorization in ${browser} for ${account.alias} (${account.email})...`,
+    );
+    onInstruction(
+      "If Microsoft says admin approval is required, an administrator for the selected tenant must review the delegated permissions.",
     );
 
     let result;
@@ -850,24 +1014,20 @@ export class MicrosoftProvider {
         scopes: [...DELEGATED_SCOPES],
         loginHint: account.email,
         prompt: "select_account",
-        openBrowser: this.browserOpener,
+        openBrowser: (url) => this.browserOpener(url, browser),
         successTemplate:
-          "<!doctype html><meta charset=utf-8><title>Multi Email</title><h1>Authorization complete</h1><p>You may close this window.</p>",
+          "<!doctype html><meta charset=utf-8><title>Multi Email</title><h1>Microsoft sign-in response received</h1><p>Authorization is not complete until Multi Email verifies the scopes, mailbox identity, and macOS Keychain storage in the terminal.</p>",
         errorTemplate:
           "<!doctype html><meta charset=utf-8><title>Multi Email</title><h1>Authorization failed</h1><p>Return to the terminal for details.</p>",
       });
     } catch (error) {
-      throw new MultiEmailError(
-        "Microsoft authorization was not completed. Check the account selection and consent policy, then try again.",
-        "MICROSOFT_AUTH_FAILED",
-        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
-      );
+      throw classifyMicrosoftAuthorizationError(error);
     }
 
     if (!result?.accessToken) {
       throw new MultiEmailError("Microsoft returned no access token.", "MISSING_ACCESS_TOKEN");
     }
-    if (result.scopes && !hasRequiredScopes(result.scopes)) {
+    if (!hasRequiredScopes(result.scopes)) {
       throw new MultiEmailError(
         "Microsoft did not grant all required mail scopes. Nothing was saved.",
         "INSUFFICIENT_SCOPES",
@@ -877,10 +1037,9 @@ export class MicrosoftProvider {
     // Persist only after /me proves that the chosen identity belongs to this configured alias.
     const profile = await this.graphRequestWithToken(result.accessToken, "me?$select=id,displayName,mail,userPrincipalName");
     assertProfileMatches(account, profile);
-    await this.credentialStore.set(
-      credentialKey(this.config, account),
-      application.getTokenCache().serialize(),
-    );
+    const key = credentialKey(this.config, account);
+    const serialized = application.getTokenCache().serialize();
+    await replaceCredentialVerified(this.credentialStore, key, serialized);
     this.applications.delete(account.alias);
     this.verifiedAliases.delete(account.alias);
 
@@ -910,6 +1069,12 @@ export class MicrosoftProvider {
       checkDeadline();
     } catch (error) {
       if (error instanceof MultiEmailError) throw error;
+      if (error instanceof TypeError) {
+        throw new MultiEmailError(
+          "The local Microsoft OAuth runtime failed. Reinstall or run self-test; do not reauthorize yet.",
+          "OAUTH_RUNTIME_ERROR",
+        );
+      }
       throw new MultiEmailError(
         `Unable to load the Microsoft credential for '${account.alias}'. Reauthorize this account.`,
         "INVALID_CREDENTIAL",
@@ -948,18 +1113,14 @@ export class MicrosoftProvider {
       ) {
         throw error;
       }
-      throw new MultiEmailError(
-        `Microsoft authorization for '${account.alias}' must be refreshed. Run 'multi-email auth ${account.alias}' (or 'node ./scripts/multi-email auth ${account.alias}' from a Git clone).`,
-        "REAUTHENTICATION_REQUIRED",
-        { providerCode: safeDetailCode(error?.errorCode || error?.code) },
-      );
+      throw microsoftSilentTokenError(account, error);
     }
 
     if (!result?.accessToken) {
       throw new MultiEmailError("Microsoft returned no access token.", "MISSING_ACCESS_TOKEN");
     }
 
-    if (result.scopes && !hasRequiredScopes(result.scopes)) {
+    if (!hasRequiredScopes(result.scopes)) {
       throw new MultiEmailError(
         `Microsoft authorization for '${account.alias}' is missing required mail scopes. Reauthorize it.`,
         "INSUFFICIENT_SCOPES",
@@ -1018,10 +1179,11 @@ export class MicrosoftProvider {
       let accounts;
       try {
         accounts = await application.getAllAccounts();
-      } catch {
-        diagnostic.token_valid = false;
-        diagnostic.status = "invalid_credential";
-        diagnostic.error_code = "INVALID_CREDENTIAL";
+      } catch (error) {
+        const failure = microsoftDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
       if (!accounts.length) {
@@ -1065,9 +1227,10 @@ export class MicrosoftProvider {
         ) {
           throw error;
         }
-        diagnostic.token_valid = false;
-        diagnostic.status = "reauthorization_required";
-        diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
+        const failure = microsoftDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
         return diagnostic;
       }
 
@@ -1088,20 +1251,29 @@ export class MicrosoftProvider {
         diagnostic.status = "ok";
       } catch (error) {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
-        diagnostic.status =
-          diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = safeDiagnosticErrorCode(
-          error?.code,
-          "MICROSOFT_PROFILE_FAILED",
-        );
+        if (diagnostic.identity_verified === false) {
+          diagnostic.status = "identity_mismatch";
+          diagnostic.error_code = "ACCOUNT_MISMATCH";
+        } else {
+          const failure = microsoftDiagnosticFailure(error);
+          diagnostic.status = failure.status;
+          diagnostic.error_code = failure.errorCode;
+        }
       }
       return diagnostic;
     } catch (error) {
-      diagnostic.status = "configuration_error";
-      diagnostic.error_code = safeDiagnosticErrorCode(
-        error?.code,
-        "MICROSOFT_CLIENT_NOT_CONFIGURED",
-      );
+      if (["MICROSOFT_CLIENT_NOT_CONFIGURED", "INVALID_CONFIG"].includes(error?.code)) {
+        diagnostic.status = "configuration_error";
+        diagnostic.error_code = safeDiagnosticErrorCode(
+          error?.code,
+          "MICROSOFT_CLIENT_NOT_CONFIGURED",
+        );
+      } else {
+        const failure = microsoftDiagnosticFailure(error);
+        diagnostic.token_valid = failure.tokenValid;
+        diagnostic.status = failure.status;
+        diagnostic.error_code = failure.errorCode;
+      }
       return diagnostic;
     }
   }

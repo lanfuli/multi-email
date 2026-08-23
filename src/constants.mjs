@@ -1,5 +1,5 @@
 export const APP_NAME = "codex-multi-email";
-export const APP_VERSION = "0.1.4";
+export const APP_VERSION = "0.1.5";
 export const CONFIG_VERSION = 2;
 export const KEYCHAIN_SERVICE = "io.github.lanfuli.multi-email";
 export const LEGACY_KEYCHAIN_SERVICE = "com.openai.codex.multi-email";

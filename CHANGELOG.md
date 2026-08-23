@@ -2,6 +2,34 @@
 
 All notable changes to Multi Email are documented here. The project follows semantic versioning after its first public release.
 
+## [0.1.5] - 2026-08-23
+
+Multi-account connection reliability release. The npm package remains unpublished in this release.
+
+### Added
+
+- Added `multi-email self-test [--json]` and the read-only `mail_get_runtime_info` MCP tool so an installed build can prove its version, artifact integrity, lazy-chunk loading, native Keychain runtime, architecture, and install channel without reading configuration, credentials, provider state, or mail.
+- Added an explicit, allowlisted OAuth browser choice with `auth <alias> --browser default|safari|chrome`, an authorization preflight that names the alias, expected mailbox, provider, browser, scopes, and existing health, plus a safe default skip for already healthy aliases. Reauthorization of a healthy alias now requires `--force`.
+- Added focused Skill runbooks for installation/runtime diagnosis and one-at-a-time multi-account OAuth onboarding. They distinguish the OAuth app developer identity from the target mailbox, an unverified-app warning from a hard provider block, and provider-client configuration from per-alias authorization.
+- Added an optional Computer Use guided-onboarding prompt for the user-owned Google Cloud setup. Computer Use remains a separate plugin rather than a dependency, and the manual setup path remains fully supported.
+- Added one allowlisted connection-diagnostic contract shared by `doctor --json` and `mail_diagnose_accounts`, including configured and verified identities, per-alias health, and one safe next step. An unexpected failure for one alias no longer hides the other aliases.
+- Added a quoted Skill `metadata.version` and build, release, and cold-install checks that require the package, Plugin manifest, Skill, bundled runtime, and build manifest to identify the same release.
+
+### Fixed
+
+- Added the required CommonJS package boundary for ncc lazy chunks and cold-install coverage that loads every emitted chunk from both the working tree and packed installation. This prevents a healthy Gmail credential from being misreported as requiring reauthorization after a fresh plugin start.
+- Made the production MCP and CLI entrypoints fail closed when the release manifest, artifact hashes, lazy chunks, CommonJS boundary, native binary, version, or artifact set is invalid. Production entrypoints no longer silently fall back to source files.
+- Limited reauthorization advice to explicit provider token/interaction failures. Runtime `TypeError`s, module or Keychain failures, network/provider outages, policy blocks, insufficient scopes, and identity mismatches now retain separate diagnostic states and do not overwrite working credentials.
+- Added PKCE to the Google desktop flow, explicit account selection, required-scope verification through token info, exact Gmail identity verification, and a Keychain read-after-write check before the browser or CLI reports authorization success. Microsoft authorization now follows the same verified-success rule.
+- Bound Google token health to the configured Desktop OAuth client audience. Authorization refuses a token issued to another client before saving it, while `doctor` reports a redacted `GOOGLE_OAUTH_CLIENT_MISMATCH` that requires reauthorization instead of briefly treating an old-client token as healthy.
+- Guarded replacement of an existing Google OAuth client behind `init --confirm`, with the number of affected Google aliases and an explicit `auth <alias> --force` next step. First-time setup and re-importing the same client remain confirmation-free.
+- Made credential replacement transactional: a failed write or readback restores and verifies the previous credential, or removes an unverifiable first credential. If rollback itself cannot be verified, the CLI reports `CREDENTIAL_ROLLBACK_FAILED` instead of claiming that either credential is safe.
+
+### Security
+
+- OAuth URLs, authorization codes, tokens, MSAL caches, callback secrets, local paths, and provider-controlled error text remain excluded from CLI, MCP, browser, and runtime-integrity output.
+- Provider, scope, identity, and policy failures occur before credential commit. A Keychain commit failure attempts and verifies rollback as described above; changing browsers is not presented as a workaround for provider policy.
+
 ## [0.1.4] - 2026-08-22
 
 Plugin branding release. The npm package remains unpublished in this release.

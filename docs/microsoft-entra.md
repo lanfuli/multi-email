@@ -52,13 +52,19 @@ node ./scripts/multi-email init \
   --microsoft-tenant organizations
 
 node ./scripts/multi-email add-account m365-main you@example.com microsoft
-node ./scripts/multi-email auth m365-main
+node ./scripts/multi-email auth m365-main --browser chrome
 node ./scripts/multi-email doctor m365-main
 ```
 
 Replace the example GUID and address with the application and primary mailbox you control. Tenant
 may be `organizations`, `common`, `consumers`, a verified tenant domain, or a tenant GUID when that
 choice matches the app registration.
+
+Use `default`, `safari`, or `chrome` for the browser value. Before opening OAuth, the CLI displays
+the exact alias, expected mailbox, provider, browser, scopes, and existing health. It skips a fully
+healthy alias unless `--force` is intentionally supplied. The `/me` identity and required scopes
+must match and the Keychain cache write must be read back before the CLI reports success; run
+`doctor` for the same alias afterward.
 
 ## Common blockers
 
@@ -68,9 +74,12 @@ choice matches the app registration.
   the configured address. Shared mailboxes, proxy addresses, and delegated send-as identities are
   not supported by the current primary-mailbox model.
 - **Reauthorization required:** from the reviewed clone of the same release, rerun
-  `node ./scripts/multi-email auth <alias>`, then
+  `node ./scripts/multi-email auth <alias> --browser <default|safari|chrome>`, then
   `node ./scripts/multi-email doctor <alias>`. Do not paste the MSAL cache or tokens into chat. A
   marketplace install alone does not place the setup CLI on `PATH`.
+- **Runtime or module error after restart:** run `node ./scripts/multi-email self-test --json` and
+  repair the installed bundle. Do not replace a mailbox credential until its own doctor result
+  explicitly requires reauthorization.
 - **Wrong tenant:** verify that the configured tenant and the app's supported account types cover
   the selected user.
 

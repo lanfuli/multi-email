@@ -1,19 +1,14 @@
 #!/usr/bin/env node
 
-import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { emptyConfig, saveConfig } from "../src/config.mjs";
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const bundledServer = path.join(pluginRoot, "dist", "server.cjs");
-const serverEntry = existsSync(bundledServer)
-  ? bundledServer
-  : path.join(pluginRoot, "src", "server.mjs");
+const serverEntry = path.join(pluginRoot, "scripts", "launch-mcp");
 const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "multi-email-smoke-"));
 const configPath = path.join(tempDirectory, "config.json");
 const packageJson = JSON.parse(
@@ -22,7 +17,6 @@ const packageJson = JSON.parse(
 let client;
 
 try {
-  await saveConfig(emptyConfig(), configPath);
   client = new Client({ name: "multi-email-smoke", version: packageJson.version });
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -48,8 +42,26 @@ try {
     throw new Error("MCP server started but advertised no tools.");
   }
   const names = tools.map((tool) => tool.name);
-  if (!names.includes("mail_list_accounts")) {
-    throw new Error("MCP server did not advertise mail_list_accounts.");
+  if (
+    !names.includes("mail_get_runtime_info") ||
+    !names.includes("mail_list_accounts")
+  ) {
+    throw new Error("MCP server did not advertise its runtime and account tools.");
+  }
+  const runtime = await client.callTool({
+    name: "mail_get_runtime_info",
+    arguments: {},
+  });
+  const info = runtime.structuredContent;
+  if (
+    runtime.isError ||
+    info?.ok !== true ||
+    info.appVersion !== packageJson.version ||
+    info.integrity !== "verified" ||
+    !/^[a-f0-9]{64}$/u.test(info.buildId || "") ||
+    info.installChannel !== "git_checkout"
+  ) {
+    throw new Error("MCP server did not report a verified working-tree runtime.");
   }
   process.stdout.write(`MCP smoke passed (${tools.length} tools).\n`);
 } finally {
