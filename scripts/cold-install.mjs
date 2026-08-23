@@ -131,6 +131,8 @@ try {
   await access(path.join(extractedPackage, "dist", `keyring.darwin-${process.arch}.node`));
   await access(path.join(extractedPackage, "CONTRIBUTING.md"));
   await access(path.join(extractedPackage, "CODE_OF_CONDUCT.md"));
+  await access(path.join(extractedPackage, "docs", "google-oauth.md"));
+  await access(path.join(extractedPackage, "docs", "microsoft-entra.md"));
   try {
     await access(path.join(extractedPackage, "test"));
     throw new Error("Published tarball unexpectedly contains tests.");
@@ -166,7 +168,12 @@ try {
     cwd: consumer,
     capture: true,
   });
-  if (!help.includes("multi-email init") || help.includes("npm run setup")) {
+  if (
+    !help.includes("multi-email setup") ||
+    !help.includes("multi-email init") ||
+    !help.includes("multi-email doctor [alias] [--json]") ||
+    help.includes("npm run setup")
+  ) {
     throw new Error("Installed setup help contains unusable consumer commands.");
   }
   const version = run(setupExecutable, ["--version"], {
@@ -185,6 +192,43 @@ try {
     ...Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined)),
     CODEX_MULTI_EMAIL_CONFIG: setupConfigPath,
   };
+  const preflight = run(setupExecutable, ["setup"], {
+    cwd: consumer,
+    capture: true,
+    env: setupEnvironment,
+  });
+  if (
+    !preflight.includes("Config\tmissing") ||
+    !preflight.includes("multi-email init --google-client-json") ||
+    !preflight.includes("multi-email init --microsoft-client-id")
+  ) {
+    throw new Error("Installed setup preflight did not explain a missing configuration.");
+  }
+  const missingDoctorLines = run(setupExecutable, ["doctor", "--json"], {
+    cwd: consumer,
+    capture: true,
+    env: setupEnvironment,
+  })
+    .trim()
+    .split("\n");
+  if (missingDoctorLines.length !== 1) {
+    throw new Error("Installed doctor did not emit one JSON Lines summary for missing config.");
+  }
+  const missingDoctor = JSON.parse(missingDoctorLines[0]);
+  if (
+    missingDoctor.type !== "summary" ||
+    missingDoctor.status !== "not_configured" ||
+    missingDoctor.next_step !==
+      "multi-email setup (or node ./scripts/multi-email setup from a Git clone)"
+  ) {
+    throw new Error("Installed doctor reported an unexpected missing-config state.");
+  }
+  try {
+    await access(setupConfigPath);
+    throw new Error("Read-only setup or doctor unexpectedly created a config file.");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
   const initialized = run(
     setupExecutable,
     [
@@ -198,6 +242,18 @@ try {
   );
   if (!initialized.includes("Microsoft OAuth is configured")) {
     throw new Error("Installed setup CLI did not complete Microsoft-only initialization.");
+  }
+  const configuredPreflight = run(setupExecutable, ["setup"], {
+    cwd: consumer,
+    capture: true,
+    env: setupEnvironment,
+  });
+  if (
+    !configuredPreflight.includes("Config\tready") ||
+    !configuredPreflight.includes("Microsoft OAuth\tready") ||
+    !configuredPreflight.includes("Accounts\tnone\t0")
+  ) {
+    throw new Error("Installed setup preflight did not report initialized provider state.");
   }
 
   const invalidConfigDirectory = path.join(temporaryRoot, "invalid-config-target");

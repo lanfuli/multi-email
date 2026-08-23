@@ -109,7 +109,11 @@ test("successful authorize resolves only after its keep-alive callback server cl
     return callbackServer;
   });
   context.mock.method(googleAuth.OAuth2.prototype, "getToken", async () => ({
-    tokens: { access_token: "test-access-token", refresh_token: "test-refresh-token" },
+    tokens: {
+      access_token: "test-access-token",
+      refresh_token: "test-refresh-token",
+      expiry_date: Date.now() + 60 * 60_000,
+    },
   }));
   context.mock.method(googleAuth.OAuth2.prototype, "request", async () => ({
     data: { emailAddress: "owner@example.com" },
@@ -161,6 +165,7 @@ test("runtime use verifies Gmail identity before migrating a legacy credential",
   const legacyRaw = JSON.stringify({
     access_token: "legacy-access-token",
     refresh_token: "legacy-refresh-token",
+    expiry_date: Date.now() + 60 * 60_000,
   });
   const credentialStore = new MemoryCredentialStore({}, {
     legacy: { "google:gmail-test": legacyRaw },
@@ -183,6 +188,7 @@ test("runtime identity mismatch never migrates a legacy Gmail credential", async
       "google:gmail-test": JSON.stringify({
         access_token: "wrong-access-token",
         refresh_token: "wrong-refresh-token",
+        expiry_date: Date.now() + 60 * 60_000,
       }),
     },
   });
@@ -201,6 +207,7 @@ test("runtime Gmail access rejects a mismatched identity even for a profile-boun
     [key]: JSON.stringify({
       access_token: "profile-access-token",
       refresh_token: "profile-refresh-token",
+      expiry_date: Date.now() + 60 * 60_000,
     }),
   });
   context.mock.method(googleAuth.OAuth2.prototype, "request", async () => ({

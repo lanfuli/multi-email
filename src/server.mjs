@@ -6,6 +6,7 @@ import { loadConfig } from "./config.mjs";
 import { publicError } from "./errors.mjs";
 import { KeychainStore } from "./keychain.mjs";
 import { MailService } from "./mail-service.mjs";
+import { runWithOperationDeadline } from "./operation-deadline.mjs";
 import { LocalSendApprovalUi } from "./send-approval-ui.mjs";
 import { SendApprovalStore } from "./send-approval.mjs";
 
@@ -43,20 +44,22 @@ function resultContent(value) {
   };
 }
 
+export async function safeMcpOperation(action, deadlineOptions = undefined) {
+  try {
+    return resultContent(await runWithOperationDeadline(action, deadlineOptions));
+  } catch (error) {
+    const safe = publicError(error);
+    console.error(`[multi-email] ${safe.code}: ${safe.error}`);
+    return {
+      content: [{ type: "text", text: JSON.stringify(safe, null, 2) }],
+      structuredContent: { ok: false, ...safe },
+      isError: true,
+    };
+  }
+}
+
 function safeHandler(action) {
-  return async (input) => {
-    try {
-      return resultContent(await action(await service(), input));
-    } catch (error) {
-      const safe = publicError(error);
-      console.error(`[multi-email] ${safe.code}: ${safe.error}`);
-      return {
-        content: [{ type: "text", text: JSON.stringify(safe, null, 2) }],
-        structuredContent: { ok: false, ...safe },
-        isError: true,
-      };
-    }
-  };
+  return (input) => safeMcpOperation(async () => action(await service(), input));
 }
 
 const accountAlias = z

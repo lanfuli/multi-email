@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import http from "node:http";
 import test from "node:test";
 import { emptyConfig, validateConfig } from "../src/config.mjs";
 import { credentialAccountKey, MemoryCredentialStore } from "../src/keychain.mjs";
+import { runWithOperationDeadline } from "../src/operation-deadline.mjs";
 import { MicrosoftProvider } from "../src/providers/microsoft.mjs";
 
 const account = {
@@ -30,6 +32,20 @@ function provider(options = {}) {
     },
     ...options,
   });
+}
+
+async function startLocalServer(handler) {
+  const server = http.createServer(handler);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return server;
+}
+
+async function closeLocalServer(server) {
+  server.closeAllConnections?.();
+  await new Promise((resolve) => server.close(resolve));
 }
 
 const REVIEW_SELECT =
@@ -216,6 +232,247 @@ test("profile accepts only an exact configured mail or principal identity", asyn
   });
 });
 
+test("MSAL uses one bounded network client for authority and token requests", async (context) => {
+  await context.test("unexpected identity origin is refused before fetch", async () => {
+    let fetchCalls = 0;
+    const mail = provider({
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        throw new Error("must not fetch");
+      },
+    });
+    const networkClient = mail.createApplication(account).config.system.networkClient;
+
+    await assert.rejects(
+      networkClient.sendGetRequestAsync(
+        "https://login.microsoftonline.com.evil.test/token?secret=must-not-leak",
+      ),
+      (error) => {
+        assert.equal(error.code, "INVALID_PROVIDER_RESPONSE");
+        assert.doesNotMatch(
+          `${error.message} ${JSON.stringify(error.details)}`,
+          /must-not-leak|evil\.test|secret/iu,
+        );
+        return true;
+      },
+    );
+    assert.equal(fetchCalls, 0);
+  });
+
+  await context.test("application wiring and bounded JSON response", async () => {
+    let response;
+    const server = await startLocalServer((_request, localResponse) => {
+      localResponse.writeHead(200, {
+        "content-type": "application/json",
+        "x-test-header": "safe",
+      });
+      localResponse.end(JSON.stringify({ issuer: "microsoft" }));
+    });
+    const mail = provider({
+      fetchImpl: async (_url, options) => {
+        response = await fetch(`http://127.0.0.1:${server.address().port}/metadata`, options);
+        return response;
+      },
+    });
+
+    try {
+      const application = mail.createApplication(account);
+      const networkClient = application.config.system.networkClient;
+      assert.equal(application.config.system.disableInternalRetries, true);
+      assert.equal(typeof networkClient.sendGetRequestAsync, "function");
+      assert.equal(typeof networkClient.sendPostRequestAsync, "function");
+      const result = await networkClient.sendGetRequestAsync(
+        "https://login.microsoftonline.com/organizations/v2.0/.well-known/openid-configuration",
+      );
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, { issuer: "microsoft" });
+      assert.equal(result.headers["x-test-header"], "safe");
+      assert.equal(response.body.locked, false);
+    } finally {
+      await closeLocalServer(server);
+    }
+  });
+
+  await context.test("redirect does not replay a token POST", async () => {
+    const requests = [];
+    const sensitiveBody = "refresh_token=must-not-leak";
+    const server = await startLocalServer((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        requests.push({
+          method: request.method,
+          path: request.url,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+        if (request.url === "/first") {
+          response.writeHead(307, { location: "/second" });
+          response.end();
+        } else {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end("{}");
+        }
+      });
+    });
+    const mail = provider({
+      fetchImpl: async (_url, options) =>
+        fetch(`http://127.0.0.1:${server.address().port}/first`, options),
+    });
+
+    try {
+      const networkClient = mail.createApplication(account).config.system.networkClient;
+      await assert.rejects(
+        networkClient.sendPostRequestAsync(
+          "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+          {
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+            body: sensitiveBody,
+          },
+        ),
+        (error) => {
+          assert.equal(error.code, "MICROSOFT_NETWORK_ERROR");
+          assert.doesNotMatch(
+            `${error.message} ${JSON.stringify(error.details)}`,
+            /must-not-leak|127\.0\.0\.1|oauth2/iu,
+          );
+          return true;
+        },
+      );
+      assert.deepEqual(requests, [
+        { method: "POST", path: "/first", body: sensitiveBody },
+      ]);
+    } finally {
+      await closeLocalServer(server);
+    }
+  });
+
+  await context.test("oversized identity response is cancelled and released", async () => {
+    let observedResponse;
+    let responseClosed = false;
+    let settleClosed;
+    const closed = new Promise((resolve) => {
+      settleClosed = resolve;
+    });
+    const server = await startLocalServer((_request, response) => {
+      response.on("close", () => {
+        responseClosed = true;
+        settleClosed();
+      });
+      response.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(2 * 1024 * 1024 + 1),
+      });
+      response.write('{"sensitive":"must-not-leak"');
+    });
+    const mail = provider({
+      fetchImpl: async (_url, options) => {
+        observedResponse = await fetch(
+          `http://127.0.0.1:${server.address().port}/oversized`,
+          options,
+        );
+        return observedResponse;
+      },
+    });
+
+    try {
+      const networkClient = mail.createApplication(account).config.system.networkClient;
+      await assert.rejects(
+        networkClient.sendGetRequestAsync(
+          "https://login.microsoftonline.com/organizations/discovery/v2.0/keys",
+        ),
+        (error) => {
+          assert.equal(error.code, "INVALID_PROVIDER_RESPONSE");
+          assert.doesNotMatch(
+            `${error.message} ${JSON.stringify(error.details)}`,
+            /must-not-leak|127\.0\.0\.1|discovery/iu,
+          );
+          return true;
+        },
+      );
+      await Promise.race([
+        closed,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("identity response stayed open")), 1_000),
+        ),
+      ]);
+      assert.equal(responseClosed, true);
+      assert.equal(observedResponse.body.locked, false);
+    } finally {
+      await closeLocalServer(server);
+    }
+  });
+
+  await context.test("stalled token response is aborted within the shared deadline", async () => {
+    const requests = [];
+    let responseClosed = false;
+    let settleClosed;
+    const closed = new Promise((resolve) => {
+      settleClosed = resolve;
+    });
+    const server = await startLocalServer((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        requests.push({
+          method: request.method,
+          path: request.url,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+      });
+      response.on("close", () => {
+        responseClosed = true;
+        settleClosed();
+      });
+    });
+    const mail = provider({
+      graphRequestTimeoutMs: 1_000,
+      fetchImpl: async (_url, options) =>
+        fetch(`http://127.0.0.1:${server.address().port}/stalled`, options),
+    });
+
+    try {
+      const networkClient = mail.createApplication(account).config.system.networkClient;
+      const startedAt = Date.now();
+      await assert.rejects(
+        runWithOperationDeadline(
+          () =>
+            networkClient.sendPostRequestAsync(
+              "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+              { body: "refresh_token=must-not-leak" },
+            ),
+          { timeoutMs: 400 },
+        ),
+        (error) => {
+          assert.equal(error.code, "MICROSOFT_TIMEOUT");
+          assert.ok(error.details.timeoutMs > 0 && error.details.timeoutMs <= 150);
+          assert.doesNotMatch(
+            `${error.message} ${JSON.stringify(error.details)}`,
+            /must-not-leak|127\.0\.0\.1|oauth2/iu,
+          );
+          return true;
+        },
+      );
+      assert.ok(Date.now() - startedAt < 400);
+      await Promise.race([
+        closed,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("stalled identity response stayed open")), 1_000),
+        ),
+      ]);
+      assert.equal(responseClosed, true);
+      assert.deepEqual(requests, [
+        {
+          method: "POST",
+          path: "/stalled",
+          body: "refresh_token=must-not-leak",
+        },
+      ]);
+    } finally {
+      await closeLocalServer(server);
+    }
+  });
+});
+
 test("Graph requests reject hostname lookalikes before fetch", async () => {
   let fetchCalls = 0;
   const mail = provider({
@@ -235,6 +492,57 @@ test("Graph requests reject hostname lookalikes before fetch", async () => {
   assert.equal(fetchCalls, 0);
 });
 
+test("Graph rejects 307 redirects without replaying a POST body", async () => {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      requests.push({
+        method: request.method,
+        path: request.url,
+        body: Buffer.concat(chunks).toString("utf8"),
+        authorization: request.headers.authorization,
+      });
+      if (request.url === "/first") {
+        response.writeHead(307, { location: "/second" });
+        response.end();
+      } else {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end("{}");
+      }
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  const mail = provider({
+    fetchImpl: async (_url, options) =>
+      fetch(`http://127.0.0.1:${server.address().port}/first`, options),
+  });
+  try {
+    await assert.rejects(
+      mail.graphRequestWithToken("not-a-real-token", "me/messages/draft-1/send", {
+        method: "POST",
+        body: {},
+      }),
+      { code: "MICROSOFT_NETWORK_ERROR" },
+    );
+    assert.deepEqual(requests, [
+      {
+        method: "POST",
+        path: "/first",
+        body: "{}",
+        authorization: "Bearer not-a-real-token",
+      },
+    ]);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("raw Graph responses enforce a byte cap before buffering MIME", async () => {
   const mail = provider({
     fetchImpl: async () =>
@@ -251,6 +559,760 @@ test("raw Graph responses enforce a byte cap before buffering MIME", async () =>
     }),
     { code: "DRAFT_TOO_LARGE" },
   );
+});
+
+test("Graph requests enforce a provider deadline and safely classify aborts", async (context) => {
+  await context.test("deadline", async () => {
+    const mail = provider({
+      graphRequestTimeoutMs: 10,
+      fetchImpl: async (_url, { signal }) =>
+        new Promise((resolve, reject) => {
+          const pending = setTimeout(() => resolve(new Response("{}")), 1_000);
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(pending);
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        }),
+    });
+
+    await assert.rejects(
+      mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+      (error) => {
+        assert.equal(error.code, "MICROSOFT_TIMEOUT");
+        assert.deepEqual(error.details, { timeoutMs: 10 });
+        assert.doesNotMatch(`${error.message} ${JSON.stringify(error.details)}`, /token/iu);
+        return true;
+      },
+    );
+  });
+
+  await context.test("abort", async () => {
+    const mail = provider({
+      fetchImpl: async () => {
+        throw new DOMException("Bearer must-not-leak", "AbortError");
+      },
+    });
+
+    await assert.rejects(
+      mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+      (error) => {
+        assert.equal(error.code, "MICROSOFT_REQUEST_ABORTED");
+        assert.doesNotMatch(`${error.message} ${JSON.stringify(error.details)}`, /must-not-leak/iu);
+        return true;
+      },
+    );
+  });
+
+  assert.ok(provider({ graphRequestTimeoutMs: 121_000 }).graphRequestTimeoutMs < 120_000);
+});
+
+test("Microsoft consumes one absolute MCP deadline across token, identity, and Graph work", async (context) => {
+  await context.test("stuck silent token acquisition", async () => {
+    const mail = provider();
+    mail.application = async () => ({
+      application: {
+        async getAllAccounts() {
+          return [{ username: account.email }];
+        },
+        async acquireTokenSilent() {
+          return new Promise(() => {});
+        },
+      },
+      record: null,
+    });
+    const keepAlive = setTimeout(() => {}, 100);
+    try {
+      await assert.rejects(
+        runWithOperationDeadline(() => mail.accessToken(account), { timeoutMs: 20 }),
+        { code: "MICROSOFT_TIMEOUT" },
+      );
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  await context.test("stuck silent token acquisition outside an MCP operation", async () => {
+    const mail = provider({ graphRequestTimeoutMs: 20 });
+    mail.application = async () => ({
+      application: {
+        async getAllAccounts() {
+          return [{ username: account.email }];
+        },
+        async acquireTokenSilent() {
+          return new Promise(() => {});
+        },
+      },
+      record: null,
+    });
+
+    await assert.rejects(mail.accessToken(account), { code: "MICROSOFT_TIMEOUT" });
+  });
+
+  await context.test("stuck application/cache load outside an MCP operation", async () => {
+    const mail = provider({ graphRequestTimeoutMs: 20 });
+    mail.application = async () => new Promise(() => {});
+
+    await assert.rejects(mail.accessToken(account), { code: "MICROSOFT_TIMEOUT" });
+  });
+
+  await context.test("expired budget prevents a late token request", async () => {
+    let tokenCalls = 0;
+    const mail = provider();
+    mail.application = async () => ({
+      application: {
+        async getAllAccounts() {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          return [{ username: account.email }];
+        },
+        async acquireTokenSilent() {
+          tokenCalls += 1;
+          return { accessToken: "must-not-be-issued" };
+        },
+      },
+      record: null,
+    });
+
+    await assert.rejects(
+      runWithOperationDeadline(() => mail.accessToken(account), { timeoutMs: 20 }),
+      { code: "MICROSOFT_TIMEOUT" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(tokenCalls, 0);
+  });
+
+  await context.test("initial identity verification", async () => {
+    const mail = provider({
+      graphRequestTimeoutMs: 1_000,
+      fetchImpl: async (_url, { signal }) =>
+        new Promise((resolve, reject) => {
+          const pending = setTimeout(() => resolve(new Response("{}")), 1_000);
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(pending);
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        }),
+    });
+    mail.application = async () => ({
+      application: {
+        async getAllAccounts() {
+          return [{ username: account.email }];
+        },
+        async acquireTokenSilent() {
+          return {
+            accessToken: "not-a-real-token",
+            scopes: ["User.Read", "Mail.ReadWrite", "Mail.Send"],
+          };
+        },
+      },
+      record: null,
+    });
+
+    await assert.rejects(
+      runWithOperationDeadline(() => mail.accessToken(account), { timeoutMs: 350 }),
+      (error) => ["MICROSOFT_TIMEOUT", "OPERATION_DEADLINE_EXCEEDED"].includes(error.code),
+    );
+  });
+
+  await context.test("cumulative Graph calls", async () => {
+    let fetchCalls = 0;
+    const mail = provider({
+      graphRequestTimeoutMs: 1_000,
+      fetchImpl: async (_url, { signal }) => {
+        fetchCalls += 1;
+        return new Promise((resolve, reject) => {
+          const pending = setTimeout(() => resolve(new Response("{}")), 240);
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(pending);
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        });
+      },
+    });
+    mail.accessToken = async () => "not-a-real-token";
+
+    await assert.rejects(
+      runWithOperationDeadline(
+        () => mail.markRead(account, ["one", "two", "three"], true),
+        { timeoutMs: 700 },
+      ),
+      (error) => {
+        assert.equal(error.code, "PARTIAL_MARK_READ");
+        assert.deepEqual(error.details.completedIds, ["one"]);
+        assert.equal(error.details.unknownOutcomeId, "two");
+        assert.deepEqual(error.details.remainingIds, ["three"]);
+        assert.equal(error.details.causeCode, "MICROSOFT_TIMEOUT");
+        return true;
+      },
+    );
+    assert.equal(fetchCalls, 2);
+  });
+
+  await context.test("batch receipt survives a later stuck silent token", async () => {
+    let fetchCalls = 0;
+    let tokenCalls = 0;
+    const mail = provider({
+      graphRequestTimeoutMs: 1_000,
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        return new Response("{}");
+      },
+    });
+    mail.verifiedAliases.add(account.alias);
+    mail.application = async () => ({
+      application: {
+        async getAllAccounts() {
+          return [{ username: account.email }];
+        },
+        async acquireTokenSilent() {
+          tokenCalls += 1;
+          if (tokenCalls === 1) {
+            return {
+              accessToken: "not-a-real-token",
+              scopes: ["User.Read", "Mail.ReadWrite", "Mail.Send"],
+            };
+          }
+          return new Promise(() => {});
+        },
+      },
+      record: null,
+    });
+
+    await assert.rejects(
+      runWithOperationDeadline(
+        () => mail.markRead(account, ["one", "two", "three"], true),
+        { timeoutMs: 300 },
+      ),
+      (error) => {
+        assert.equal(error.code, "PARTIAL_MARK_READ");
+        assert.deepEqual(error.details, {
+          changed: 1,
+          requested: 3,
+          isRead: true,
+          completedIds: ["one"],
+          failedId: "two",
+          remainingIds: ["three"],
+          causeCode: "MICROSOFT_TIMEOUT",
+        });
+        return true;
+      },
+    );
+    assert.equal(tokenCalls, 2);
+    assert.equal(fetchCalls, 1);
+  });
+
+  await context.test("batch receipt survives a later stuck account-cache read", async () => {
+    let applicationCalls = 0;
+    let fetchCalls = 0;
+    let tokenCalls = 0;
+    const mail = provider({
+      graphRequestTimeoutMs: 1_000,
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        return new Response("{}");
+      },
+    });
+    mail.verifiedAliases.add(account.alias);
+    mail.application = async () => {
+      applicationCalls += 1;
+      return {
+        application: {
+          async getAllAccounts() {
+            if (applicationCalls === 2) return new Promise(() => {});
+            return [{ username: account.email }];
+          },
+          async acquireTokenSilent() {
+            tokenCalls += 1;
+            return {
+              accessToken: "not-a-real-token",
+              scopes: ["User.Read", "Mail.ReadWrite", "Mail.Send"],
+            };
+          },
+        },
+        record: null,
+      };
+    };
+
+    await assert.rejects(
+      runWithOperationDeadline(
+        () => mail.markRead(account, ["one", "two"], true),
+        { timeoutMs: 400 },
+      ),
+      (error) => {
+        assert.equal(error.code, "PARTIAL_MARK_READ");
+        assert.deepEqual(error.details, {
+          changed: 1,
+          requested: 2,
+          isRead: true,
+          completedIds: ["one"],
+          failedId: "two",
+          remainingIds: [],
+          causeCode: "MICROSOFT_TIMEOUT",
+        });
+        return true;
+      },
+    );
+    assert.equal(applicationCalls, 2);
+    assert.equal(tokenCalls, 1);
+    assert.equal(fetchCalls, 1);
+  });
+});
+
+test("Graph JSON responses are stream-limited before parsing", async () => {
+  let cancelled = false;
+  const chunk = new Uint8Array(1024 * 1024 + 1).fill(0x20);
+  const mail = provider({
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.enqueue(chunk);
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+  });
+
+  await assert.rejects(
+    mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+    { code: "INVALID_PROVIDER_RESPONSE" },
+  );
+  assert.equal(cancelled, true);
+});
+
+test("Graph cancels a readable response rejected by Content-Length", async () => {
+  let cancelled = false;
+  const response = new Response(
+    new ReadableStream({
+      cancel() {
+        cancelled = true;
+      },
+    }),
+    {
+      status: 200,
+      headers: { "content-length": String(2 * 1024 * 1024 + 1) },
+    },
+  );
+  const mail = provider({
+    fetchImpl: async () => response,
+  });
+
+  await assert.rejects(
+    mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+    { code: "INVALID_PROVIDER_RESPONSE" },
+  );
+  assert.equal(cancelled, true);
+  assert.equal(response.body.locked, false);
+});
+
+test("Graph JSON errors preserve safe status details without exposing provider text", async (context) => {
+  await context.test("malformed success JSON", async () => {
+    const mail = provider({
+      fetchImpl: async () =>
+        new Response("{not-json", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+
+    await assert.rejects(
+      mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+      { code: "INVALID_PROVIDER_RESPONSE" },
+    );
+  });
+
+  await context.test("provider error JSON", async () => {
+    const mail = provider({
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            error: { code: "TooManyRequests", message: "Bearer must-not-leak" },
+          }),
+          {
+            status: 429,
+            headers: { "content-type": "application/json", "retry-after": "7" },
+          },
+        ),
+    });
+
+    await assert.rejects(
+      mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+      (error) => {
+        assert.equal(error.code, "MICROSOFT_GRAPH_ERROR");
+        assert.deepEqual(error.details, {
+          status: 429,
+          providerCode: "TooManyRequests",
+          retryAfter: "7",
+        });
+        assert.doesNotMatch(`${error.message} ${JSON.stringify(error.details)}`, /must-not-leak/iu);
+        return true;
+      },
+    );
+  });
+
+  await context.test("malicious provider details", async () => {
+    const response = new Response(
+      JSON.stringify({
+        error: { code: `Bad\n${"x".repeat(200)}`, message: "must-not-leak" },
+      }),
+      { status: 429, headers: { "content-type": "application/json" } },
+    );
+    Object.defineProperty(response, "headers", {
+      value: {
+        get(name) {
+          if (name.toLowerCase() === "retry-after") return "7\r\nX-Leak: must-not-leak";
+          return null;
+        },
+      },
+    });
+    const mail = provider({
+      fetchImpl: async () => response,
+    });
+
+    await assert.rejects(
+      mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+      (error) => {
+        assert.deepEqual(error.details, {
+          status: 429,
+          providerCode: null,
+          retryAfter: null,
+        });
+        assert.doesNotMatch(`${error.message} ${JSON.stringify(error.details)}`, /must-not-leak/iu);
+        return true;
+      },
+    );
+  });
+
+  await context.test("oversized provider error body", async () => {
+    let cancelled = false;
+    const mail = provider({
+      fetchImpl: async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new Uint8Array(64 * 1024 + 1));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          {
+            status: 503,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "12",
+            },
+          },
+        ),
+    });
+
+    await assert.rejects(
+      mail.graphRequestWithToken("not-a-real-token", "me/messages"),
+      (error) => {
+        assert.equal(error.code, "MICROSOFT_GRAPH_ERROR");
+        assert.deepEqual(error.details, {
+          status: 503,
+          providerCode: null,
+          retryAfter: "12",
+        });
+        return true;
+      },
+    );
+    assert.equal(cancelled, true);
+  });
+});
+
+test("Microsoft batch failures identify completed, failed, and remaining message IDs", async (context) => {
+  const messageIds = ["one", "two", "three"];
+  const providerFailure = Object.assign(new Error("Bearer must-not-leak"), {
+    code: "MICROSOFT_GRAPH_ERROR",
+    details: { status: 400 },
+  });
+
+  function assertPartial(error, code, extra = {}) {
+    assert.equal(error.code, code);
+    assert.deepEqual(error.details, {
+      ...extra,
+      requested: 3,
+      completedIds: ["one"],
+      failedId: "two",
+      remainingIds: ["three"],
+      causeCode: "MICROSOFT_GRAPH_ERROR",
+    });
+    assert.doesNotMatch(`${error.message} ${JSON.stringify(error.details)}`, /must-not-leak/iu);
+    return true;
+  }
+
+  await context.test("archive", async () => {
+    const mail = provider();
+    mail.graphRequest = async (_account, path) => {
+      if (path === "me/mailFolders/archive?$select=id,displayName") return { id: "archive" };
+      if (path === "me/messages/one?$select=id,parentFolderId") return { parentFolderId: "inbox" };
+      if (path === "me/messages/one/move") return { id: "one" };
+      if (path === "me/messages/two?$select=id,parentFolderId") throw providerFailure;
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.archive(account, messageIds),
+      (error) => assertPartial(error, "PARTIAL_ARCHIVE", { archived: 1 }),
+    );
+  });
+
+  await context.test("mark read", async () => {
+    const mail = provider();
+    mail.graphRequest = async (_account, path) => {
+      if (path === "me/messages/one") return { id: "one" };
+      if (path === "me/messages/two") throw providerFailure;
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.markRead(account, messageIds, true),
+      (error) => assertPartial(error, "PARTIAL_MARK_READ", { changed: 1, isRead: true }),
+    );
+  });
+
+  await context.test("categories", async () => {
+    const mail = provider();
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (path === "me/messages/one?$select=id,categories") {
+        return { id: "one", categories: ["remove"] };
+      }
+      if (path === "me/messages/one" && options.method === "PATCH") return { id: "one" };
+      if (path === "me/messages/two?$select=id,categories") throw providerFailure;
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.modifyCategories(account, messageIds, { add: ["add"], remove: ["remove"] }),
+      (error) => assertPartial(error, "PARTIAL_CATEGORY_UPDATE", { changed: 1 }),
+    );
+  });
+});
+
+test("Microsoft batch receipts distinguish definite failures from unknown mutation outcomes", async (context) => {
+  const messageIds = ["one", "two", "three"];
+  const unknownFailure = Object.assign(new Error("Bearer must-not-leak"), {
+    code: "MICROSOFT_TIMEOUT",
+  });
+
+  function assertUnknown(error, code, extra = {}) {
+    assert.equal(error.code, code);
+    assert.deepEqual(error.details, {
+      ...extra,
+      requested: 3,
+      completedIds: ["one"],
+      unknownOutcomeId: "two",
+      remainingIds: ["three"],
+      causeCode: "MICROSOFT_TIMEOUT",
+    });
+    assert.equal("failedId" in error.details, false);
+    assert.doesNotMatch(`${error.message} ${JSON.stringify(error.details)}`, /must-not-leak/iu);
+    return true;
+  }
+
+  await context.test("archive move", async () => {
+    const mail = provider();
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (path === "me/mailFolders/archive?$select=id,displayName") return { id: "archive" };
+      if (path === "me/messages/one?$select=id,parentFolderId") return { parentFolderId: "inbox" };
+      if (path === "me/messages/one/move") return { id: "one" };
+      if (path === "me/messages/two?$select=id,parentFolderId") return { parentFolderId: "inbox" };
+      if (path === "me/messages/two/move") {
+        options.onDispatch();
+        throw unknownFailure;
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.archive(account, messageIds),
+      (error) => assertUnknown(error, "PARTIAL_ARCHIVE", { archived: 1 }),
+    );
+  });
+
+  await context.test("mark read", async () => {
+    const mail = provider();
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (path === "me/messages/one") return { id: "one" };
+      if (path === "me/messages/two") {
+        options.onDispatch();
+        throw unknownFailure;
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.markRead(account, messageIds, true),
+      (error) => assertUnknown(error, "PARTIAL_MARK_READ", { changed: 1, isRead: true }),
+    );
+  });
+
+  await context.test("category patch", async () => {
+    const mail = provider();
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (path === "me/messages/one?$select=id,categories") return { categories: [] };
+      if (path === "me/messages/one" && options.method === "PATCH") return { id: "one" };
+      if (path === "me/messages/two?$select=id,categories") return { categories: [] };
+      if (path === "me/messages/two" && options.method === "PATCH") {
+        options.onDispatch();
+        throw unknownFailure;
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.modifyCategories(account, messageIds, { add: ["add"] }),
+      (error) => assertUnknown(error, "PARTIAL_CATEGORY_UPDATE", { changed: 1 }),
+    );
+  });
+
+  await context.test("malicious cause code", async () => {
+    const mail = provider();
+    mail.graphRequest = async () => {
+      throw Object.assign(new Error("must-not-leak"), {
+        code: `BAD\n${"x".repeat(200)}`,
+        details: { status: 400 },
+      });
+    };
+
+    await assert.rejects(
+      mail.markRead(account, ["one"], true),
+      (error) => {
+        assert.deepEqual(error.details, {
+          changed: 0,
+          requested: 1,
+          isRead: true,
+          completedIds: [],
+          failedId: "one",
+          remainingIds: [],
+          causeCode: null,
+        });
+        assert.doesNotMatch(`${error.message} ${JSON.stringify(error.details)}`, /must-not-leak/iu);
+        return true;
+      },
+    );
+  });
+
+  await context.test("token failure before dispatch", async () => {
+    const mail = provider();
+    let fetchCalls = 0;
+    mail.accessToken = async () => {
+      throw new Error("token unavailable");
+    };
+    mail.fetchImpl = async () => {
+      fetchCalls += 1;
+      throw new Error("must not fetch");
+    };
+
+    await assert.rejects(
+      mail.markRead(account, ["one"], true),
+      (error) => {
+        assert.deepEqual(error.details, {
+          changed: 0,
+          requested: 1,
+          isRead: true,
+          completedIds: [],
+          failedId: "one",
+          remainingIds: [],
+          causeCode: null,
+        });
+        assert.equal("unknownOutcomeId" in error.details, false);
+        return true;
+      },
+    );
+    assert.equal(fetchCalls, 0);
+  });
+
+  for (const status of [408, 500, 502, 503, 504]) {
+    await context.test(`dispatched HTTP ${status} remains unknown`, async () => {
+      let applied = false;
+      const attempted = [];
+      const mail = provider({
+        fetchImpl: async (url) => {
+          const id = new URL(url).pathname.split("/").at(-1);
+          attempted.push(id);
+          if (id === "one") {
+            return new Response(JSON.stringify({ id }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          if (id === "two") {
+            applied = true;
+            return new Response(JSON.stringify({ error: { code: "ServerError" } }), {
+              status,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          throw new Error("third mutation must remain untouched");
+        },
+      });
+      mail.accessToken = async () => "not-a-real-token";
+
+      await assert.rejects(
+        mail.markRead(account, messageIds, true),
+        (error) => {
+          assert.equal(applied, true);
+          assert.deepEqual(attempted, ["one", "two"]);
+          assert.deepEqual(error.details, {
+            changed: 1,
+            requested: 3,
+            isRead: true,
+            completedIds: ["one"],
+            unknownOutcomeId: "two",
+            remainingIds: ["three"],
+            causeCode: "MICROSOFT_GRAPH_ERROR",
+          });
+          assert.equal("failedId" in error.details, false);
+          return true;
+        },
+      );
+    });
+  }
+
+  await context.test("dispatched HTTP 400 is a definite rejection", async () => {
+    const mail = provider({
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ error: { code: "InvalidRequest" } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    mail.accessToken = async () => "not-a-real-token";
+
+    await assert.rejects(
+      mail.markRead(account, ["one"], true),
+      (error) => {
+        assert.deepEqual(error.details, {
+          changed: 0,
+          requested: 1,
+          isRead: true,
+          completedIds: [],
+          failedId: "one",
+          remainingIds: [],
+          causeCode: "MICROSOFT_GRAPH_ERROR",
+        });
+        assert.equal("unknownOutcomeId" in error.details, false);
+        return true;
+      },
+    );
+  });
 });
 
 test("Microsoft page tokens are confined to the messages collection", async () => {
@@ -890,6 +1952,151 @@ test("sendDraft rechecks the source then posts one frozen approved MIME message"
   assert.doesNotMatch(frozen.raw, /Sales <sales@example\.com>/u);
   assert.doesNotMatch(frozen.raw, /X-Unreviewed-Display|Return-Path|Disposition-Notification-To/u);
   assert.doesNotMatch(frozen.raw, /X-Injected-Late|MUTATED AFTER FINAL CHECK/u);
+});
+
+test("sendDraft attempts the send once when the response outcome is unknown", async () => {
+  const mail = provider();
+  const raw = plainTextMime("Approved body");
+  const approvedManifest = fullManifest(sendReview({ body: "Approved body", raw }));
+  let revisionCalls = 0;
+  let sendCalls = 0;
+  mail.graphRequest = async (_account, path, options = {}) => {
+    if (path === revisionPath("draft/send")) {
+      revisionCalls += 1;
+      return {
+        id: "draft/send",
+        conversationId: "thread-send",
+        isDraft: true,
+        changeKey: "CQAAABYAA-send-1",
+        lastModifiedDateTime: "2026-08-21T13:00:00Z",
+      };
+    }
+    if (path === rawPath("draft/send")) return raw;
+    if (path === attachmentPath("draft/send")) return { value: [] };
+    if (path === "me/sendMail" && options.method === "POST") {
+      sendCalls += 1;
+      options.onDispatch();
+      throw Object.assign(new Error("response timed out after dispatch"), {
+        code: "MICROSOFT_TIMEOUT",
+      });
+    }
+    throw new Error(`Unexpected Graph request: ${path}`);
+  };
+
+  await assert.rejects(
+    mail.sendDraft(account, "draft/send", approvedManifest),
+    { code: "MICROSOFT_TIMEOUT" },
+  );
+  assert.equal(revisionCalls, 2);
+  assert.equal(sendCalls, 1);
+});
+
+test("sendDraft reports failures before send dispatch as definitely unsent", async (context) => {
+  const raw = plainTextMime("Approved body");
+  const approvedManifest = fullManifest(sendReview({ body: "Approved body", raw }));
+
+  function installPreflight(mail, sendRequest) {
+    let revisionCalls = 0;
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (path === revisionPath("draft/send")) {
+        revisionCalls += 1;
+        return {
+          id: "draft/send",
+          conversationId: "thread-send",
+          isDraft: true,
+          changeKey: "CQAAABYAA-send-1",
+          lastModifiedDateTime: "2026-08-21T13:00:00Z",
+        };
+      }
+      if (path === rawPath("draft/send")) return raw;
+      if (path === attachmentPath("draft/send")) return { value: [] };
+      if (path === "me/sendMail" && options.method === "POST") {
+        return sendRequest(_account, path, options);
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+    return () => revisionCalls;
+  }
+
+  await context.test("draft verification transport failure", async () => {
+    let sendCalls = 0;
+    const mail = provider();
+    mail.graphRequest = async (_account, path, options = {}) => {
+      if (options.method === "POST") sendCalls += 1;
+      if (path === revisionPath("draft/send")) {
+        throw Object.assign(new Error("verification timed out"), {
+          code: "MICROSOFT_TIMEOUT",
+        });
+      }
+      throw new Error(`Unexpected Graph request: ${path}`);
+    };
+
+    await assert.rejects(
+      mail.sendDraft(account, "draft/send", approvedManifest),
+      (error) => {
+        assert.equal(error.code, "SEND_VERIFICATION_FAILED");
+        assert.match(error.message, /Nothing was sent\./u);
+        assert.deepEqual(error.details, { causeCode: "MICROSOFT_TIMEOUT" });
+        return true;
+      },
+    );
+    assert.equal(sendCalls, 0);
+  });
+
+  await context.test("access token failure", async () => {
+    let fetchCalls = 0;
+    const mail = provider({
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        throw new Error("must not fetch");
+      },
+    });
+    const graphRequest = MicrosoftProvider.prototype.graphRequest.bind(mail);
+    mail.accessToken = async () => {
+      throw Object.assign(new Error("token wait expired"), { code: "MICROSOFT_TIMEOUT" });
+    };
+    const revisionCalls = installPreflight(mail, graphRequest);
+
+    await assert.rejects(
+      mail.sendDraft(account, "draft/send", approvedManifest),
+      (error) => {
+        assert.equal(error.code, "SEND_VERIFICATION_FAILED");
+        assert.match(error.message, /Nothing was sent\./u);
+        assert.deepEqual(error.details, { causeCode: "MICROSOFT_TIMEOUT" });
+        return true;
+      },
+    );
+    assert.equal(revisionCalls(), 2);
+    assert.equal(fetchCalls, 0);
+  });
+
+  await context.test("request budget failure", async () => {
+    let fetchCalls = 0;
+    const mail = provider({
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        throw new Error("must not fetch");
+      },
+    });
+    const graphRequest = MicrosoftProvider.prototype.graphRequest.bind(mail);
+    mail.accessToken = async () => "not-a-real-token";
+    const revisionCalls = installPreflight(mail, graphRequest);
+
+    await assert.rejects(
+      runWithOperationDeadline(
+        () => mail.sendDraft(account, "draft/send", approvedManifest),
+        { timeoutMs: 200 },
+      ),
+      (error) => {
+        assert.equal(error.code, "SEND_VERIFICATION_FAILED");
+        assert.match(error.message, /Nothing was sent\./u);
+        assert.deepEqual(error.details, { causeCode: "OPERATION_DEADLINE_EXCEEDED" });
+        return true;
+      },
+    );
+    assert.equal(revisionCalls(), 2);
+    assert.equal(fetchCalls, 0);
+  });
 });
 
 test("sendDraft rejects every Microsoft revision change before POST", async () => {

@@ -6,6 +6,7 @@ import { decodeWords } from "postal-mime";
 import { GOOGLE_SCOPES, HARD_SAFETY_LIMITS } from "../constants.mjs";
 import { MultiEmailError } from "../errors.mjs";
 import { credentialAccountKey, legacyCredentialAccountKey } from "../keychain.mjs";
+import { operationRequestBudget } from "../operation-deadline.mjs";
 import {
   buildRawMessage,
   extractGmailBody,
@@ -34,6 +35,30 @@ const MAX_REVIEW_RAW_BYTES = 2 * 1024 * 1024;
 const MAX_SUBJECT_BYTES = 998;
 const MAX_IN_REPLY_TO_BYTES = 900;
 const MAX_REFERENCES_BYTES = 8192;
+const GOOGLE_REQUEST_TIMEOUT_MS = 90_000;
+const GOOGLE_RESPONSE_LIMIT_BYTES = 4 * 1024 * 1024;
+const GOOGLE_TIMEOUT_CODES = new Set([
+  "ABORT_ERR",
+  "AbortError",
+  "OPERATION_DEADLINE_EXCEEDED",
+  "TimeoutError",
+  "ETIMEDOUT",
+  "ESOCKETTIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+const GOOGLE_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "EAI_AGAIN",
+]);
+const DIAGNOSTIC_ERROR_CODE = /^[A-Z0-9][A-Z0-9_-]{0,63}$/u;
 const UNSUPPORTED_MATERIAL_HEADERS = new Set([
   "apparently-to",
   "bounces-to",
@@ -49,6 +74,11 @@ const UNSUPPORTED_MATERIAL_HEADERS = new Set([
 
 function draftNotReviewable(message) {
   return new MultiEmailError(message, "DRAFT_NOT_REVIEWABLE");
+}
+
+function safeDiagnosticErrorCode(value, fallback) {
+  const code = typeof value === "string" ? value.trim() : "";
+  return DIAGNOSTIC_ERROR_CODE.test(code) ? code : fallback;
 }
 
 function headerValues(headers, name) {
@@ -561,6 +591,209 @@ function compactBody(body, limit = 80_000) {
   return { body: `${body.slice(0, limit)}\n\n[truncated]`, truncated: true };
 }
 
+function isGoogleRequestTimeout(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    if (
+      GOOGLE_TIMEOUT_CODES.has(String(current.code || "")) ||
+      GOOGLE_TIMEOUT_CODES.has(String(current.name || ""))
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+function isGoogleNetworkError(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    if (GOOGLE_NETWORK_CODES.has(String(current.code || ""))) return true;
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+function isGoogleRedirectError(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const type = String(current.type || "");
+    const message = String(current.message || "");
+    if (
+      type === "no-redirect" ||
+      type === "max-redirect" ||
+      /redirect mode is set to error|maximum redirect reached/iu.test(message)
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+function isGoogleResponseTooLarge(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    const message = String(current.message || "");
+    if (
+      current.type === "max-size" ||
+      message === "Response's `Content-Length` is over the limit." ||
+      /^content size at .* over limit: \d+$/u.test(message)
+    ) {
+      return true;
+    }
+    current = current.cause || current.error;
+  }
+  return false;
+}
+
+async function abandonGoogleResponse(error) {
+  const body = error?.response?.body;
+  try {
+    if (typeof body?.cancel === "function") {
+      await body.cancel();
+    } else if (typeof body?.destroy === "function") {
+      body.destroy();
+    }
+  } catch {
+    // Best-effort transport cleanup must not replace the safe public error.
+  }
+}
+
+function googleRequestTimeout() {
+  return new MultiEmailError(
+    "The Google request timed out before completing.",
+    "GOOGLE_REQUEST_TIMEOUT",
+  );
+}
+
+function googleNetworkError() {
+  return new MultiEmailError(
+    "The Google request could not reach the provider.",
+    "GOOGLE_NETWORK_ERROR",
+  );
+}
+
+function googleResponseTooLarge() {
+  return new MultiEmailError(
+    "The Google response exceeded the safe transport limit.",
+    "GOOGLE_RESPONSE_TOO_LARGE",
+  );
+}
+
+function googleNoRetryOptions() {
+  return {
+    retry: false,
+    retryConfig: { retry: 0 },
+    // A 307/308 redirect can replay a POST body even when gaxios retries are
+    // disabled. Provider endpoints are fixed, so fail closed on every redirect.
+    maxRedirects: 0,
+    // gaxios does not map maxRedirects from transporter defaults to node-fetch's
+    // `follow` field, so set both native fetch controls explicitly as well.
+    follow: 0,
+    redirect: "error",
+  };
+}
+
+function googleResponseLimitOptions() {
+  return {
+    maxContentLength: GOOGLE_RESPONSE_LIMIT_BYTES,
+    // gaxios only derives node-fetch's streaming `size` from per-call input,
+    // so keep it explicit for OAuth requests that originate inside the library.
+    size: GOOGLE_RESPONSE_LIMIT_BYTES,
+  };
+}
+
+function googleRequestOptions() {
+  const budget = operationRequestBudget({ fallbackMs: GOOGLE_REQUEST_TIMEOUT_MS });
+  const requestSignal = AbortSignal.timeout(budget.timeout);
+  return {
+    ...budget,
+    // gaxios prepares its timeout signal before request interceptors run. The
+    // interceptor therefore has to preserve both the shared operation signal
+    // and a fresh provider-request timeout when it replaces the options.
+    signal: budget.signal
+      ? AbortSignal.any([budget.signal, requestSignal])
+      : requestSignal,
+    ...googleResponseLimitOptions(),
+    ...googleNoRetryOptions(),
+  };
+}
+
+function hasUsableTokenExpiry(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+async function prepareGoogleApiCredentials(oauth) {
+  const credentials = oauth.credentials || {};
+  if (credentials.refresh_token && !hasUsableTokenExpiry(credentials.expiry_date)) {
+    await oauth.refreshAccessToken();
+  } else {
+    await oauth.getAccessToken();
+  }
+
+  const prepared = oauth.credentials || {};
+  if (
+    !prepared.access_token ||
+    (prepared.refresh_token && !hasUsableTokenExpiry(prepared.expiry_date))
+  ) {
+    throw new MultiEmailError(
+      "The Google credential could not be normalized safely. Reauthorize this account.",
+      "INVALID_CREDENTIAL",
+    );
+  }
+  return prepared;
+}
+
+function gmailSendVerificationFailed() {
+  return new MultiEmailError(
+    "The Gmail draft could not be verified before sending. Nothing was sent.",
+    "SEND_VERIFICATION_FAILED",
+  );
+}
+
+function createGoogleOAuthClient(provider, redirectUri) {
+  const oauth = new googleAuth.OAuth2({
+    clientId: provider.clientId,
+    clientSecret: provider.clientSecret,
+    ...(redirectUri ? { redirectUri } : {}),
+    forceRefreshOnFailure: false,
+    // google-auth-library applies these public transporter defaults to token
+    // exchange, refresh, token-info, and revocation requests.
+    transporterOptions: {
+      timeout: GOOGLE_REQUEST_TIMEOUT_MS,
+      ...googleResponseLimitOptions(),
+      ...googleNoRetryOptions(),
+    },
+  });
+  oauth.transporter.interceptors.request.add({
+    resolved: (options) => ({ ...options, ...googleRequestOptions() }),
+    rejected: (error) => Promise.reject(error),
+  });
+  oauth.transporter.interceptors.response.add({
+    resolved: (response) => response,
+    rejected: async (error) => {
+      if (isGoogleRequestTimeout(error)) throw googleRequestTimeout();
+      if (isGoogleResponseTooLarge(error)) {
+        await abandonGoogleResponse(error);
+        throw googleResponseTooLarge();
+      }
+      if (isGoogleRedirectError(error)) throw googleNetworkError();
+      if (isGoogleNetworkError(error)) throw googleNetworkError();
+      throw error;
+    },
+  });
+  return oauth;
+}
+
 export class GmailProvider {
   constructor({ config, credentialStore, browserOpener = openBrowser }) {
     this.config = config;
@@ -645,7 +878,7 @@ export class GmailProvider {
     try {
       const port = await listen(server);
       const redirectUri = `http://127.0.0.1:${port}/oauth/google/callback`;
-      const oauth = new googleAuth.OAuth2(provider.clientId, provider.clientSecret, redirectUri);
+      const oauth = createGoogleOAuthClient(provider, redirectUri);
       const authorizationUrl = oauth.generateAuthUrl({
         access_type: "offline",
         prompt: "consent",
@@ -674,7 +907,8 @@ export class GmailProvider {
           );
         }),
       ]);
-      const { tokens } = await oauth.getToken(code);
+      const exchange = await oauth.getToken(code);
+      let tokens = exchange.tokens;
       if (!tokens.refresh_token) {
         throw new MultiEmailError(
           "Google did not return a refresh token. Revoke the app grant and authorize again.",
@@ -682,8 +916,14 @@ export class GmailProvider {
         );
       }
       oauth.setCredentials(tokens);
+      const preparedTokens = await prepareGoogleApiCredentials(oauth);
+      tokens = { ...tokens, ...preparedTokens };
+      oauth.setCredentials(tokens);
       const gmail = createGmailClient({ version: "v1", auth: oauth });
-      const profile = await gmail.users.getProfile({ userId: "me" });
+      const profile = await gmail.users.getProfile(
+        { userId: "me" },
+        googleRequestOptions(),
+      );
       const actualEmail = assertProfileMatches(account, profile);
       if (tokens.scope && !hasRequiredScopes(tokens.scope)) {
         throw new MultiEmailError(
@@ -710,7 +950,7 @@ export class GmailProvider {
       );
     }
     let tokens = parseToken(record.raw, account.alias);
-    const oauth = new googleAuth.OAuth2(provider.clientId, provider.clientSecret);
+    const oauth = createGoogleOAuthClient(provider);
     oauth.setCredentials(tokens);
     oauth.on("tokens", (updates) => {
       tokens = { ...tokens, ...updates };
@@ -734,9 +974,13 @@ export class GmailProvider {
 
   async client(account) {
     const session = await this.oauthSession(account);
+    await prepareGoogleApiCredentials(session.oauth);
     const gmail = createGmailClient({ version: "v1", auth: session.oauth });
     if (!this.verifiedAliases.has(account.alias) || session.record.source === "legacy") {
-      const response = await gmail.users.getProfile({ userId: "me" });
+      const response = await gmail.users.getProfile(
+        { userId: "me" },
+        googleRequestOptions(),
+      );
       assertProfileMatches(account, response);
       if (session.record.source === "legacy") {
         // Copy, but do not delete, the old entry. The old namespace is shared by
@@ -753,7 +997,10 @@ export class GmailProvider {
 
   async profile(account) {
     const gmail = await this.client(account);
-    const response = await gmail.users.getProfile({ userId: "me" });
+    const response = await gmail.users.getProfile(
+      { userId: "me" },
+      googleRequestOptions(),
+    );
     const email = assertProfileMatches(account, response);
     return {
       email,
@@ -791,7 +1038,7 @@ export class GmailProvider {
       } catch (error) {
         diagnostic.token_valid = false;
         diagnostic.status = "invalid_credential";
-        diagnostic.error_code = error?.code || "INVALID_CREDENTIAL";
+        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "INVALID_CREDENTIAL");
         return diagnostic;
       }
 
@@ -803,7 +1050,12 @@ export class GmailProvider {
         if (!accessToken) throw new Error("missing access token");
         tokenInfo = await session.oauth.getTokenInfo(accessToken);
         diagnostic.token_valid = true;
-      } catch {
+      } catch (error) {
+        if (error?.code === "GOOGLE_REQUEST_TIMEOUT") {
+          diagnostic.status = "provider_unavailable";
+          diagnostic.error_code = "GOOGLE_REQUEST_TIMEOUT";
+          return diagnostic;
+        }
         diagnostic.token_valid = false;
         diagnostic.status = "reauthorization_required";
         diagnostic.error_code = "REAUTHENTICATION_REQUIRED";
@@ -819,7 +1071,10 @@ export class GmailProvider {
 
       try {
         const gmail = createGmailClient({ version: "v1", auth: session.oauth });
-        const profile = await gmail.users.getProfile({ userId: "me" });
+        const profile = await gmail.users.getProfile(
+          { userId: "me" },
+          googleRequestOptions(),
+        );
         assertProfileMatches(account, profile);
         diagnostic.identity_verified = true;
         diagnostic.status = "ok";
@@ -827,12 +1082,15 @@ export class GmailProvider {
         diagnostic.identity_verified = error?.code === "ACCOUNT_MISMATCH" ? false : null;
         diagnostic.status =
           diagnostic.identity_verified === false ? "identity_mismatch" : "provider_unavailable";
-        diagnostic.error_code = error?.code || "GOOGLE_PROFILE_FAILED";
+        diagnostic.error_code = safeDiagnosticErrorCode(error?.code, "GOOGLE_PROFILE_FAILED");
       }
       return diagnostic;
     } catch (error) {
       diagnostic.status = "configuration_error";
-      diagnostic.error_code = error?.code || "GOOGLE_CLIENT_NOT_CONFIGURED";
+      diagnostic.error_code = safeDiagnosticErrorCode(
+        error?.code,
+        "GOOGLE_CLIENT_NOT_CONFIGURED",
+      );
       return diagnostic;
     }
   }
@@ -850,10 +1108,16 @@ export class GmailProvider {
         try {
           const provider = this.providerConfig();
           const tokens = parseToken(legacy, account.alias);
-          const oauth = new googleAuth.OAuth2(provider.clientId, provider.clientSecret);
+          const oauth = createGoogleOAuthClient(provider);
           oauth.setCredentials(tokens);
           const gmail = createGmailClient({ version: "v1", auth: oauth });
-          assertProfileMatches(account, await gmail.users.getProfile({ userId: "me" }));
+          assertProfileMatches(
+            account,
+            await gmail.users.getProfile(
+              { userId: "me" },
+              googleRequestOptions(),
+            ),
+          );
           legacyRemoved = await this.credentialStore.deleteLegacy(legacyKey);
         } catch {
           // Never delete a shared legacy entry unless its provider identity was proven.
@@ -875,7 +1139,13 @@ export class GmailProvider {
   async revoke(account) {
     const session = await this.oauthSession(account, { persistUpdates: false });
     const gmail = createGmailClient({ version: "v1", auth: session.oauth });
-    assertProfileMatches(account, await gmail.users.getProfile({ userId: "me" }));
+    assertProfileMatches(
+      account,
+      await gmail.users.getProfile(
+        { userId: "me" },
+        googleRequestOptions(),
+      ),
+    );
     let verifiedLegacyKey = session.record.source === "legacy" ? session.record.legacyKey : null;
     if (!verifiedLegacyKey && typeof this.credentialStore.getLegacy === "function") {
       const candidateKey = legacyCredentialKey(account);
@@ -883,10 +1153,16 @@ export class GmailProvider {
       if (raw !== null) {
         try {
           const provider = this.providerConfig();
-          const legacyOauth = new googleAuth.OAuth2(provider.clientId, provider.clientSecret);
+          const legacyOauth = createGoogleOAuthClient(provider);
           legacyOauth.setCredentials(parseToken(raw, account.alias));
           const legacyGmail = createGmailClient({ version: "v1", auth: legacyOauth });
-          assertProfileMatches(account, await legacyGmail.users.getProfile({ userId: "me" }));
+          assertProfileMatches(
+            account,
+            await legacyGmail.users.getProfile(
+              { userId: "me" },
+              googleRequestOptions(),
+            ),
+          );
           verifiedLegacyKey = candidateKey;
         } catch {
           // A shared legacy entry is left untouched unless independently verified.
@@ -925,20 +1201,26 @@ export class GmailProvider {
 
   async search(account, { query, maxResults, pageToken }) {
     const gmail = await this.client(account);
-    const list = await gmail.users.messages.list({
-      userId: "me",
-      q: query,
-      maxResults,
-      pageToken: pageToken || undefined,
-    });
+    const list = await gmail.users.messages.list(
+      {
+        userId: "me",
+        q: query,
+        maxResults,
+        pageToken: pageToken || undefined,
+      },
+      googleRequestOptions(),
+    );
     const summaries = await Promise.all(
       (list.data.messages || []).map(async ({ id }) => {
-        const response = await gmail.users.messages.get({
-          userId: "me",
-          id,
-          format: "metadata",
-          metadataHeaders: PROFILE_HEADERS,
-        });
+        const response = await gmail.users.messages.get(
+          {
+            userId: "me",
+            id,
+            format: "metadata",
+            metadataHeaders: PROFILE_HEADERS,
+          },
+          googleRequestOptions(),
+        );
         const headers = headersToObject(response.data.payload?.headers);
         return {
           id: response.data.id,
@@ -962,11 +1244,14 @@ export class GmailProvider {
 
   async getMessage(account, messageId) {
     const gmail = await this.client(account);
-    const response = await gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "full",
-    });
+    const response = await gmail.users.messages.get(
+      {
+        userId: "me",
+        id: messageId,
+        format: "full",
+      },
+      googleRequestOptions(),
+    );
     const headers = headersToObject(response.data.payload?.headers);
     const extracted = extractGmailBody(response.data.payload);
     const preferredBody = extracted.body || extracted.htmlBody;
@@ -999,12 +1284,15 @@ export class GmailProvider {
     let to = input.to || [];
 
     if (input.replyToMessageId) {
-      const original = await gmail.users.messages.get({
-        userId: "me",
-        id: input.replyToMessageId,
-        format: "metadata",
-        metadataHeaders: PROFILE_HEADERS,
-      });
+      const original = await gmail.users.messages.get(
+        {
+          userId: "me",
+          id: input.replyToMessageId,
+          format: "metadata",
+          metadataHeaders: PROFILE_HEADERS,
+        },
+        googleRequestOptions(),
+      );
       const headers = headersToObject(original.data.payload?.headers);
       threadId = original.data.threadId;
       inReplyTo = headers["message-id"] || undefined;
@@ -1026,10 +1314,13 @@ export class GmailProvider {
       inReplyTo,
       references,
     });
-    const response = await gmail.users.drafts.create({
-      userId: "me",
-      requestBody: { message: { raw, threadId } },
-    });
+    const response = await gmail.users.drafts.create(
+      {
+        userId: "me",
+        requestBody: { message: { raw, threadId } },
+      },
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       provider: "google",
@@ -1053,11 +1344,14 @@ export class GmailProvider {
 
   async updateDraft(account, draftId, input) {
     const gmail = await this.client(account);
-    const current = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "full",
-    });
+    const current = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "full",
+      },
+      googleRequestOptions(),
+    );
     const message = current.data.message || {};
     const headers = headersToObject(message.payload?.headers);
     const extracted = extractGmailBody(message.payload);
@@ -1071,14 +1365,17 @@ export class GmailProvider {
       inReplyTo: headers["in-reply-to"] || undefined,
       references: headers.references || undefined,
     });
-    const response = await gmail.users.drafts.update({
-      userId: "me",
-      id: draftId,
-      requestBody: {
+    const response = await gmail.users.drafts.update(
+      {
+        userId: "me",
         id: draftId,
-        message: { raw, threadId: message.threadId },
+        requestBody: {
+          id: draftId,
+          message: { raw, threadId: message.threadId },
+        },
       },
-    });
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       provider: "google",
@@ -1091,21 +1388,30 @@ export class GmailProvider {
 
   async reviewDraft(account, draftId) {
     const gmail = await this.client(account);
-    const rawBeforeResponse = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "raw",
-    });
-    const fullResponse = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "full",
-    });
-    const rawAfterResponse = await gmail.users.drafts.get({
-      userId: "me",
-      id: draftId,
-      format: "raw",
-    });
+    const rawBeforeResponse = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "raw",
+      },
+      googleRequestOptions(),
+    );
+    const fullResponse = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "full",
+      },
+      googleRequestOptions(),
+    );
+    const rawAfterResponse = await gmail.users.drafts.get(
+      {
+        userId: "me",
+        id: draftId,
+        format: "raw",
+      },
+      googleRequestOptions(),
+    );
     const revisionBefore = rawDraftRevision(rawBeforeResponse, draftId);
     const revisionAfter = rawDraftRevision(rawAfterResponse, draftId);
     assertSameRawRevision(revisionBefore, revisionAfter);
@@ -1194,16 +1500,33 @@ export class GmailProvider {
       throw draftChanged("The approved Gmail send manifest could not be reconstructed safely.");
     }
 
-    const gmail = await this.client(account);
+    let gmail;
+    try {
+      gmail = await this.client(account);
+    } catch {
+      throw gmailSendVerificationFailed();
+    }
     let currentRevision;
     try {
-      const rawResponse = await gmail.users.drafts.get({
-        userId: "me",
-        id: draftId,
-        format: "raw",
-      });
+      const rawResponse = await gmail.users.drafts.get(
+        {
+          userId: "me",
+          id: draftId,
+          format: "raw",
+        },
+        googleRequestOptions(),
+      );
       currentRevision = rawDraftRevision(rawResponse, draftId);
-    } catch {
+    } catch (error) {
+      if (
+        error?.code === "GOOGLE_REQUEST_TIMEOUT" ||
+        error?.code === "GOOGLE_NETWORK_ERROR" ||
+        error?.code === "OPERATION_DEADLINE_EXCEEDED" ||
+        isGoogleRequestTimeout(error) ||
+        isGoogleNetworkError(error)
+      ) {
+        throw gmailSendVerificationFailed();
+      }
       throw draftChanged(
         "The Gmail draft could not be verified against the reviewed revision. Prepare and review it again before sending.",
       );
@@ -1219,10 +1542,23 @@ export class GmailProvider {
     }
     const message = { raw };
     if (approved.threadId) message.threadId = approved.threadId;
-    const response = await gmail.users.drafts.send({
-      userId: "me",
-      requestBody: { id: draftId, message },
-    });
+    let requestOptions;
+    try {
+      requestOptions = googleRequestOptions();
+    } catch (error) {
+      if (error?.code !== "OPERATION_DEADLINE_EXCEEDED") throw error;
+      throw new MultiEmailError(
+        "The Gmail send deadline expired before the send request started. Nothing was sent.",
+        "SEND_VERIFICATION_FAILED",
+      );
+    }
+    const response = await gmail.users.drafts.send(
+      {
+        userId: "me",
+        requestBody: { id: draftId, message },
+      },
+      requestOptions,
+    );
     return {
       account: account.alias,
       provider: "google",
@@ -1234,29 +1570,38 @@ export class GmailProvider {
 
   async archive(account, messageIds) {
     const gmail = await this.client(account);
-    await gmail.users.messages.batchModify({
-      userId: "me",
-      requestBody: { ids: messageIds, removeLabelIds: ["INBOX"] },
-    });
+    await gmail.users.messages.batchModify(
+      {
+        userId: "me",
+        requestBody: { ids: messageIds, removeLabelIds: ["INBOX"] },
+      },
+      googleRequestOptions(),
+    );
     return { account: account.alias, archived: messageIds.length };
   }
 
   async markRead(account, messageIds, isRead) {
     const gmail = await this.client(account);
-    await gmail.users.messages.batchModify({
-      userId: "me",
-      requestBody: {
-        ids: messageIds,
-        addLabelIds: isRead ? [] : ["UNREAD"],
-        removeLabelIds: isRead ? ["UNREAD"] : [],
+    await gmail.users.messages.batchModify(
+      {
+        userId: "me",
+        requestBody: {
+          ids: messageIds,
+          addLabelIds: isRead ? [] : ["UNREAD"],
+          removeLabelIds: isRead ? ["UNREAD"] : [],
+        },
       },
-    });
+      googleRequestOptions(),
+    );
     return { account: account.alias, changed: messageIds.length, isRead };
   }
 
   async listLabels(account) {
     const gmail = await this.client(account);
-    const response = await gmail.users.labels.list({ userId: "me" });
+    const response = await gmail.users.labels.list(
+      { userId: "me" },
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       labels: (response.data.labels || []).map((label) => ({
@@ -1269,10 +1614,13 @@ export class GmailProvider {
 
   async modifyLabels(account, messageIds, { addLabelIds = [], removeLabelIds = [] }) {
     const gmail = await this.client(account);
-    await gmail.users.messages.batchModify({
-      userId: "me",
-      requestBody: { ids: messageIds, addLabelIds, removeLabelIds },
-    });
+    await gmail.users.messages.batchModify(
+      {
+        userId: "me",
+        requestBody: { ids: messageIds, addLabelIds, removeLabelIds },
+      },
+      googleRequestOptions(),
+    );
     return {
       account: account.alias,
       changed: messageIds.length,

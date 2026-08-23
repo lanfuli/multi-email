@@ -2,6 +2,28 @@
 
 All notable changes to Multi Email are documented here. The project follows semantic versioning after its first public release.
 
+## [0.1.3] - 2026-08-22
+
+Provider reliability and guided-onboarding release. The npm package remains unpublished in this release.
+
+### Added
+
+- Added a non-interactive, read-only `setup` preflight plus human-readable `doctor` output and stable allowlisted JSON Lines for automation.
+- Added provider-owned Google Cloud and Microsoft Entra setup guides with exact scopes, desktop application settings, safe commands, and common policy blockers.
+- Added explicit Microsoft partial-batch receipts that identify completed work, the current failed or unknown-outcome item, and untouched remaining IDs.
+
+### Fixed
+
+- Added one 108-second MCP handler budget, enforced a shorter request signal from the remaining budget on provider HTTP calls, disabled hidden Google API mutation retries and provider redirects, and preserved definite preflight failures versus ambiguous post-send outcomes. Uncancellable SDK promises are abandoned by the handler at the deadline and may settle later.
+- Capped Gmail transport responses and stream-limited Microsoft identity, Graph JSON, Graph error, and MIME bodies before full buffering or parsing; oversized responses are actively abandoned.
+- Removed absolute configuration paths, provider-controlled diagnostic codes, provider identifiers, and untrusted provider text from setup, MCP diagnostic, and unknown-send log output while retaining actionable allowlisted status codes.
+
+### Security
+
+- A send request remains single-attempt: timeout or disconnect after submission produces an unknown result and cannot silently reuse approval.
+- Gmail, Microsoft identity, and Graph transports reject redirects so a 307/308 cannot replay a mutation or token POST body.
+- A timed-out, HTTP 408, or HTTP 5xx Microsoft batch mutation no longer claims the in-flight item definitely failed, preventing an unsafe replay based on a false receipt.
+
 ## [0.1.2] - 2026-08-22
 
 Installation, onboarding, and local hardening release. The npm package remains unpublished in this release.
