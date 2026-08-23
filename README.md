@@ -1,10 +1,14 @@
 # Multi Email
 
+<p align="center">
+  <img src="assets/plugin-icon.png" alt="Multi Email plugin icon" width="128">
+</p>
+
 Multi Email is an open-source Codex plugin and MCP server for independently authorized Gmail and Microsoft 365 mailboxes. Every operation names an explicit `account_alias`; there is no implicit active mailbox.
 
 It supports searching, reading, drafting, archiving, read-state changes, Gmail labels, Microsoft categories, and sending through a server-enforced localhost review window.
 
-> Release status: `0.1.3` is official only when installed from the annotated `v0.1.3` tag or matching GitHub release under `lanfuli/multi-email`. The `codex-multi-email` npm package is not yet published; verify the repository owner and release tag before installation.
+> Release status: `0.1.4` is official only when installed from the annotated `v0.1.4` tag or matching GitHub release under `lanfuli/multi-email`. The `codex-multi-email` npm package is not yet published; verify the repository owner and release tag before installation.
 
 ## Why this exists
 
@@ -34,7 +38,7 @@ The MCP process and credential store run on the Mac, but the end-to-end workflow
 - Microsoft batch mutations distinguish completed IDs, definite failures, in-flight unknown outcomes, and untouched remaining IDs so callers do not replay from an inaccurate receipt.
 - Sending is blocked until the user reviews the complete supported plain-text draft in a `127.0.0.1` window and clicks Approve.
 - A short-lived `approval_request_id` is bound to an effective-send manifest: authenticated principal, mailbox, effective sender identity, draft and thread identity, every recipient, subject, complete body, provider revision, and the verified absence of attachments. Approval expires, is one-use, and is invalidated by any bound change.
-- Version `0.1.3` fails closed before review or send when a provider draft contains HTML, multipart or unknown MIME, inline content, attachments, a malformed mailbox address, an unsupported From/Sender/Reply-To identity, or an incomplete provider revision.
+- Version `0.1.4` fails closed before review or send when a provider draft contains HTML, multipart or unknown MIME, inline content, attachments, a malformed mailbox address, an unsupported From/Sender/Reply-To identity, or an incomplete provider revision.
 - The provider send request is built from the approved allowlisted plain-text fields. Gmail supplies that frozen raw message in the draft-send request; Microsoft uses one MIME `sendMail` request instead of sending a mutable provider draft.
 - No MCP tool can approve its own send request.
 - A send is never automatically retried after an ambiguous result because the provider may already have accepted it.
@@ -55,7 +59,7 @@ These controls reduce accidental and prompt-injected actions; they do not make O
 | Labels/categories | List and modify label IDs | Modify an exact known category name |
 | Human-reviewed frozen send | Local full-review window | Local full-review window; source draft is retained |
 
-The plugin does not intentionally call provider attachment-content endpoints, expose attachment contents through MCP, permanently delete mail, operate calendars, expose arbitrary provider APIs, or automatically enable send-as aliases, delegated identities, or shared mailboxes. Gmail `format=full` responses can still deliver small inline MIME-part bytes to the local process; they are not returned by the tool. Message reads expose attachment names only. Drafts created by the plugin are plain text. Provider drafts containing HTML, inline content, attachments, malformed mailbox addresses, or unsupported identities cannot pass the send-review gate in version `0.1.3`.
+The plugin does not intentionally call provider attachment-content endpoints, expose attachment contents through MCP, permanently delete mail, operate calendars, expose arbitrary provider APIs, or automatically enable send-as aliases, delegated identities, or shared mailboxes. Gmail `format=full` responses can still deliver small inline MIME-part bytes to the local process; they are not returned by the tool. Message reads expose attachment names only. Drafts created by the plugin are plain text. Provider drafts containing HTML, inline content, attachments, malformed mailbox addresses, or unsupported identities cannot pass the send-review gate in version `0.1.4`.
 
 Search queries are provider-native: Gmail search syntax for Google and Microsoft Graph mail search syntax for Microsoft 365.
 
@@ -78,7 +82,7 @@ The most transparent install is a local clone:
 ```bash
 git clone https://github.com/lanfuli/multi-email.git
 cd multi-email
-git checkout --detach v0.1.3
+git checkout --detach v0.1.4
 node ./scripts/multi-email --help
 codex plugin marketplace add "$(pwd)"
 codex plugin add multi-email@multi-email
@@ -89,7 +93,7 @@ Start a new Codex task after installation so the skill and MCP tools are discove
 Codex also accepts a Git marketplace source once the repository exists:
 
 ```bash
-codex plugin marketplace add lanfuli/multi-email --ref v0.1.3
+codex plugin marketplace add lanfuli/multi-email --ref v0.1.4
 codex plugin add multi-email@multi-email
 ```
 
@@ -204,16 +208,16 @@ For a local clone marketplace:
 
 ```bash
 git fetch origin --tags
-git checkout --detach v0.1.3
+git checkout --detach v0.1.4
 codex plugin add multi-email@multi-email
 ```
 
-Replace `v0.1.3` only with a newer annotated release tag that you have reviewed. A Git marketplace installed with `--ref` stays pinned, so move it to a new release explicitly:
+Replace `v0.1.4` only with a newer annotated release tag that you have reviewed. A Git marketplace installed with `--ref` stays pinned, so move it to a new release explicitly:
 
 ```bash
 codex plugin remove multi-email@multi-email
 codex plugin marketplace remove multi-email
-codex plugin marketplace add lanfuli/multi-email --ref v0.1.3
+codex plugin marketplace add lanfuli/multi-email --ref v0.1.4
 codex plugin add multi-email@multi-email
 ```
 

@@ -2,6 +2,20 @@
 
 All notable changes to Multi Email are documented here. The project follows semantic versioning after its first public release.
 
+## [0.1.4] - 2026-08-22
+
+Plugin branding release. The npm package remains unpublished in this release.
+
+### Added
+
+- Added a production Multi Email icon whose three distinct account routes converge into one mail hub, with transparent corners and legibility verified at 32 and 64 pixels.
+- Connected the icon to the Codex composer and plugin details through `composerIcon` and `logo` interface metadata, with a matching navy brand color.
+
+### Changed
+
+- Included plugin assets in the npm package whitelist and added release and cold-install checks that fail if the icon is absent from the published archive.
+- Displayed the same canonical icon in the GitHub README so the repository and installed plugin share one visual identity.
+
 ## [0.1.3] - 2026-08-22
 
 Provider reliability and guided-onboarding release. The npm package remains unpublished in this release.

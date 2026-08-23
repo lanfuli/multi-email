@@ -60,6 +60,7 @@ assert(packageJson.repository?.url?.includes("lanfuli/multi-email"), "Repository
 assert(packageJson.bin?.["multi-email"], "The setup CLI bin is missing.");
 assert(packageJson.bin?.["multi-email-mcp"], "The MCP bin is missing.");
 assert(packageJson.files?.includes("dist/"), "The package files whitelist omits dist.");
+assert(packageJson.files?.includes("assets/"), "The package files whitelist omits plugin assets.");
 assert(packageJson.files?.includes("docs/"), "The package files whitelist omits OAuth guides.");
 assert(
   packageJson.files?.includes("CONTRIBUTING.md") &&
@@ -72,6 +73,12 @@ assert(plugin.version === packageJson.version, "Plugin and package versions diff
 assert(plugin.author?.name === "Vincent_Lan", "Plugin author is incorrect.");
 assert(plugin.license === "MIT", "Plugin manifest must declare MIT.");
 assert(plugin.mcpServers === "./.mcp.json", "Plugin MCP manifest path is incorrect.");
+assert(plugin.interface?.brandColor === "#0B2B66", "Plugin brand color is incorrect.");
+assert(
+  plugin.interface?.composerIcon === "./assets/plugin-icon.png" &&
+    plugin.interface?.logo === "./assets/plugin-icon.png",
+  "Plugin icon metadata is incomplete.",
+);
 assert(
   constants.includes(`APP_VERSION = "${packageJson.version}"`),
   "Runtime and package versions differ.",
@@ -188,6 +195,7 @@ for (const relative of [
   "CHANGELOG.md",
   "docs/google-oauth.md",
   "docs/microsoft-entra.md",
+  "assets/plugin-icon.png",
   ".mcp.json",
   ".codex-plugin/plugin.json",
   "dist/server.cjs",
